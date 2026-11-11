@@ -1452,3 +1452,62 @@ a writer with a fixed color type ends up with."
     (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-do-with-result)))
                     '("addps" "addpd"))
             () "a DO with a result form was vectorized")))
+
+;;;; Reductions: a sum of a fixed-width integer array into a variable of that width.
+;;;; Integer addition wraps at the declared width whatever the order, so adding the
+;;;; lanes up at the end gives the same answer.  A float accumulator would not
+;;;; (addition is not associative for floats), so it is refused.
+
+(defun vectorize-u32-sum (a n total)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a) (type vectorize-index n)
+           (type (unsigned-byte 32) total) (optimize speed))
+  (dotimes (i n) (incf total (aref a i)))
+  total)
+
+(defun vectorize-s32-sum (a n total)
+  (declare (type (simple-array (signed-byte 32) (*)) a) (type vectorize-index n)
+           (type (signed-byte 32) total) (optimize speed))
+  (dotimes (i n) (incf total (aref a i)))
+  total)
+
+(defun vectorize-single-sum (a n total)
+  "A float sum: must stay scalar, and must still be right."
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (type single-float total) (optimize speed))
+  (dotimes (i n) (incf total (aref a i)))
+  total)
+
+(with-test (:name :vectorize-integer-reduction)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop with total0 = (logand #xFFFFFFF0 #xFFFFFFFF)
+          for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(unsigned-byte 32) '(1 2 3 4 5 6 7) n)
+          do (let ((sum (vectorize-u32-sum a n total0)))
+               (unless (= sum
+                          (let ((expected total0))
+                            (dotimes (i n expected) (setf expected (logand (+ expected (aref a i))
+                                                                           #xFFFFFFFF)))))
+                 (error "~@<u32 sum of ~D elements is ~S.~:@>" n sum))))
+    (loop with total0 = -100
+          for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(signed-byte 32) '(1 -2 3 -4 5) n)
+          do (let ((sum (vectorize-s32-sum a n total0)))
+               (unless (= sum
+                          (let ((expected total0))
+                            (dotimes (i n expected)
+                              (setf expected (vectorize-sign-extend (+ expected (aref a i)) 32)))))
+                 (error "~@<s32 sum of ~D elements is ~S.~:@>" n sum))))
+    (assert (search "paddd" (disassembly #'vectorize-u32-sum))
+            () "an integer reduction was not vectorized")
+    ;; a float sum changes with the order of the additions, so it stays scalar
+    (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-single-sum)))
+                    '("addps" "addpd"))
+            () "a float reduction was vectorized")
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'single-float '(1.0f0 2.0f0 3.0f0 4.0f0) n)
+          do (let ((expected 0.5f0))
+               (dotimes (i n) (setf expected (+ expected (aref a i))))
+               (unless (eql (vectorize-single-sum a n 0.5f0) expected)
+                 (error "~@<scalar float sum of ~D elements changed.~:@>" n))))))

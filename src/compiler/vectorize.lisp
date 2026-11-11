@@ -156,7 +156,7 @@
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
   element-type index count destination destination-offset destination-simple-p
-  destination-literal-p sources expression body fallback)
+  destination-literal-p sources expression body fallback accumulator)
 
 ;;; A loop bound the generated code may evaluate more than once: a variable, a
 ;;; literal, or arithmetic on one of those, which has no side effects.  A bound
@@ -485,6 +485,42 @@
                              :body (first statements)
                              :fallback form)))))))))))))))
 
+;;; A sum of a fixed-width integer array into a variable of that same width:
+;;;
+;;;   (dotimes (i count) (incf accumulator expression))
+;;;
+;;; Integer addition wraps at the declared width whatever the order of the adds, so
+;;; accumulating into lanes and adding the lanes up at the end gives the same
+;;; answer.  Floating point is not like that, so a float accumulator is refused.
+(defun vector-match-reduction (form env)
+  (when (and (consp form) (eq (car form) 'dotimes))
+    (destructuring-bind (spec . body) (cdr form)
+      (when (and (consp spec) (null (cddr spec)))
+        (destructuring-bind (index count) spec
+          (when (and (symbolp index) (vector-pure-count-p count))
+            (multiple-value-bind (declarations statements) (vector-split-declarations body)
+              (when (and (null (cdr statements))
+                         (not (vector-special-declaration-p declarations)))
+                (let ((store (vector-normalize-store (first statements))))
+                  (when (and (consp store) (eq (car store) 'setf) (null (cdddr store)))
+                    (let ((place (second store)))
+                      (when (and (symbolp place) (not (eq place index)))
+                        (multiple-value-bind (kind type) (vector-variable-info place env)
+                          (when (and (eq kind :scalar)
+                                     (not (vector-float-element-type-p type)))
+                            (let ((expression
+                                    (vector-match-expression (third store) env index type)))
+                              (when expression
+                                (make-vector-loop
+                                 :element-type type
+                                 :index index
+                                 :count count
+                                 :accumulator place
+                                 :sources (vector-collect-arrays expression)
+                                 :expression expression
+                                 :body (first statements)
+                                 :fallback form)))))))))))))))))
+
 ;;;; Generating the vectorized loop
 
 ;;; The backend primitives that move and combine one vector of floats: an alist
@@ -577,6 +613,11 @@
 ;;; express it (which is the normal answer on a build whose backend has not
 ;;; published its primitives, and for byte lanes outside SAFETY 0).
 (defun vector-expand-loop (loop)
+  (if (vloop-accumulator loop)
+      (vector-expand-reduction loop)
+      (vector-expand-elementwise-loop loop)))
+
+(defun vector-expand-elementwise-loop (loop)
   (let* ((element-type (vloop-element-type loop))
          (width (vector-width element-type))
          (index (vloop-index loop))
@@ -642,6 +683,75 @@
                  ,body)
                ,(vloop-fallback loop)))))))
 
+;;; Expand a reduction: add the elementwise expression into a vector accumulator,
+;;; run the same expression over the tail one element at a time, then add the
+;;; accumulator's lanes to the variable.  The lanes are stored to a stack-allocated
+;;; array and added with ordinary arithmetic, which keeps the result exact and needs
+;;; no horizontal-add instruction.
+(defun vector-expand-reduction (loop)
+  (let* ((element-type (vloop-element-type loop))
+         (width (vector-width element-type))
+         (index (vloop-index loop))
+         (count (vloop-count loop))
+         (accumulator (vloop-accumulator loop))
+         (expression (vloop-expression loop))
+         (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
+                          (vector-collect-scalars expression)))
+         (arrays (vloop-sources loop))
+         (pack-type `(simd-pack ,element-type))
+         (accumulating (make-symbol "ACCUM"))
+         (lanes (make-symbol "LANES"))
+         (end (make-symbol "VECTOR-END"))
+         (lane (make-symbol "LANE"))
+         (load (vector-primitive "LOAD" element-type))
+         (store (vector-primitive "STORE" element-type))
+         (splat (vector-primitive "SPLAT" element-type))
+         (add (vector-primitive "ADD" element-type))
+         (arithmetic (mapcar (lambda (operator)
+                               (vector-primitive (vector-operator-base operator element-type)
+                                                 element-type))
+                             (vector-collect-operators expression))))
+    (when (and load store splat add (every #'identity arithmetic)
+               (or (/= width 16) *vectorize-byte-lanes*))
+      (when *auto-vectorize-notes*
+        (compiler-notify "vectorized reduction over ~a, ~a elements at a time"
+                         element-type width))
+      `(if (and (typep ,count 'index)
+                ,@(loop for entry in arrays
+                        for name = (first entry)
+                        for offsets = (second entry)
+                        append (cons `(>= (length ,name) (+ ,count (max ,@offsets)))
+                                     (loop for offset in offsets
+                                           unless (typep offset '(integer 0 *))
+                                             collect `(>= ,offset 0)))))
+           (let* (,@(mapcar (lambda (scalar)
+                              `(,(cdr scalar) (,splat ,(second (car scalar)))))
+                            scalars)
+                  (,accumulating (,splat 0))
+                  (,lanes (make-array ,width :element-type ',element-type))
+                  (,end (- ,count (mod ,count ,width))))
+             (declare (type index ,end)
+                      (type ,pack-type ,accumulating)
+                      ,@(mapcar (lambda (scalar) `(type ,pack-type ,(cdr scalar))) scalars)
+                      (dynamic-extent ,lanes))
+             (do ((,index 0 (+ ,index ,width)))
+                 ((>= ,index ,end))
+               (declare (type index ,index))
+               (setf ,accumulating
+                     (,add ,accumulating
+                           ,(vector-emit expression element-type index scalars nil))))
+             ;; the tail, one element at a time, exactly as written
+             (do ((,index ,end (1+ ,index)))
+                 ((>= ,index ,count))
+               (declare (type index ,index))
+               ,(vloop-body loop))
+             ;; and the lanes into the variable
+             (,store ,accumulating ,lanes 0)
+             (dotimes (,lane ,width)
+               (incf ,accumulator (aref ,lanes ,lane)))
+             nil)
+           ,(vloop-fallback loop)))))
+
 ;;;; Walking a body
 
 (defun vector-vectorize-body (forms env)
@@ -665,7 +775,8 @@
          (let ((plan (case (car form)
                        (loop (vector-match-loop form env))
                        ((do do*) (vector-match-do form env))
-                       (t (vector-match-dotimes form env)))))
+                       (t (or (vector-match-dotimes form env)
+                              (vector-match-reduction form env))))))
            (or (and plan (vector-expand-loop plan)) form)))
         (lambda `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env)))
         ((let let*)
