@@ -1169,7 +1169,7 @@ a writer with a fixed color type ends up with."
           do (vectorize-s16-add a b c n)
              (dotimes (i n)
                (unless (= (aref c i) (vectorize-sign-extend (+ (aref a i) (aref b i)) 16))
-                 (error "~@<s16 add wrong at element ~D of ~D: ~S.~:@>" i n (aref c i))))
+                 (error "~@<s16 add wrong at element ~D of ~D: ~S.~:@>" i n (aref c i)))))
     (assert (search "psubw" (disassembly #'vectorize-u16-subtract))
             () "16-bit subtraction is not packed")
     (assert (search "paddw" (disassembly #'vectorize-s16-add))
