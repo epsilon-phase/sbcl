@@ -122,14 +122,16 @@
 (macrolet ((define-vec-arith (name translate type sc instruction)
              `(define-vop (,name)
                 (:translate ,translate)
-                (:args (a :scs (,sc) :target result)
+                (:args (a :scs (,sc))
                        (b :scs (,sc)))
                 (:arg-types ,type ,type)
+                (:temporary (:sc ,sc :from (:argument 0)) arith-tmp)
                 (:results (result :scs (,sc)))
                 (:result-types ,type)
                 (:generator 2
-                  (move result a)
-                  (inst ,instruction result b)))))
+                  (move arith-tmp a)
+                  (inst ,instruction arith-tmp b)
+                  (move result arith-tmp)))))
   (define-vec-arith %vec-add-single %vec-add-single
     simd-pack-single single-sse-reg addps)
   (define-vec-arith %vec-sub-single %vec-sub-single
@@ -313,14 +315,16 @@
 (macrolet ((define-vec-arith (name type instruction)
              `(define-vop (,name)
                 (:translate ,name)
-                (:args (a :scs (int-sse-reg) :target result)
+                (:args (a :scs (int-sse-reg))
                        (b :scs (int-sse-reg)))
                 (:arg-types ,type ,type)
+                (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
                 (:results (result :scs (int-sse-reg)))
                 (:result-types ,type)
                 (:generator 2
-                  (move result a)
-                  (inst ,instruction result b)))))
+                  (move arith-tmp a)
+                  (inst ,instruction arith-tmp b)
+                  (move result arith-tmp)))))
   (define-vec-arith %vec-add-ub32 simd-pack-ub32 paddd)
   (define-vec-arith %vec-sub-ub32 simd-pack-ub32 psubd)
   (define-vec-arith %vec-and-ub32 simd-pack-ub32 pand)
@@ -537,13 +541,15 @@
 
 (define-vop (%vec-add-ub8)
   (:translate %vec-add-ub8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 2
-    (move result a)
-    (inst paddb result b)))
+    (move arith-tmp a)
+    (inst paddb arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-sub-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
     (simd-pack (unsigned-byte 8))
@@ -551,13 +557,15 @@
 
 (define-vop (%vec-sub-ub8)
   (:translate %vec-sub-ub8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 2
-    (move result a)
-    (inst psubb result b)))
+    (move arith-tmp a)
+    (inst psubb arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-and-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
     (simd-pack (unsigned-byte 8))
@@ -565,13 +573,15 @@
 
 (define-vop (%vec-and-ub8)
   (:translate %vec-and-ub8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 2
-    (move result a)
-    (inst pand result b)))
+    (move arith-tmp a)
+    (inst pand arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-or-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
     (simd-pack (unsigned-byte 8))
@@ -579,13 +589,15 @@
 
 (define-vop (%vec-or-ub8)
   (:translate %vec-or-ub8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 2
-    (move result a)
-    (inst por result b)))
+    (move arith-tmp a)
+    (inst por arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-xor-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
     (simd-pack (unsigned-byte 8))
@@ -593,13 +605,15 @@
 
 (define-vop (%vec-xor-ub8)
   (:translate %vec-xor-ub8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 2
-    (move result a)
-    (inst pxor result b)))
+    (move arith-tmp a)
+    (inst pxor arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-load-sb8 ((simple-array (signed-byte 8) (*)) index)
     (simd-pack (signed-byte 8))
@@ -668,13 +682,15 @@
 
 (define-vop (%vec-add-sb8)
   (:translate %vec-add-sb8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 2
-    (move result a)
-    (inst paddb result b)))
+    (move arith-tmp a)
+    (inst paddb arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-sub-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
     (simd-pack (signed-byte 8))
@@ -682,13 +698,15 @@
 
 (define-vop (%vec-sub-sb8)
   (:translate %vec-sub-sb8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 2
-    (move result a)
-    (inst psubb result b)))
+    (move arith-tmp a)
+    (inst psubb arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-and-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
     (simd-pack (signed-byte 8))
@@ -696,13 +714,15 @@
 
 (define-vop (%vec-and-sb8)
   (:translate %vec-and-sb8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 2
-    (move result a)
-    (inst pand result b)))
+    (move arith-tmp a)
+    (inst pand arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-or-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
     (simd-pack (signed-byte 8))
@@ -710,13 +730,15 @@
 
 (define-vop (%vec-or-sb8)
   (:translate %vec-or-sb8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 2
-    (move result a)
-    (inst por result b)))
+    (move arith-tmp a)
+    (inst por arith-tmp b)
+    (move result arith-tmp)))
 
 (defknown %vec-xor-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
     (simd-pack (signed-byte 8))
@@ -724,13 +746,15 @@
 
 (define-vop (%vec-xor-sb8)
   (:translate %vec-xor-sb8)
-  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
   (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 2
-    (move result a)
-    (inst pxor result b)))
+    (move arith-tmp a)
+    (inst pxor arith-tmp b)
+    (move result arith-tmp)))
 
 ;;;; 16-bit lanes: eight at a time.
 ;;;;
@@ -831,14 +855,16 @@
 (macrolet ((define-vec-arith (name type instruction)
              `(define-vop (,name)
                 (:translate ,name)
-                (:args (a :scs (int-sse-reg) :target result)
+                (:args (a :scs (int-sse-reg))
                        (b :scs (int-sse-reg)))
                 (:arg-types ,type ,type)
+                (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
                 (:results (result :scs (int-sse-reg)))
                 (:result-types ,type)
                 (:generator 2
-                  (move result a)
-                  (inst ,instruction result b)))))
+                  (move arith-tmp a)
+                  (inst ,instruction arith-tmp b)
+                  (move result arith-tmp)))))
   (define-vec-arith %vec-add-ub16 simd-pack-ub16 paddw)
   (define-vec-arith %vec-sub-ub16 simd-pack-ub16 psubw)
   (define-vec-arith %vec-and-ub16 simd-pack-ub16 pand)
