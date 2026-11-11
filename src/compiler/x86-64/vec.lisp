@@ -1072,6 +1072,30 @@
     (inst movaps result
           (register-inline-constant :oword (ash #x3FF0000000000000 64)))))
 
+;;; The width of a vector, in every lane: how much the index pack advances per
+;;; iteration.  4.0f0 is #x40800000 and 2.0d0 is #x4000000000000000.
+(defknown (%vec-stride-single) () (simd-pack single-float) (flushable movable))
+(defknown (%vec-stride-double) () (simd-pack double-float) (flushable movable))
+
+(define-vop (%vec-stride-single)
+  (:translate %vec-stride-single)
+  (:results (result :scs (single-sse-reg)))
+  (:result-types simd-pack-single)
+  (:generator 1
+    (inst movaps result
+          (register-inline-constant
+           :oword (logior #x40800000 (ash #x40800000 32)
+                          (ash #x40800000 64) (ash #x40800000 96))))))
+
+(define-vop (%vec-stride-double)
+  (:translate %vec-stride-double)
+  (:results (result :scs (double-sse-reg)))
+  (:result-types simd-pack-double)
+  (:generator 1
+    (inst movaps result
+          (register-inline-constant
+           :oword (logior #x4000000000000000 (ash #x4000000000000000 64))))))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1098,6 +1122,8 @@
     (publish "INDEX" double-float %vec-splat-index-double)
     (publish "RAMP" single-float %vec-ramp-single)
     (publish "RAMP" double-float %vec-ramp-double)
+    (publish "STRIDE" single-float %vec-stride-single)
+    (publish "STRIDE" double-float %vec-stride-double)
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)
