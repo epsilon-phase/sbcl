@@ -1074,6 +1074,12 @@ a writer with a fixed color type ends up with."
       (dotimes (i n)
         (assert (eql (aref result i) 3.75f0))))))
 
+;;; VALUE wrapped into BITS and read back as a signed integer: what a store into a
+;;; BITS-wide element type does.
+(defun vectorize-sign-extend (value bits)
+  (let ((wrapped (ldb (byte bits 0) value)))
+    (if (logbitp (1- bits) wrapped) (- wrapped (ash 1 bits)) wrapped)))
+
 ;;;; Unary minus.  For floats this is a sign flip, which is not the same as
 ;;;; subtracting from zero: (- 0.0) is -0.0, and 0.0 - 0.0 is 0.0.
 
@@ -1162,10 +1168,8 @@ a writer with a fixed color type ends up with."
           for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
           do (vectorize-s16-add a b c n)
              (dotimes (i n)
-               (unless (= (aref c i)
-                          (let ((v (+ (aref a i) (aref b i))))
-                            (if (logbitp 15 v) (- v #x10000) v)))
-                 (error "~@<s16 add wrong at element ~D of ~D.~:@>" i n))))
+               (unless (= (aref c i) (vectorize-sign-extend (+ (aref a i) (aref b i)) 16))
+                 (error "~@<s16 add wrong at element ~D of ~D: ~S.~:@>" i n (aref c i))))
     (assert (search "psubw" (disassembly #'vectorize-u16-subtract))
             () "16-bit subtraction is not packed")
     (assert (search "paddw" (disassembly #'vectorize-s16-add))
@@ -1198,7 +1202,7 @@ a writer with a fixed color type ends up with."
                                (error "~@<~A: element ~D of ~D is ~S, expected ~S.~:@>"
                                       ,context i n (aref c i) (+ (aref a i) (aref b i))))))))
       ;; simple vectors take the fast path
-      (case-values vectorize-array vectorize-array "simple")
+      (case-values #'vectorize-array #'vectorize-array "simple")
       ;; and adjustable ones still compute the right thing
       (case-values (lambda (element-type values count &optional (offset 0))
                      (make-array count :element-type element-type :adjustable t
@@ -1234,8 +1238,7 @@ a writer with a fixed color type ends up with."
   (let ((a (vectorize-array 'single-float *vectorize-single-values* 4))
         (b (vectorize-array 'single-float *vectorize-single-values* 4))
         (c (make-array 4 :element-type 'single-float :initial-element 0.0f0)))
-    (assert-error (vectorize-variable-offset a b c 4 -1)
-                  sb-int:invalid-array-index-error)))
+    (assert-error (vectorize-variable-offset a b c 4 -1) error)))
 
 ;;;; A negative scalar broadcast into narrow lanes.  Untagging a negative fixnum
 ;;;; sign-extends it, so a byte or word has to be masked to the lane width before it
@@ -1275,22 +1278,19 @@ a writer with a fixed color type ends up with."
         for c = (make-array n :element-type '(signed-byte 8) :initial-element 0)
         do (vectorize-s8-add-negative a c n)
            (dotimes (i n)
-             (let ((v (+ (aref a i) -3)))
-               (unless (= (aref c i) (if (logbitp 7 v) (- v #x100) v))
-                 (error "~@<s8 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
+             (unless (= (aref c i) (vectorize-sign-extend (+ (aref a i) -3) 8))
+               (error "~@<s8 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
   (loop for n in *vectorize-lengths*
         for a = (vectorize-integer-array '(signed-byte 16) '(0 1 2 -3 32767 -32768) n)
         for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
         do (vectorize-s16-add-negative a c n)
            (dotimes (i n)
-             (let ((v (+ (aref a i) -3)))
-               (unless (= (aref c i) (if (logbitp 15 v) (- v #x10000) v))
-                 (error "~@<s16 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
+             (unless (= (aref c i) (vectorize-sign-extend (+ (aref a i) -3) 16))
+               (error "~@<s16 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
   (loop for n in *vectorize-lengths*
         for a = (vectorize-integer-array '(signed-byte 16) '(0 1 299 300 -400 32767) n)
         for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
         do (vectorize-s16-subtract-literal a c n)
            (dotimes (i n)
-             (let ((v (- (aref a i) 300)))
-               (unless (= (aref c i) (if (logbitp 15 v) (- v #x10000) v))
-                 (error "~@<s16 - 300: element ~D of ~D is ~S.~:@>" i n (aref c i)))))))
+             (unless (= (aref c i) (vectorize-sign-extend (- (aref a i) 300) 16))
+               (error "~@<s16 - 300: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
