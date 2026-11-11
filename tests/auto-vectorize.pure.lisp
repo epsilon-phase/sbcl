@@ -761,6 +761,9 @@ OPERATION applied to the same numbers, which involves no array loop."
         finally (return c)))
 
 (defun vectorize-single-accumulate (a c n)
+  "INCF into the destination, which the vectorizer does take; kept here because the
+correctness check below still wants the values, and :vectorize-incf-store covers the
+instruction side."
   (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
            (optimize speed))
   (loop for i below n do (incf (aref c i) (aref a i)))
@@ -795,8 +798,7 @@ OPERATION applied to the same numbers, which involves no array loop."
                  (unless (eql (aref c i) (+ 1.0f0 (aref a i)))
                    (error "~@<an accumulating loop is wrong at element ~D of ~D.~:@>" i n)))))
     (dolist (function (list #'vectorize-single-add-loop-from-1
-                            #'vectorize-single-add-loop-with-finally
-                            #'vectorize-single-accumulate))
+                            #'vectorize-single-add-loop-with-finally))
       (let ((text (disassembly function)))
         (assert (notany (lambda (mnemonic) (search mnemonic text))
                         '("addps" "addpd"))
@@ -1430,6 +1432,7 @@ a writer with a fixed color type ends up with."
     (loop for n in *vectorize-lengths*
           for a = (vectorize-array 'single-float *vectorize-single-values* n)
           for b = (vectorize-array 'single-float *vectorize-single-values* n 3)
+          for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
           do (dolist (function (list #'vectorize-do-add #'vectorize-do-add-plus))
                (let ((c (make-array n :element-type 'single-float :initial-element 0.0f0)))
                  (funcall function a b c n)
@@ -1437,9 +1440,8 @@ a writer with a fixed color type ends up with."
                    (unless (vectorize-same-value-p (aref c i) (+ (aref a i) (aref b i)))
                      (error "~@<~S, length ~D: element ~D is ~S.~:@>"
                             function n i (aref c i))))))
-          ;; a DO with a result form is not one of the shapes taken, but computes
-          for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
-          do (assert (eq (vectorize-do-with-result a b c n) c))
+             ;; a DO with a result form is not one of the shapes taken, but computes
+             (assert (eq (vectorize-do-with-result a b c n) c))
              (dotimes (i n)
                (unless (vectorize-same-value-p (aref c i) (+ (aref a i) (aref b i)))
                  (error "~@<a DO with a result form is wrong at element ~D of ~D.~:@>" i n))))
