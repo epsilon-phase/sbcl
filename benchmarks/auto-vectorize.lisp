@@ -42,12 +42,17 @@
 (define-pair mul-single single-float *)
 (define-pair mul-double double-float *)
 
+;;; Integer lanes: four 32-bit or two 64-bit at a time.
+(define-pair add-u32 (unsigned-byte 32) +)
+(define-pair add-u64 (unsigned-byte 64) +)
+
 (defun make-random-array (element-type n)
   (let ((v (make-array n :element-type element-type)))
     (dotimes (i n v)
-      (setf (aref v i) (if (eq element-type 'single-float)
-                           (coerce (- (random 2.0) 1.0) 'single-float)
-                           (- (random 2d0) 1d0))))))
+      (setf (aref v i)
+            (cond ((eq element-type 'single-float) (coerce (- (random 2.0) 1.0) 'single-float))
+                  ((eq element-type 'double-float) (- (random 2d0) 1d0))
+                  (t (random 1000)))))))
 
 (defun time-loop (function element-type size)
   "SECONDS and GB/s for REPETITIONS-FOR calls of FUNCTION over SIZE elements."
@@ -72,7 +77,8 @@
   (format t "~&~a elements, ~a reps~%" size (repetitions-for size))
   (format t "~30a ~10a ~10a ~10a~%" "loop" "seconds" "GB/s" "speedup")
   (dolist (pair '((add-single single-float) (add-double double-float)
-                  (mul-single single-float) (mul-double double-float)))
+                  (mul-single single-float) (mul-double double-float)
+                  (add-u32 (unsigned-byte 32)) (add-u64 (unsigned-byte 64))))
     (destructuring-bind (name element-type) pair
       (let ((scalar-name (intern (concatenate 'string (symbol-name name) "/SCALAR"))))
         (multiple-value-bind (scalar-seconds scalar-rate) (time-loop scalar-name element-type size)
