@@ -452,6 +452,278 @@
         (inst movq result x))
     (inst punpcklqdq result result)))
 
+;;;; 8-bit lanes: sixteen at a time.
+;;;;
+;;;; PADDB/PSUBB are baseline SSE2, and a byte that wraps around is exactly what
+;;;; a scalar loop does to an (unsigned-byte 8) array once the range check is
+;;;; off.  That is the only case the vectorizer takes these for: the pass only
+;;;; rewrites 8-bit element types when the code is compiled at SAFETY 0, because
+;;;; at any higher safety the scalar store signals a type error where a packed
+;;;; store would quietly truncate.
+;;;;
+;;;; One element is one byte and a tagged index counts two units per element, so
+;;;; the index cannot be scaled: it is untagged into a scratch register and added
+;;;; with a scale of 1.  (INDEX-SCALE 1 INDEX would ask the assembler for a
+;;;; scale of 0, which does not exist.)
+;;;;
+;;;; No MUL, DIV, MIN or MAX here: PMULLW would compute the wrong width, and the
+;;;; byte-wise minimum and maximum are SSE2's PMINUB/PMAXUB for unsigned only,
+;;;; which is a separate feature with its own semantics.
+
+(defknown %vec-load-ub8 ((simple-array (unsigned-byte 8) (*)) index)
+    (simd-pack (unsigned-byte 8))
+  (flushable))
+
+(define-vop (%vec-load-ub8)
+  (:translate %vec-load-ub8)
+  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types simple-array-unsigned-byte-8 tagged-num)
+  (:temporary (:sc any-reg) byte-index)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 3
+    (move byte-index index)
+    (inst shr byte-index n-fixnum-tag-bits)
+    (inst movdqu result
+          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+              vector byte-index 1))))
+
+(defknown %vec-store-ub8 ((simd-pack (unsigned-byte 8)) (simple-array (unsigned-byte 8) (*)) index)
+    (values)
+  ())
+
+(define-vop (%vec-store-ub8)
+  (:translate %vec-store-ub8)
+  (:args (value :scs (int-sse-reg))
+         (vector :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types simd-pack-ub8 simple-array-unsigned-byte-8 tagged-num)
+  (:temporary (:sc any-reg) byte-index)
+  (:generator 3
+    (move byte-index index)
+    (inst shr byte-index n-fixnum-tag-bits)
+    (inst movdqu
+          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+              vector byte-index 1)
+          value)))
+
+(defknown %vec-splat-ub8 ((unsigned-byte 8)) (simd-pack (unsigned-byte 8)) (flushable movable))
+
+;;; One byte in all sixteen lanes: strip the tag if there is one, copy the byte
+;;; into all four bytes of a word by multiplying by #x01010101, and PSHUFD the
+;;; word into all four dwords.
+(define-vop (%vec-splat-ub8)
+  (:translate %vec-splat-ub8)
+  (:args (x :scs (unsigned-reg signed-reg)))
+  (:arg-types unsigned-num)
+  (:temporary (:sc unsigned-reg) word)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 3
+    (if (tagged-fixnum-tn-p x)
+        (progn (move word x) (inst sar word n-fixnum-tag-bits))
+        (move word x))
+    (inst imul word word #x01010101)
+    (inst movd result word)
+    (inst pshufd result result #b00000000)))
+
+(defknown %vec-add-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-add-ub8)
+  (:translate %vec-add-ub8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move result a)
+    (inst paddb result b)))
+
+(defknown %vec-sub-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-sub-ub8)
+  (:translate %vec-sub-ub8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move result a)
+    (inst psubb result b)))
+
+(defknown %vec-and-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-and-ub8)
+  (:translate %vec-and-ub8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move result a)
+    (inst pand result b)))
+
+(defknown %vec-or-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-or-ub8)
+  (:translate %vec-or-ub8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move result a)
+    (inst por result b)))
+
+(defknown %vec-xor-ub8 ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-xor-ub8)
+  (:translate %vec-xor-ub8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move result a)
+    (inst pxor result b)))
+
+(defknown %vec-load-sb8 ((simple-array (signed-byte 8) (*)) index)
+    (simd-pack (signed-byte 8))
+  (flushable))
+
+(define-vop (%vec-load-sb8)
+  (:translate %vec-load-sb8)
+  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types simple-array-signed-byte-8 tagged-num)
+  (:temporary (:sc any-reg) byte-index)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 3
+    (move byte-index index)
+    (inst shr byte-index n-fixnum-tag-bits)
+    (inst movdqu result
+          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+              vector byte-index 1))))
+
+(defknown %vec-store-sb8 ((simd-pack (signed-byte 8)) (simple-array (signed-byte 8) (*)) index)
+    (values)
+  ())
+
+(define-vop (%vec-store-sb8)
+  (:translate %vec-store-sb8)
+  (:args (value :scs (int-sse-reg))
+         (vector :scs (descriptor-reg))
+         (index :scs (any-reg)))
+  (:arg-types simd-pack-sb8 simple-array-signed-byte-8 tagged-num)
+  (:temporary (:sc any-reg) byte-index)
+  (:generator 3
+    (move byte-index index)
+    (inst shr byte-index n-fixnum-tag-bits)
+    (inst movdqu
+          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+              vector byte-index 1)
+          value)))
+
+(defknown %vec-splat-sb8 ((signed-byte 8)) (simd-pack (signed-byte 8)) (flushable movable))
+
+;;; One byte in all sixteen lanes: strip the tag if there is one, copy the byte
+;;; into all four bytes of a word by multiplying by #x01010101, and PSHUFD the
+;;; word into all four dwords.
+(define-vop (%vec-splat-sb8)
+  (:translate %vec-splat-sb8)
+  (:args (x :scs (unsigned-reg signed-reg)))
+  (:arg-types signed-num)
+  (:temporary (:sc unsigned-reg) word)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 3
+    (if (tagged-fixnum-tn-p x)
+        (progn (move word x) (inst sar word n-fixnum-tag-bits))
+        (move word x))
+    (inst imul word word #x01010101)
+    (inst movd result word)
+    (inst pshufd result result #b00000000)))
+
+(defknown %vec-add-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-add-sb8)
+  (:translate %vec-add-sb8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 2
+    (move result a)
+    (inst paddb result b)))
+
+(defknown %vec-sub-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-sub-sb8)
+  (:translate %vec-sub-sb8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 2
+    (move result a)
+    (inst psubb result b)))
+
+(defknown %vec-and-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-and-sb8)
+  (:translate %vec-and-sb8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 2
+    (move result a)
+    (inst pand result b)))
+
+(defknown %vec-or-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-or-sb8)
+  (:translate %vec-or-sb8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 2
+    (move result a)
+    (inst por result b)))
+
+(defknown %vec-xor-sb8 ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-xor-sb8)
+  (:translate %vec-xor-sb8)
+  (:args (a :scs (int-sse-reg) :target result) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 2
+    (move result a)
+    (inst pxor result b)))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -472,6 +744,22 @@
     (publish "MUL" double-float %vec-mul-double)
     (publish "DIV" single-float %vec-div-single)
     (publish "DIV" double-float %vec-div-double)
+    (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
+    (publish "LOAD" (signed-byte 8) %vec-load-sb8)
+    (publish "STORE" (unsigned-byte 8) %vec-store-ub8)
+    (publish "STORE" (signed-byte 8) %vec-store-sb8)
+    (publish "SPLAT" (unsigned-byte 8) %vec-splat-ub8)
+    (publish "SPLAT" (signed-byte 8) %vec-splat-sb8)
+    (publish "ADD" (unsigned-byte 8) %vec-add-ub8)
+    (publish "ADD" (signed-byte 8) %vec-add-sb8)
+    (publish "SUB" (unsigned-byte 8) %vec-sub-ub8)
+    (publish "SUB" (signed-byte 8) %vec-sub-sb8)
+    (publish "AND" (unsigned-byte 8) %vec-and-ub8)
+    (publish "AND" (signed-byte 8) %vec-and-sb8)
+    (publish "OR" (unsigned-byte 8) %vec-or-ub8)
+    (publish "OR" (signed-byte 8) %vec-or-sb8)
+    (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
+    (publish "XOR" (signed-byte 8) %vec-xor-sb8)
     (publish "LOAD" (unsigned-byte 32) %vec-load-ub32)
     (publish "LOAD" (signed-byte 32) %vec-load-sb32)
     (publish "LOAD" (unsigned-byte 64) %vec-load-ub64)
