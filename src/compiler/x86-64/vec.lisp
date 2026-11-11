@@ -980,6 +980,39 @@
            :oword (logior (ash #x80000000 32)
                           (ash #x80000000 96))))))
 
+;;;; Byte-wise minimum and maximum, unsigned only: PMINUB and PMAXUB are SSE2,
+;;;; while the signed (PMINSB/PMAXSB) and word-width (PMINUW/PMAXUW) forms are
+;;;; SSE4.1 and out of scope for a baseline x86-64 backend.
+
+(defknown (%vec-min-ub8 %vec-max-ub8)
+    ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
+    (simd-pack (unsigned-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-min-ub8)
+  (:translate %vec-min-ub8)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move arith-tmp a)
+    (inst pminub arith-tmp b)
+    (move result arith-tmp)))
+
+(define-vop (%vec-max-ub8)
+  (:translate %vec-max-ub8)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 2
+    (move arith-tmp a)
+    (inst pmaxub arith-tmp b)
+    (move result arith-tmp)))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1017,6 +1050,8 @@
     (publish "OR" (unsigned-byte 8) %vec-or-ub8)
     (publish "OR" (signed-byte 8) %vec-or-sb8)
     (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
+    (publish "MIN" (unsigned-byte 8) %vec-min-ub8)
+    (publish "MAX" (unsigned-byte 8) %vec-max-ub8)
     (publish "XOR" (signed-byte 8) %vec-xor-sb8)
     (publish "LOAD" (unsigned-byte 16) %vec-load-ub16)
     (publish "LOAD" (signed-byte 16) %vec-load-sb16)
