@@ -650,7 +650,9 @@
           (dolist (ctype (list (lambda-var-type var) (leaf-defined-type var)))
             (unless (or (null ctype) (eq ctype *universal-type*))
               (let ((spec (type-specifier ctype)))
-                (when (vector-element-type spec)
+                ;; a declaration of (VECTOR T) or (ARRAY T (*)) counts too: its
+                ;; element type is known and the data vector is found at run time
+                (when (vector-array-element-type spec)
                   (push (cons name spec) env))))))))))
 
 ;;; Called on the body of every lambda before it is converted to IR1. Returns a
