@@ -35,6 +35,7 @@
 (defun vector-supported-element-type-p (element-type)
   (member element-type '(single-float double-float
                          (signed-byte 8) (unsigned-byte 8)
+                         (signed-byte 16) (unsigned-byte 16)
                          (signed-byte 32) (unsigned-byte 32)
                          (signed-byte 64) (unsigned-byte 64))
           :test #'equal))
@@ -54,6 +55,7 @@
   (cond ((eq element-type 'single-float) 4)
         ((eq element-type 'double-float) 2)
         ((eql (second element-type) 8) 16)
+        ((eql (second element-type) 16) 8)
         ((eql (second element-type) 32) 4)
         (t 2)))
 
@@ -76,7 +78,8 @@
       (/ (and floats "DIV"))
       (logand (and (not floats) "AND"))
       (logior (and (not floats) "OR"))
-      (logxor (and (not floats) "XOR")))))
+      (logxor (and (not floats) "XOR"))
+      (:negate (and floats "NEG")))))
 
 ;;; Extend ENV (an alist of variable name to declared type spec) by the
 ;;; declarations found at the head of FORMS.
@@ -100,8 +103,10 @@
   (let ((spec (cdr (assq variable env))))
     (cond ((null spec) (values nil nil))
           ((vector-supported-element-type-p spec) (values :scalar spec))
-          (t (let ((element-type (vector-element-type spec)))
-               (if element-type (values :array element-type) (values nil nil)))))))
+          (t (let ((element-type (vector-array-element-type spec)))
+               (if element-type
+                   (values :array (cons element-type (vector-simple-spec-p spec)))
+                   (values nil nil)))))))
 
 ;;; Strip any (THE type form) wrappers of FORM, returning (VALUES form type).
 (defun vector-unwrap-the (form)
@@ -112,14 +117,32 @@
 
 ;;; (VALUES ARRAY ELEMENT-TYPE) if FORM names a declared float array, following
 ;;; (THE (SIMPLE-ARRAY SINGLE-FLOAT (*)) name) as well as plain declarations.
+;;; (VALUES NAME ELEMENT-TYPE SIMPLE-P) for an array reference, or NILs.  A
+;;; declaration of (VECTOR element-type) or (ARRAY element-type (*)) tells us the
+;;; element type but not whether the data is inline, so SIMPLE-P is NIL there and
+;;; the generated code fetches the data vector once with WITH-ARRAY-DATA.
 (defun vector-array-type (form env)
   (multiple-value-bind (inner spec) (vector-unwrap-the form)
-    (let ((element-type (and spec (vector-element-type spec))))
-      (cond (element-type (values inner element-type))
+    (let ((element-type (and spec (vector-array-element-type spec))))
+      (cond (element-type (values inner element-type (vector-simple-spec-p spec)))
             ((and (symbolp inner) (null spec))
              (multiple-value-bind (kind type) (vector-variable-info inner env)
-               (if (eq kind :array) (values inner type) (values nil nil))))
-            (t (values nil nil))))))
+               (if (eq kind :array)
+                   (values inner (car type) (cdr type))
+                   (values nil nil nil))))
+            (t (values nil nil nil))))))
+
+;;; The element type of a declared array type, whether or not it is simple.
+(defun vector-array-element-type (spec)
+  (when (consp spec)
+    (cond ((eq (car spec) 'simple-array) (vector-element-type spec))
+          ((eq (car spec) 'vector)
+           (and (vector-supported-element-type-p (second spec)) (second spec)))
+          ((eq (car spec) 'array)
+           (and (vector-supported-element-type-p (second spec)) (second spec))))))
+
+(defun vector-simple-spec-p (spec)
+  (and (consp spec) (eq (car spec) 'simple-array)))
 
 ;;;; Recognizing a loop
 
@@ -129,7 +152,8 @@
 ;;;   (:CONST . number) a float constant, broadcast
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
-  element-type index count destination destination-offset sources expression body fallback)
+  element-type index count destination destination-offset destination-simple-p
+  destination-literal-p sources expression body fallback)
 
 ;;; A loop bound the generated code may evaluate more than once: a variable, a
 ;;; literal, or arithmetic on one of those, which has no side effects.  A bound
@@ -183,8 +207,12 @@
 ;;; The offset of a subscript from the loop variable: (aref a i) is 0,
 ;;; (aref a (+ i 3)) and (aref a (+ 3 i)) are 3.  A negative offset would index
 ;;; before the loop variable's range, so it is not taken.
+;;; (VALUES OFFSET LITERAL-P), or NIL if SUBSCRIPT is not the loop variable plus
+;;; something.  The something may be a literal, or a variable; a variable can be
+;;; negative at run time, so the generated guard checks it, which a literal does
+;;; not need.
 (defun vector-subscript-offset (subscript index)
-  (cond ((eq subscript index) 0)
+  (cond ((eq subscript index) (values 0 t))
         ((and (consp subscript) (eq (car subscript) '+))
          (let ((arguments (cdr subscript)))
            (when (and (= (length arguments) 2)
@@ -192,8 +220,8 @@
              (let ((other (if (eq (first arguments) index)
                               (second arguments)
                               (first arguments))))
-               (when (typep other '(integer 0 *))
-                 other)))))
+               (cond ((and (typep other '(integer 0 *)) ) (values other t))
+                     ((symbolp other) (values other nil)))))))
         (t nil)))
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
@@ -218,13 +246,22 @@
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
            (when (null (cdr subscripts))
-             (let ((offset (vector-subscript-offset (car subscripts) index)))
+             (multiple-value-bind (offset literal-p)
+                 (vector-subscript-offset (car subscripts) index)
                (when offset
-                 (multiple-value-bind (name type) (vector-array-type array env)
+                 (multiple-value-bind (name type simple-p) (vector-array-type array env)
                    (when (equal type element-type)
-                     (list :array name offset))))))))
+                     (list :array name offset simple-p literal-p))))))))
+        ;; (- x) is a sign flip for floats, which is not the same as (- 0 x):
+        ;; the two disagree on zeroes, so floats get their own packed negation
+        ;; and integers subtract from zero, which is exactly what they do.
+        ((and (eq (car form) '-) (null (cdr (cdr form))))
+         (let ((subexpression (vector-match-expression (second form) env index element-type)))
+           (when subexpression
+             (if (vector-float-element-type-p element-type)
+                 (list :negate subexpression)
+                 (list :op '- (list :const 0) subexpression)))))
         ((memq (car form) '(+ - * / logand logior logxor))
-         ;; unary minus is not handled: (- x) differs from (- 0 x) on zeroes
          (let ((arguments (cdr form)))
            (when (and (cdr arguments) (vector-operator-base (car form) element-type))
              (let ((subexpressions
@@ -242,14 +279,15 @@
       (when (and (consp place) (eq (car place) 'aref))
         (destructuring-bind (array . subscripts) (cdr place)
           (when (null (cdr subscripts))
-            (let ((offset (vector-subscript-offset (car subscripts) index)))
+            (multiple-value-bind (offset literal-p)
+                (vector-subscript-offset (car subscripts) index)
               (when offset
-                (multiple-value-bind (name element-type) (vector-array-type array env)
+                (multiple-value-bind (name element-type simple-p) (vector-array-type array env)
                   (when name
                     (let ((expression
                             (vector-match-expression (third form) env index element-type)))
                       (when expression
-                        (values name element-type expression offset)))))))))))))
+                        (values name element-type expression offset simple-p literal-p)))))))))))))
 
 ;;; Split leading DECLARE forms from a body.
 (defun vector-split-declarations (forms)
@@ -274,7 +312,7 @@
                      (vector-pure-count-p count))
             (multiple-value-bind (declarations statements) (vector-split-declarations body)
               (when (and (null (cdr statements)) (not (vector-special-declaration-p declarations)))
-                (multiple-value-bind (destination element-type expression offset)
+                (multiple-value-bind (destination element-type expression offset simple-p literal-p)
                     (vector-match-element-store (car statements) env index)
                   (when destination
                     (make-vector-loop
@@ -283,31 +321,41 @@
                      :count count
                      :destination destination
                      :destination-offset offset
+                     :destination-simple-p simple-p
+                     :destination-literal-p literal-p
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (car statements)
                      :fallback form)))))))))))
 
-;;; The arrays read by an expression tree, as an alist of name to the largest
-;;; constant offset the array is read at, in order of first use.
+;;; The arrays read by an expression tree, as an alist of name to
+;;; (OFFSETS . SIMPLE-P), in order of first use, where OFFSETS is every offset the
+;;; array is read at.  The guard has to cover the largest of them, and it has to
+;;; check any that is not a literal, since a variable offset can be negative.
 (defun vector-collect-arrays (expression &optional (accumulator '()))
   (ecase (car expression)
-    (:array (let ((known (assoc (second expression) accumulator)))
-              (if known
-                  (progn (setf (cdr known) (max (cdr known) (third expression))) accumulator)
+    (:array (let* ((name (second expression))
+                   (entry (assoc name accumulator))
+                   (offset (third expression)))
+              (if entry
+                  (progn (pushnew offset (car (cdr entry)) :test #'equal) accumulator)
                   (append accumulator
-                          (list (cons (second expression) (third expression)))))))
+                          (list (cons name
+                                      (cons (list offset) (fourth expression))))))))
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-arrays subexpression accumulator))))
+    (:negate (vector-collect-arrays (second expression) accumulator))
     ((:scalar :const) accumulator)))
 
 ;;; The loop invariant parts of an expression tree, in order of first use.
 (defun vector-collect-scalars (expression &optional (accumulator '()))
-  (ecase (car expression)
+  (case (car expression)
     (:array accumulator)
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-scalars subexpression accumulator))))
-    ((:scalar :const) (adjoin expression accumulator :test #'equal))))
+    (:negate (vector-collect-scalars (second expression) accumulator))
+    ((:scalar :const) (adjoin expression accumulator :test #'equal))
+    (t accumulator)))
 
 ;;; (1- n) and (- n 1) are the same bound as N one step down.
 (defun vector-normalize-bound (count)
@@ -351,7 +399,7 @@
               (when (and (vector-loop-keyword (car clauses) "DO")
                          (null (cddr clauses))
                          (vector-pure-count-p count))
-                (multiple-value-bind (destination element-type expression offset)
+                (multiple-value-bind (destination element-type expression offset simple-p literal-p)
                     (vector-match-element-store (second clauses) env index)
                   (when destination
                     (make-vector-loop
@@ -360,6 +408,8 @@
                      :count count
                      :destination destination
                      :destination-offset offset
+                     :destination-simple-p simple-p
+                     :destination-literal-p literal-p
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (second clauses)
@@ -387,36 +437,60 @@
 
 ;;; The operators an expression tree uses, in order of first use.
 (defun vector-collect-operators (expression &optional (accumulator '()))
-  (if (eq (car expression) :op)
-      (dolist (subexpression (cddr expression)
-               (adjoin (second expression) accumulator))
-        (setf accumulator (vector-collect-operators subexpression accumulator)))
-      accumulator))
+  (case (car expression)
+    (:op (dolist (subexpression (cddr expression)
+             (adjoin (second expression) accumulator))
+           (setf accumulator (vector-collect-operators subexpression accumulator))))
+    (:negate (adjoin :negate (vector-collect-operators (second expression) accumulator)))
+    (t accumulator)))
 
 ;;; Emit an expression tree over SIMD packs. SCALARS maps each loop invariant
 ;;; leaf to the variable holding its broadcast pack.
-(defun vector-emit (expression element-type index scalars)
+(defun vector-emit (expression element-type index scalars data-references)
   (ecase (car expression)
-    (:array (if (zerop (third expression))
-                `(,(vector-primitive "LOAD" element-type) ,(second expression) ,index)
-                `(,(vector-primitive "LOAD" element-type) ,(second expression)
-                  (+ ,index ,(third expression)))))
+    (:negate `(,(vector-primitive "NEG" element-type)
+               ,(vector-emit (second expression) element-type index scalars
+                             data-references)))
+    (:array (let* ((name (second expression))
+                   (offset (third expression))
+                   (reference (or (cdr (assoc name data-references)) name))
+                   (subscript (if (eql offset 0) index `(+ ,index ,offset))))
+              `(,(vector-primitive "LOAD" element-type) ,reference ,subscript)))
     (:op (let ((operator (second expression)))
            (let ((name (vector-primitive (vector-operator-base operator element-type) element-type)))
              (reduce (lambda (left right) `(,name ,left ,right))
                      (mapcar (lambda (subexpression)
-                               (vector-emit subexpression element-type index scalars))
+                               (vector-emit subexpression element-type index scalars
+                                            data-references))
                              (cddr expression))))))
     ((:scalar :const)
      ;; splats are computed once, before the loop, and live in an SSE register
      (cdr (assoc expression scalars :test #'equal)))))
 
-;;; The arrays a loop touches, as an alist of name to the largest constant
-;;; offset it is used at, destination first.
+;;; The arrays a loop touches, as an alist of name to (OFFSETS . SIMPLE-P),
+;;; destination first.
 (defun vector-loop-arrays (loop)
-  (cons (cons (vloop-destination loop) (vloop-destination-offset loop))
-        (remove (vloop-destination loop) (vloop-sources loop)
-                :key #'car :test #'eq)))
+  (let ((destination (list (list (vloop-destination-offset loop))
+                           (vloop-destination-simple-p loop))))
+    (cons (cons (vloop-destination loop) destination)
+          (remove (vloop-destination loop) (vloop-sources loop)
+                  :key #'car :test #'eq))))
+
+;;; The data vector and start index to use for each array that is not known to be
+;;; simple, so that the loop body can address a plain simple array.
+(defun vector-data-references (loop)
+  (loop for (name offsets . simple-p) in (vector-loop-arrays loop)
+        unless simple-p
+          collect (cons name (cons (make-symbol "DATA") (make-symbol "START")))))
+
+;;; Wrap FORMS in one WITH-ARRAY-DATA per array whose data is not inline, so the
+;;; data vector and start index are found once per call instead of per element.
+(defun vector-with-data-vectors (references form)
+  (if (null references)
+      form
+      `(sb-kernel:with-array-data ((,(cadr (first references)) ,(car (first references)))
+                                   (,(cddr (first references))))
+         ,(vector-with-data-vectors (rest references) form))))
 
 ;;; Return the vectorized form for a matched loop, or NIL if this backend cannot
 ;;; express it (which is the normal answer on a build whose backend has not
@@ -431,6 +505,8 @@
          (expression (vloop-expression loop))
          (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
                           (vector-collect-scalars expression)))
+         (arrays (vector-loop-arrays loop))
+         (references (vector-data-references loop))
          (pack-type `(simd-pack ,element-type))
          (load (vector-primitive "LOAD" element-type))
          (store (vector-primitive "STORE" element-type))
@@ -439,39 +515,50 @@
                                (vector-primitive (vector-operator-base operator element-type)
                                                  element-type))
                              (vector-collect-operators expression))))
-    (when (and load store (every #'identity arithmetic) (or splat (null scalars))
+    (when (and load store
+               (every #'identity arithmetic)
+               (or splat (null scalars))
                (or (/= width 16) *vectorize-byte-lanes*))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
-      `(if (and (typep ,count 'index)
-                ;; every array has to cover the last element the vector body
-                ;; touches, which is (n - 1) plus that array's offset
-                ,@(mapcar (lambda (entry)
-                            `(>= (length ,(car entry)) (+ ,count ,(cdr entry))))
-                          (vector-loop-arrays loop)))
-           (let* (,@(mapcar (lambda (scalar)
-                              `(,(cdr scalar) (,splat ,(second (car scalar)))))
-                            scalars)
-                  (,end (- ,count (mod ,count ,width))))
-             (declare (type index ,end)
-                      ,@(mapcar (lambda (scalar) `(type ,pack-type ,(cdr scalar))) scalars))
-             ;; the vector body
-             (do ((,index 0 (+ ,index ,width)))
-                 ((>= ,index ,end))
-               (declare (type index ,index))
-               (,store ,(vector-emit expression element-type index scalars)
-                       ,(vloop-destination loop)
-                       ,(if (zerop destination-offset)
-                            index
-                            `(+ ,index ,destination-offset))))
-             ;; the tail, element by element, exactly as written
-             (do ((,index ,end (1+ ,index)))
-                 ((>= ,index ,count))
-               (declare (type index ,index))
-               ,(vloop-body loop)))
-           ;; not the shape we want: the loop the user wrote
-           ,(vloop-fallback loop)))))
+      (flet ((subscript (offset) (if (eql offset 0) index `(+ ,index ,offset)))
+             (reference (name) (or (cdr (assoc name references)) name)))
+        (let ((guard
+                (loop for entry in arrays
+                      for name = (first entry)
+                      for offsets = (second entry)
+                      append (cons `(>= (length ,name) (+ ,count (max ,@offsets)))
+                                   (loop for offset in offsets
+                                         unless (typep offset '(integer 0 *))
+                                           collect `(>= ,offset 0)))))
+              (body
+                (vector-with-data-vectors
+                 references
+                 `(progn
+                    ;; the vector body
+                    (do ((,index 0 (+ ,index ,width)))
+                        ((>= ,index ,end))
+                      (declare (type index ,index))
+                      (,store ,(vector-emit expression element-type index scalars references)
+                              ,(reference (vloop-destination loop))
+                              ,(subscript destination-offset)))
+                    ;; the tail, element by element, exactly as written
+                    (do ((,index ,end (1+ ,index)))
+                        ((>= ,index ,count))
+                      (declare (type index ,index))
+                      ,(vloop-body loop))))))
+          `(if (and (typep ,count 'index) ,@guard)
+               (let* (,@(mapcar (lambda (scalar)
+                                  `(,(cdr scalar) (,splat ,(second (car scalar)))))
+                                scalars)
+                      (,end (- ,count (mod ,count ,width))))
+                 (declare (type index ,end)
+                          ,@(mapcar (lambda (scalar)
+                                      `(type ,pack-type ,(cdr scalar)))
+                                    scalars))
+                 ,body)
+               ,(vloop-fallback loop)))))))
 
 ;;;; Walking a body
 

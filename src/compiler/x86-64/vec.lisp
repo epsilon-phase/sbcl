@@ -509,9 +509,12 @@
 
 (defknown %vec-splat-ub8 ((unsigned-byte 8)) (simd-pack (unsigned-byte 8)) (flushable movable))
 
-;;; One byte in all sixteen lanes: strip the tag if there is one, copy the byte
-;;; into all four bytes of a word by multiplying by #x01010101, and PSHUFD the
-;;; word into all four dwords.
+;;; One byte in all sixteen lanes: strip the tag if there is one, mask the word
+;;; down to the byte that is left -- the shift leaves a negative value
+;;; sign-extended, and the multiplication below copies whatever is in the high
+;;; half as well, turning -3 into #x...FCFCFCFD -- then copy the byte into all
+;;; four bytes of a word by multiplying by #x01010101, and PSHUFD the word into
+;;; all four dwords.
 (define-vop (%vec-splat-ub8)
   (:translate %vec-splat-ub8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -523,6 +526,7 @@
     (if (tagged-fixnum-tn-p x)
         (progn (move word x) (inst sar word n-fixnum-tag-bits))
         (move word x))
+    (inst and word #xFF)
     (inst imul word word #x01010101)
     (inst movd result word)
     (inst pshufd result result #b00000000)))
@@ -636,9 +640,12 @@
 
 (defknown %vec-splat-sb8 ((signed-byte 8)) (simd-pack (signed-byte 8)) (flushable movable))
 
-;;; One byte in all sixteen lanes: strip the tag if there is one, copy the byte
-;;; into all four bytes of a word by multiplying by #x01010101, and PSHUFD the
-;;; word into all four dwords.
+;;; One byte in all sixteen lanes: strip the tag if there is one, mask the word
+;;; down to the byte that is left -- the shift leaves a negative value
+;;; sign-extended, and the multiplication below copies whatever is in the high
+;;; half as well, turning -3 into #x...FCFCFCFD -- then copy the byte into all
+;;; four bytes of a word by multiplying by #x01010101, and PSHUFD the word into
+;;; all four dwords.
 (define-vop (%vec-splat-sb8)
   (:translate %vec-splat-sb8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -650,6 +657,7 @@
     (if (tagged-fixnum-tn-p x)
         (progn (move word x) (inst sar word n-fixnum-tag-bits))
         (move word x))
+    (inst and word #xFF)
     (inst imul word word #x01010101)
     (inst movd result word)
     (inst pshufd result result #b00000000)))
@@ -724,6 +732,228 @@
     (move result a)
     (inst pxor result b)))
 
+;;;; 16-bit lanes: eight at a time.
+;;;;
+;;;; The four shapes of the integer sections above again, over SIMD-PACK-UB16
+;;;; and SIMD-PACK-SB16, which live in INT-SSE-REG like the 32- and 64-bit
+;;;; packs, with the arrays spelled SIMPLE-ARRAY-UNSIGNED-BYTE-16 and
+;;;; SIMPLE-ARRAY-SIGNED-BYTE-16 (vm-array.lisp).
+;;;;
+;;;; Two bytes per element can be scaled: a tagged fixnum counts two units per
+;;;; element, so (INDEX-SCALE 2 INDEX) is a scale of 1 and the index is used
+;;;; exactly as it arrives.  That is what the 8-bit section above cannot do,
+;;;; where one element is one byte, a scale of 1 is already the smallest the
+;;;; assembler has, and the index therefore has to be untagged by hand.
+;;;;
+;;;; PADDW and PSUBW are baseline SSE2 and wrap at 16 bits, which is what an
+;;;; (UNSIGNED-BYTE 16) or (SIGNED-BYTE 16) element means, and PAND/POR/PXOR do
+;;;; not care about the lane width at all.  No MUL or DIV: the vectorizer asks
+;;;; for those on float lanes only (VECTOR-OPERATOR-BASE in vectorize.lisp).
+
+(defknown %vec-load-ub16 ((simple-array (unsigned-byte 16) (*)) index)
+    (simd-pack (unsigned-byte 16))
+  (flushable))
+(defknown %vec-load-sb16 ((simple-array (signed-byte 16) (*)) index)
+    (simd-pack (signed-byte 16))
+  (flushable))
+(defknown %vec-store-ub16
+    ((simd-pack (unsigned-byte 16)) (simple-array (unsigned-byte 16) (*)) index)
+    (values)
+  ())
+(defknown %vec-store-sb16
+    ((simd-pack (signed-byte 16)) (simple-array (signed-byte 16) (*)) index)
+    (values)
+  ())
+
+(defknown (%vec-add-ub16 %vec-sub-ub16
+           %vec-and-ub16 %vec-or-ub16 %vec-xor-ub16)
+    ((simd-pack (unsigned-byte 16)) (simd-pack (unsigned-byte 16)))
+    (simd-pack (unsigned-byte 16))
+  (flushable movable))
+(defknown (%vec-add-sb16 %vec-sub-sb16
+           %vec-and-sb16 %vec-or-sb16 %vec-xor-sb16)
+    ((simd-pack (signed-byte 16)) (simd-pack (signed-byte 16)))
+    (simd-pack (signed-byte 16))
+  (flushable movable))
+
+(defknown %vec-splat-ub16 ((unsigned-byte 16))
+    (simd-pack (unsigned-byte 16))
+  (flushable movable))
+(defknown %vec-splat-sb16 ((signed-byte 16))
+    (simd-pack (signed-byte 16))
+  (flushable movable))
+
+;;;; Loading and storing 128 bits at a time in a simple 16-bit array.
+;;;
+;;; The effective address is the one the float and 32/64-bit sections use,
+;;; with the element size -- two bytes -- in place of N-WORD-BYTES.
+
+(macrolet ((define-vec-load (name element-type result-type)
+             `(define-vop (,name)
+                (:translate ,name)
+                (:args (vector :scs (descriptor-reg))
+                       (index :scs (any-reg)))
+                (:arg-types ,element-type tagged-num)
+                (:results (result :scs (int-sse-reg)))
+                (:result-types ,result-type)
+                (:generator 3
+                  (inst movdqu result
+                        (ea (- (* vector-data-offset n-word-bytes)
+                               other-pointer-lowtag)
+                            vector index
+                            (index-scale 2 index))))))
+           (define-vec-store (name element-type result-type)
+             ;; VALUE is first in both the Lisp arglist and :ARGS.
+             `(define-vop (,name)
+                (:translate ,name)
+                (:args (value :scs (int-sse-reg))
+                       (vector :scs (descriptor-reg))
+                       (index :scs (any-reg)))
+                (:arg-types ,result-type ,element-type tagged-num)
+                (:generator 3
+                  (inst movdqu
+                        (ea (- (* vector-data-offset n-word-bytes)
+                               other-pointer-lowtag)
+                            vector index
+                            (index-scale 2 index))
+                        value)))))
+  (define-vec-load %vec-load-ub16 simple-array-unsigned-byte-16 simd-pack-ub16)
+  (define-vec-load %vec-load-sb16 simple-array-signed-byte-16 simd-pack-sb16)
+  (define-vec-store %vec-store-ub16 simple-array-unsigned-byte-16 simd-pack-ub16)
+  (define-vec-store %vec-store-sb16 simple-array-signed-byte-16 simd-pack-sb16))
+
+;;;; Packed 16-bit arithmetic and bitwise operations.
+;;;
+;;; Same reasoning as the integer arithmetic above: the destination is also the
+;;; first source, so RESULT is MOVEd from A first and :TARGET is only a packing
+;;; preference.
+
+(macrolet ((define-vec-arith (name type instruction)
+             `(define-vop (,name)
+                (:translate ,name)
+                (:args (a :scs (int-sse-reg) :target result)
+                       (b :scs (int-sse-reg)))
+                (:arg-types ,type ,type)
+                (:results (result :scs (int-sse-reg)))
+                (:result-types ,type)
+                (:generator 2
+                  (move result a)
+                  (inst ,instruction result b)))))
+  (define-vec-arith %vec-add-ub16 simd-pack-ub16 paddw)
+  (define-vec-arith %vec-sub-ub16 simd-pack-ub16 psubw)
+  (define-vec-arith %vec-and-ub16 simd-pack-ub16 pand)
+  (define-vec-arith %vec-or-ub16 simd-pack-ub16 por)
+  (define-vec-arith %vec-xor-ub16 simd-pack-ub16 pxor)
+  (define-vec-arith %vec-add-sb16 simd-pack-sb16 paddw)
+  (define-vec-arith %vec-sub-sb16 simd-pack-sb16 psubw)
+  (define-vec-arith %vec-and-sb16 simd-pack-sb16 pand)
+  (define-vec-arith %vec-or-sb16 simd-pack-sb16 por)
+  (define-vec-arith %vec-xor-sb16 simd-pack-sb16 pxor))
+
+;;;; Splatting one 16-bit integer across every lane.
+;;;
+;;; The scalar arrives in a general-purpose register, tagged unless the compiler
+;;; materialized an untagged value, and there is no move VOP from there into
+;;; INT-SSE-REG, so the transfer is an instruction rather than a MOVE, as in the
+;;; splats above: strip the tag with an ARITHMETIC shift, mask the word down to
+;;; the 16 bits that are left, copy the value into both halves of a 32-bit word
+;;; by multiplying by #x00010001, MOVD that word into lane 0 -- which zeroes the
+;;; rest of the register -- and PSHUFD the word into all four dwords, which is
+;;; all eight 16-bit lanes.
+;;;
+;;; The AND is not decoration.  The shift leaves a negative value sign-extended
+;;; to the full word, where the multiply copies whatever is in the high half as
+;;; well: -3 in a 16-bit lane times #x00010001 is #x...FFFCFFFD, whose second
+;;; half is -4.  Masking first makes the two halves identical for every value
+;;; in the range, -32768 included.
+
+(define-vop (%vec-splat-ub16)
+  (:translate %vec-splat-ub16)
+  (:args (x :scs (unsigned-reg signed-reg) :target result))
+  (:arg-types unsigned-num)
+  (:temporary (:sc unsigned-reg) word)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub16)
+  (:generator 4
+    (if (tagged-fixnum-tn-p x)
+        (progn (move word x) (inst sar word n-fixnum-tag-bits))
+        (move word x))
+    (inst and word #xFFFF)
+    (inst imul word word #x00010001)
+    (inst movd result word)
+    (inst pshufd result result #b00000000)))
+
+(define-vop (%vec-splat-sb16)
+  (:translate %vec-splat-sb16)
+  (:args (x :scs (unsigned-reg signed-reg) :target result))
+  (:arg-types signed-num)
+  (:temporary (:sc unsigned-reg) word)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb16)
+  (:generator 4
+    (if (tagged-fixnum-tn-p x)
+        (progn (move word x) (inst sar word n-fixnum-tag-bits))
+        (move word x))
+    (inst and word #xFFFF)
+    (inst imul word word #x00010001)
+    (inst movd result word)
+    (inst pshufd result result #b00000000)))
+
+;;;; Negating a packed float.
+;;;
+;;; A scalar (- x) on a float does not subtract: it flips the sign bit, with
+;;; XORPS/XORPD against a constant mask (%NEGATE/SINGLE-FLOAT and
+;;; %NEGATE/DOUBLE-FLOAT in float.lisp, which use
+;;; (REGISTER-INLINE-CONSTANT :OWORD (ASH 1 31)) and (ASH 1 63) respectively).
+;;; The packed version is that instruction with the mask in every lane, which
+;;; makes it bit-identical to the scalar one on the cases a subtraction gets
+;;; wrong: 0.0 comes out as -0.0 and -0.0 as 0.0, and a NaN keeps its payload
+;;; with only the sign bit flipped.
+;;;
+;;; The constant is one 128-bit OWORD integer, because
+;;; CANONICALIZE-INLINE-CONSTANT (insts.lisp) destructures the descriptor as
+;;; (TYPE VALUE) and :OWORD takes a single integer.  The lanes are the sign bits
+;;; of the pack: #x80000000 is the bit pattern of the single-float -0.0, which
+;;; is the top bit of a 32-bit lane, so the first mask sets bits 31, 63, 95 and
+;;; 127; and the double-float -0.0 -- (MAKE-DOUBLE-FLOAT #x80000000 0) -- is
+;;; that dword in the high half of a 64-bit lane, so the second mask sets bit
+;;; 63 and bit 127.
+
+(defknown %vec-negate-single ((simd-pack single-float))
+    (simd-pack single-float)
+  (flushable movable))
+(defknown %vec-negate-double ((simd-pack double-float))
+    (simd-pack double-float)
+  (flushable movable))
+
+(define-vop (%vec-negate-single)
+  (:translate %vec-negate-single)
+  (:args (a :scs (single-sse-reg) :target result))
+  (:arg-types simd-pack-single)
+  (:results (result :scs (single-sse-reg)))
+  (:result-types simd-pack-single)
+  (:generator 2
+    (move result a)
+    (inst xorps result
+          (register-inline-constant
+           :oword (logior #x80000000
+                          (ash #x80000000 32)
+                          (ash #x80000000 64)
+                          (ash #x80000000 96))))))
+
+(define-vop (%vec-negate-double)
+  (:translate %vec-negate-double)
+  (:args (a :scs (double-sse-reg) :target result))
+  (:arg-types simd-pack-double)
+  (:results (result :scs (double-sse-reg)))
+  (:result-types simd-pack-double)
+  (:generator 2
+    (move result a)
+    (inst xorpd result
+          (register-inline-constant
+           :oword (logior (ash #x80000000 32)
+                          (ash #x80000000 96))))))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -744,6 +974,8 @@
     (publish "MUL" double-float %vec-mul-double)
     (publish "DIV" single-float %vec-div-single)
     (publish "DIV" double-float %vec-div-double)
+    (publish "NEG" single-float %vec-negate-single)
+    (publish "NEG" double-float %vec-negate-double)
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)
@@ -760,6 +992,22 @@
     (publish "OR" (signed-byte 8) %vec-or-sb8)
     (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
     (publish "XOR" (signed-byte 8) %vec-xor-sb8)
+    (publish "LOAD" (unsigned-byte 16) %vec-load-ub16)
+    (publish "LOAD" (signed-byte 16) %vec-load-sb16)
+    (publish "STORE" (unsigned-byte 16) %vec-store-ub16)
+    (publish "STORE" (signed-byte 16) %vec-store-sb16)
+    (publish "SPLAT" (unsigned-byte 16) %vec-splat-ub16)
+    (publish "SPLAT" (signed-byte 16) %vec-splat-sb16)
+    (publish "ADD" (unsigned-byte 16) %vec-add-ub16)
+    (publish "ADD" (signed-byte 16) %vec-add-sb16)
+    (publish "SUB" (unsigned-byte 16) %vec-sub-ub16)
+    (publish "SUB" (signed-byte 16) %vec-sub-sb16)
+    (publish "AND" (unsigned-byte 16) %vec-and-ub16)
+    (publish "AND" (signed-byte 16) %vec-and-sb16)
+    (publish "OR" (unsigned-byte 16) %vec-or-ub16)
+    (publish "OR" (signed-byte 16) %vec-or-sb16)
+    (publish "XOR" (unsigned-byte 16) %vec-xor-ub16)
+    (publish "XOR" (signed-byte 16) %vec-xor-sb16)
     (publish "LOAD" (unsigned-byte 32) %vec-load-ub32)
     (publish "LOAD" (signed-byte 32) %vec-load-sb32)
     (publish "LOAD" (unsigned-byte 64) %vec-load-ub64)

@@ -1073,3 +1073,224 @@ a writer with a fixed color type ends up with."
     (let ((result (vectorize-made-locals n)))
       (dotimes (i n)
         (assert (eql (aref result i) 3.75f0))))))
+
+;;;; Unary minus.  For floats this is a sign flip, which is not the same as
+;;;; subtracting from zero: (- 0.0) is -0.0, and 0.0 - 0.0 is 0.0.
+
+(defun vectorize-negate-single (a c n)
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i))))
+  c)
+
+(defun vectorize-negate-double (a c n)
+  (declare (type (simple-array double-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i))))
+  c)
+
+(defun vectorize-negate-integer (a c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i))))
+  c)
+
+(with-test (:name :vectorize-unary-minus)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    ;; values include both zeroes: the sign of a zero must survive
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'single-float '(0.0f0 -0.0f0 1.5f0 -2.5f0) n)
+          for c = (make-array n :element-type 'single-float)
+          do (vectorize-negate-single a c n)
+             (dotimes (i n)
+               (let ((want (- (aref a i))) (got (aref c i)))
+                 (unless (eql got want)
+                   (error "~@<negate: element ~D of ~D is ~S, expected ~S.~:@>"
+                          i n got want)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'double-float '(0d0 -0d0 1.5d0 -2.5d0) n)
+          for c = (make-array n :element-type 'double-float)
+          do (vectorize-negate-double a c n)
+             (dotimes (i n)
+               (unless (eql (aref c i) (- (aref a i)))
+                 (error "~@<double negate wrong at element ~D of ~D.~:@>" i n))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(signed-byte 32) '(0 1 -2 7 -100) n)
+          for c = (make-array n :element-type '(signed-byte 32) :initial-element 0)
+          do (vectorize-negate-integer a c n)
+             (dotimes (i n)
+               (unless (= (aref c i) (- (aref a i)))
+                 (error "~@<integer negate wrong at element ~D of ~D.~:@>" i n))))
+    (assert (search "xorps" (disassembly #'vectorize-negate-single))
+            () "single-float negation is not a packed sign flip")
+    (assert (search "xorpd" (disassembly #'vectorize-negate-double))
+            () "double-float negation is not a packed sign flip")))
+
+;;;; Sixteen-bit lanes, eight at a time.
+
+(defun vectorize-u16-subtract (a b c n)
+  (declare (type (simple-array (unsigned-byte 16) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+(defun vectorize-s16-add (a b c n)
+  (declare (type (simple-array (signed-byte 16) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(with-test (:name :vectorize-16-bit-lanes)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(unsigned-byte 16) '(0 1 2 300 65535 4000) n)
+          for b = (vectorize-integer-array '(unsigned-byte 16) '(0 1 2 300 3 4000) n 3)
+          for c = (make-array (+ n 8) :element-type '(unsigned-byte 16)
+                                :initial-element 4321)
+          do (vectorize-u16-subtract a b c n)
+             (dotimes (i n)
+               (unless (= (aref c i) (logand (- (aref a i) (aref b i)) #xFFFF))
+                 (error "~@<u16 subtract wrong at element ~D of ~D.~:@>" i n)))
+             (loop for i from n below (+ n 8)
+                   do (unless (= (aref c i) 4321)
+                        (error "~@<u16 loop wrote element ~D past its bound.~:@>" i))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(signed-byte 16) '(0 1 -2 300 -32768 4000) n)
+          for b = (vectorize-integer-array '(signed-byte 16) '(0 1 -2 300 3 4000) n 3)
+          for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
+          do (vectorize-s16-add a b c n)
+             (dotimes (i n)
+               (unless (= (aref c i)
+                          (let ((v (+ (aref a i) (aref b i))))
+                            (if (logbitp 15 v) (- v #x10000) v)))
+                 (error "~@<s16 add wrong at element ~D of ~D.~:@>" i n))))
+    (assert (search "psubw" (disassembly #'vectorize-u16-subtract))
+            () "16-bit subtraction is not packed")
+    (assert (search "paddw" (disassembly #'vectorize-s16-add))
+            () "16-bit addition is not packed")))
+
+;;;; A declaration of (VECTOR element-type) says the element type but not that the
+;;;; data is inline, so the loop has to work for any vector of that type.
+
+(defun vectorize-vector-declared (a b c n)
+  (declare (type (vector single-float) a b c) (type vectorize-index n) (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(with-test (:name :vectorize-vector-declared)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (assert (some (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-vector-declared)))
+                  *vectorize-packed-mnemonics*)
+            () "a loop over (VECTOR SINGLE-FLOAT) was not vectorized")
+    (macrolet ((case-values (make-a make-b context)
+                 `(loop for n in '(0 1 2 3 5 8 17)
+                        for a = (funcall ,make-a 'single-float *vectorize-single-values* n)
+                        for b = (funcall ,make-b 'single-float *vectorize-single-values* n 3)
+                        for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+                        do (vectorize-vector-declared a b c n)
+                           (dotimes (i n)
+                             (unless (vectorize-same-value-p (aref c i)
+                                                             (+ (aref a i) (aref b i)))
+                               (error "~@<~A: element ~D of ~D is ~S, expected ~S.~:@>"
+                                      ,context i n (aref c i) (+ (aref a i) (aref b i))))))))
+      ;; simple vectors take the fast path
+      (case-values vectorize-array vectorize-array "simple")
+      ;; and adjustable ones still compute the right thing
+      (case-values (lambda (element-type values count &optional (offset 0))
+                     (make-array count :element-type element-type :adjustable t
+                                       :initial-contents (vectorize-fill-list values count offset)))
+                   (lambda (element-type values count &optional (offset 0))
+                     (make-array count :element-type element-type :adjustable t
+                                       :initial-contents (vectorize-fill-list values count offset)))
+                   "adjustable"))))
+
+;;;; An offset may be a variable.  It has to be known not to be negative before the
+;;;; packed loop runs, so a negative one falls back to the scalar loop.
+
+(defun vectorize-variable-offset (a b c n k)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n k)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref c i) (+ (aref a i) (aref b (+ i k)))))
+  c)
+
+(with-test (:name :vectorize-variable-offset)
+  (loop for k in '(0 1 3 8)
+        do (loop for n in '(0 1 2 3 5 17)
+                 for a = (vectorize-array 'single-float *vectorize-single-values* n)
+                 for b = (vectorize-array 'single-float *vectorize-single-values* (+ n k 4))
+                 for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+                 do (vectorize-variable-offset a b c n k)
+                    (dotimes (i n)
+                      (unless (vectorize-same-value-p (aref c i) (+ (aref a i) (aref b (+ i k))))
+                        (error "~@<k=~D: element ~D of ~D is ~S, expected ~S.~:@>"
+                               k i n (aref c i) (+ (aref a i) (aref b (+ i k))))))))
+  ;; a negative offset must not read out of bounds: the guard sends it to the
+  ;; scalar loop, which reports the index error the loop always would
+  (let ((a (vectorize-array 'single-float *vectorize-single-values* 4))
+        (b (vectorize-array 'single-float *vectorize-single-values* 4))
+        (c (make-array 4 :element-type 'single-float :initial-element 0.0f0)))
+    (assert-error (vectorize-variable-offset a b c 4 -1)
+                  sb-int:invalid-array-index-error)))
+
+;;;; A negative scalar broadcast into narrow lanes.  Untagging a negative fixnum
+;;;; sign-extends it, so a byte or word has to be masked to the lane width before it
+;;;; is duplicated by a multiply; getting that wrong turns -3 into (-3 -4 -4 -4).
+
+(defun vectorize-u8-add-negative (a c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
+
+(defun vectorize-s8-add-negative (a c n)
+  (declare (type (simple-array (signed-byte 8) (*)) a c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
+
+(defun vectorize-s16-add-negative (a c n)
+  (declare (type (simple-array (signed-byte 16) (*)) a c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
+
+(defun vectorize-s16-subtract-literal (a c n)
+  (declare (type (simple-array (signed-byte 16) (*)) a c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) 300))))
+
+(with-test (:name :vectorize-negative-narrow-splat)
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 8) '(0 1 2 200 255 7) n)
+        for c = (make-array n :element-type '(unsigned-byte 8) :initial-element 0)
+        do (vectorize-u8-add-negative a c n)
+           (dotimes (i n)
+             (unless (= (aref c i) (logand (+ (aref a i) -3) #xFF))
+               (error "~@<u8 + -3: element ~D of ~D is ~S, expected ~S.~:@>"
+                      i n (aref c i) (logand (+ (aref a i) -3) #xFF)))))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 8) '(0 1 2 -3 127 -128) n)
+        for c = (make-array n :element-type '(signed-byte 8) :initial-element 0)
+        do (vectorize-s8-add-negative a c n)
+           (dotimes (i n)
+             (let ((v (+ (aref a i) -3)))
+               (unless (= (aref c i) (if (logbitp 7 v) (- v #x100) v))
+                 (error "~@<s8 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 16) '(0 1 2 -3 32767 -32768) n)
+        for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
+        do (vectorize-s16-add-negative a c n)
+           (dotimes (i n)
+             (let ((v (+ (aref a i) -3)))
+               (unless (= (aref c i) (if (logbitp 15 v) (- v #x10000) v))
+                 (error "~@<s16 + -3: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 16) '(0 1 299 300 -400 32767) n)
+        for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
+        do (vectorize-s16-subtract-literal a c n)
+           (dotimes (i n)
+             (let ((v (- (aref a i) 300)))
+               (unless (= (aref c i) (if (logbitp 15 v) (- v #x10000) v))
+                 (error "~@<s16 - 300: element ~D of ~D is ~S.~:@>" i n (aref c i)))))))
