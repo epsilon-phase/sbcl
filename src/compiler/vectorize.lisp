@@ -704,13 +704,14 @@
                                                  destination-offset
                                                  index references))
                       ,@(when indexed
-                          ;; leave the pack holding the offsets for the next iteration
+                          ;; leave the pack holding the offsets for the next
+                          ;; iteration
                           (let ((lanes (cdr (assoc :index scalars))))
                             `((setf ,lanes
                                     (,(vector-primitive "ADD" element-type)
                                      ,lanes
                                      (,(vector-primitive "INDEX" element-type)
-                                      (+ ,index ,width)))))))
+                                      (+ ,index ,width))))))))
                     ;; the tail, element by element, exactly as written
                     (do ((,index ,end (1+ ,index)))
                         ((>= ,index ,count))
