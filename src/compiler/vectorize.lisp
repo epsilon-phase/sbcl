@@ -34,6 +34,7 @@
 ;;; The element types this backend can move and compute a vector at a time.
 (defun vector-supported-element-type-p (element-type)
   (member element-type '(single-float double-float
+                         (signed-byte 8) (unsigned-byte 8)
                          (signed-byte 32) (unsigned-byte 32)
                          (signed-byte 64) (unsigned-byte 64))
           :test #'equal))
@@ -52,8 +53,15 @@
 (defun vector-width (element-type)
   (cond ((eq element-type 'single-float) 4)
         ((eq element-type 'double-float) 2)
+        ((eql (second element-type) 8) 16)
         ((eql (second element-type) 32) 4)
         (t 2)))
+
+;;; Byte lanes only carry the meaning of the scalar loop when the scalar loop is
+;;; not checking the element type: at any safety above 0, storing a byte that
+;;; does not fit signals a type error, where a packed store truncates.  Set by
+;;; VECTORIZE-LAMBDA-BODY from the policy and read when expanding.
+(defvar *vectorize-byte-lanes* nil)
 
 ;;; The primitive base name for OPERATOR over ELEMENT-TYPE, or NIL when this
 ;;; pair is not something the backend can do a vector at a time.  Multiplication
@@ -121,7 +129,37 @@
 ;;;   (:CONST . number) a float constant, broadcast
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
-  element-type index count destination sources expression body fallback)
+  element-type index count destination destination-offset sources expression body fallback)
+
+;;; A loop bound the generated code may evaluate more than once: a variable, a
+;;; literal, or arithmetic on one of those, which has no side effects.  A bound
+;;; that could do something visible stays with the scalar loop.
+(defun vector-pure-count-p (count)
+  (cond ((symbolp count) t)
+        ((typep count 'unsigned-byte) t)
+        ((and (consp count) (or (eq (car count) '-) (eq (car count) '+)))
+         (and (= (length count) 3)
+              (symbolp (second count))
+              (typep (third count) 'integer)))
+        ((and (consp count) (memq (car count) '(1- 1+)))
+         (and (= (length count) 2) (symbolp (second count))))
+        (t nil)))
+
+;;; The offset of a subscript from the loop variable: (aref a i) is 0,
+;;; (aref a (+ i 3)) and (aref a (+ 3 i)) are 3.  A negative offset would index
+;;; before the loop variable's range, so it is not taken.
+(defun vector-subscript-offset (subscript index)
+  (cond ((eq subscript index) 0)
+        ((and (consp subscript) (eq (car subscript) '+))
+         (let ((arguments (cdr subscript)))
+           (when (and (= (length arguments) 2)
+                      (member index arguments :test #'eq))
+             (let ((other (if (eq (first arguments) index)
+                              (second arguments)
+                              (first arguments))))
+               (when (typep other '(integer 0 *))
+                 other)))))
+        (t nil)))
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
 (defun vector-match-expression (form env index element-type)
@@ -144,10 +182,12 @@
            (vector-match-expression (third form) env index element-type)))
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
-           (when (and (null (cdr subscripts)) (eq (car subscripts) index))
-             (multiple-value-bind (name type) (vector-array-type array env)
-               (when (equal type element-type)
-                 (list :array name))))))
+           (when (null (cdr subscripts))
+             (let ((offset (vector-subscript-offset (car subscripts) index)))
+               (when offset
+                 (multiple-value-bind (name type) (vector-array-type array env)
+                   (when (equal type element-type)
+                     (list :array name offset))))))))
         ((memq (car form) '(+ - * / logand logior logxor))
          ;; unary minus is not handled: (- x) differs from (- 0 x) on zeroes
          (let ((arguments (cdr form)))
@@ -166,12 +206,15 @@
     (let ((place (second form)))
       (when (and (consp place) (eq (car place) 'aref))
         (destructuring-bind (array . subscripts) (cdr place)
-          (when (and (null (cdr subscripts)) (eq (car subscripts) index))
-            (multiple-value-bind (name element-type) (vector-array-type array env)
-              (when name
-                (let ((expression (vector-match-expression (third form) env index element-type)))
-                  (when expression
-                    (values name element-type expression)))))))))))
+          (when (null (cdr subscripts))
+            (let ((offset (vector-subscript-offset (car subscripts) index)))
+              (when offset
+                (multiple-value-bind (name element-type) (vector-array-type array env)
+                  (when name
+                    (let ((expression
+                            (vector-match-expression (third form) env index element-type)))
+                      (when expression
+                        (values name element-type expression offset)))))))))))))
 
 ;;; Split leading DECLARE forms from a body.
 (defun vector-split-declarations (forms)
@@ -193,10 +236,10 @@
       (when (and (consp spec) (null (cddr spec))) ; no result form: returns NIL
         (destructuring-bind (index count) spec
           (when (and (symbolp index)
-                     (or (symbolp count) (typep count 'unsigned-byte)))
+                     (vector-pure-count-p count))
             (multiple-value-bind (declarations statements) (vector-split-declarations body)
               (when (and (null (cdr statements)) (not (vector-special-declaration-p declarations)))
-                (multiple-value-bind (destination element-type expression)
+                (multiple-value-bind (destination element-type expression offset)
                     (vector-match-element-store (car statements) env index)
                   (when destination
                     (make-vector-loop
@@ -204,15 +247,21 @@
                      :index index
                      :count count
                      :destination destination
+                     :destination-offset offset
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (car statements)
                      :fallback form)))))))))))
 
-;;; The arrays read by an expression tree, in order of first use.
+;;; The arrays read by an expression tree, as an alist of name to the largest
+;;; constant offset the array is read at, in order of first use.
 (defun vector-collect-arrays (expression &optional (accumulator '()))
   (ecase (car expression)
-    (:array (adjoin (second expression) accumulator))
+    (:array (let ((known (assoc (second expression) accumulator)))
+              (if known
+                  (progn (setf (cdr known) (max (cdr known) (third expression))) accumulator)
+                  (append accumulator
+                          (list (cons (second expression) (third expression)))))))
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-arrays subexpression accumulator))))
     ((:scalar :const) accumulator)))
@@ -266,8 +315,8 @@
               (setf clauses (cddr clauses))
               (when (and (vector-loop-keyword (car clauses) "DO")
                          (null (cddr clauses))
-                         (or (symbolp count) (typep count 'unsigned-byte)))
-                (multiple-value-bind (destination element-type expression)
+                         (vector-pure-count-p count))
+                (multiple-value-bind (destination element-type expression offset)
                     (vector-match-element-store (second clauses) env index)
                   (when destination
                     (make-vector-loop
@@ -275,6 +324,7 @@
                      :index index
                      :count count
                      :destination destination
+                     :destination-offset offset
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (second clauses)
@@ -312,7 +362,10 @@
 ;;; leaf to the variable holding its broadcast pack.
 (defun vector-emit (expression element-type index scalars)
   (ecase (car expression)
-    (:array `(,(vector-primitive "LOAD" element-type) ,(second expression) ,index))
+    (:array (if (zerop (third expression))
+                `(,(vector-primitive "LOAD" element-type) ,(second expression) ,index)
+                `(,(vector-primitive "LOAD" element-type) ,(second expression)
+                  (+ ,index ,(third expression)))))
     (:op (let ((operator (second expression)))
            (let ((name (vector-primitive (vector-operator-base operator element-type) element-type)))
              (reduce (lambda (left right) `(,name ,left ,right))
@@ -323,14 +376,23 @@
      ;; splats are computed once, before the loop, and live in an SSE register
      (cdr (assoc expression scalars :test #'equal)))))
 
+;;; The arrays a loop touches, as an alist of name to the largest constant
+;;; offset it is used at, destination first.
+(defun vector-loop-arrays (loop)
+  (let ((destination (assoc (vloop-destination loop) (vloop-sources loop))))
+    (cons (cons (vloop-destination loop) (vloop-destination-offset loop))
+          (remove (vloop-destination loop) (vloop-sources loop)
+                  :key #'car :test #'eq))))
+
 ;;; Return the vectorized form for a matched loop, or NIL if this backend cannot
-;;; express it (which is the normal answer while the target compiler is still
-;;; being built, before the backend primitives exist).
+;;; express it (which is the normal answer on a build whose backend has not
+;;; published its primitives, and for byte lanes outside SAFETY 0).
 (defun vector-expand-loop (loop)
   (let* ((element-type (vloop-element-type loop))
          (width (vector-width element-type))
          (index (vloop-index loop))
          (count (vloop-count loop))
+         (destination-offset (vloop-destination-offset loop))
          (end (make-symbol "VECTOR-END"))
          (expression (vloop-expression loop))
          (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
@@ -340,15 +402,20 @@
          (store (vector-primitive "STORE" element-type))
          (splat (and scalars (vector-primitive "SPLAT" element-type)))
          (arithmetic (mapcar (lambda (operator)
-                               (vector-primitive (vector-operator-base operator element-type) element-type))
+                               (vector-primitive (vector-operator-base operator element-type)
+                                                 element-type))
                              (vector-collect-operators expression))))
-    (when (and load store (every #'identity arithmetic) (or splat (null scalars)))
+    (when (and load store (every #'identity arithmetic) (or splat (null scalars))
+               (or (/= width 16) *vectorize-byte-lanes*))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
       `(if (and (typep ,count 'index)
-                ,@(mapcar (lambda (array) `(>= (length ,array) ,count))
-                          (cons (vloop-destination loop) (vloop-sources loop))))
+                ;; every array has to cover the last element the vector body
+                ;; touches, which is (n - 1) plus that array's offset
+                ,@(mapcar (lambda (entry)
+                            `(>= (length ,(car entry)) (+ ,count ,(cdr entry))))
+                          (vector-loop-arrays loop)))
            (let* (,@(mapcar (lambda (scalar)
                               `(,(cdr scalar) (,splat ,(second (car scalar)))))
                             scalars)
@@ -361,7 +428,9 @@
                (declare (type index ,index))
                (,store ,(vector-emit expression element-type index scalars)
                        ,(vloop-destination loop)
-                       ,index))
+                       ,(if (zerop destination-offset)
+                            index
+                            `(+ ,index ,destination-offset))))
              ;; the tail, element by element, exactly as written
              (do ((,index ,end (1+ ,index)))
                  ((>= ,index ,count))
@@ -460,5 +529,6 @@
   (if (and *auto-vectorize*
            (member :x86-64 *features*)
            (policy (or local-policy lexenv) (>= speed 2)))
-      (vector-vectorize-body body (vector-parameter-environment vars))
+      (let ((*vectorize-byte-lanes* (policy (or local-policy lexenv) (= safety 0))))
+        (vector-vectorize-body body (vector-parameter-environment vars)))
       body))

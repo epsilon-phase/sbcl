@@ -823,3 +823,214 @@ OPERATION applied to the same numbers, which involves no array loop."
                     (dotimes (i n) (setf (aref a i) (aref a i)))))))
     (assert (not (search "vectorized loop over" output))
             () "A note was emitted for a loop that was not vectorized:~%~A" output)))
+
+;;;; Byte lanes: sixteen at a time, and only at SAFETY 0.
+;;;;
+;;;; A packed byte store truncates where the scalar store signals a type error,
+;;;; so the two agree only when the code has turned the check off.  These loops
+;;;; therefore declare (safety 0); the last test checks that the same loop at the
+;;;; default safety is left scalar instead.
+
+(defun vectorize-u8-subtract (a b c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+(defun vectorize-u8-add (a b c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun vectorize-u8-logxor (a b c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (logxor (aref a i) (aref b i)))))
+
+(defun vectorize-s8-subtract (a b c n)
+  (declare (type (simple-array (signed-byte 8) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+;;; The same loop, checked: it must be left scalar.
+(defun vectorize-u8-subtract-checked (a b c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+(defun vectorize-byte-guard (element-type)
+  "A byte no loop below produces, in range for both byte element types."
+  (if (equal element-type '(unsigned-byte 8)) 222 -34))
+
+(defun vectorize-check-byte-elementwise (function operation element-type
+                                         values-a values-b context)
+  "Compare FUNCTION against OPERATION wrapped to the element type, over every
+test length, and check that nothing was written past N."
+  (loop with guard = (vectorize-byte-guard element-type)
+        for n in *vectorize-lengths*
+        for a = (vectorize-integer-array element-type values-a n)
+        for b = (vectorize-integer-array element-type values-b n 3)
+        for c = (make-array (+ n 16) :element-type element-type
+                              :initial-element guard)
+        do (funcall function a b c n)
+           (dotimes (i n)
+             (let ((want (logand (funcall operation (aref a i) (aref b i)) #xFF))
+                   (got (aref c i)))
+               (unless (= (logand got #xFF) want)
+                 (error "~@<~A: element ~D of ~D is ~S, expected ~S.~:@>"
+                        context i n got want))))
+           (loop for i from n below (+ n 16)
+                 do (unless (= (aref c i) guard)
+                      (error "~@<~A: element ~D is past the loop bound but was written.~:@>"
+                             context i)))))
+
+(defparameter *vectorize-u8-values* '(0 1 2 3 7 11 100 255 128 64))
+(defparameter *vectorize-s8-values* '(0 1 -2 3 -7 11 -100 127 -128 64))
+
+(with-test (:name :vectorize-byte-subtract)
+  (vectorize-check-byte-elementwise #'vectorize-u8-subtract #'- '(unsigned-byte 8)
+                                    *vectorize-u8-values* *vectorize-u8-values*
+                                    'vectorize-u8-subtract))
+
+(with-test (:name :vectorize-byte-add)
+  (vectorize-check-byte-elementwise #'vectorize-u8-add #'+ '(unsigned-byte 8)
+                                    *vectorize-u8-values* *vectorize-u8-values*
+                                    'vectorize-u8-add))
+
+(with-test (:name :vectorize-byte-bitwise)
+  (vectorize-check-byte-elementwise #'vectorize-u8-logxor #'logxor '(unsigned-byte 8)
+                                    *vectorize-u8-values* *vectorize-u8-values*
+                                    'vectorize-u8-logxor))
+
+(with-test (:name :vectorize-signed-byte-subtract)
+  (vectorize-check-byte-elementwise #'vectorize-s8-subtract #'- '(signed-byte 8)
+                                    *vectorize-s8-values* *vectorize-s8-values*
+                                    'vectorize-s8-subtract))
+
+(with-test (:name :vectorize-byte-disassembly)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (let ((text (disassembly #'vectorize-u8-subtract)))
+      (assert (search "psubb" text) () "u8 subtract is not packed:~%~A" text)
+      (assert (search "movdqu" text) () "u8 subtract does not move 16 bytes:~%~A" text))
+    (assert (search "paddb" (disassembly #'vectorize-u8-add))
+            () "u8 add is not packed")
+    (assert (search "pxor" (disassembly #'vectorize-u8-logxor))
+            () "u8 logxor is not packed")))
+
+;;; At the default safety the scalar loop may signal, so the vectorizer must not
+;;; take it; the values it computes are still right when nothing signals.
+(with-test (:name :vectorize-byte-needs-safety-0)
+  (let ((text (string-downcase (with-output-to-string (stream)
+                                 (disassemble #'vectorize-u8-subtract-checked
+                                              :stream stream)))))
+    (assert (notany (lambda (mnemonic) (search mnemonic text))
+                    '("psubb" "pxor" "paddb"))
+            () "a checked u8 loop was vectorized:~%~A" text))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 8) '(200 100 55 240) n)
+        for b = (vectorize-integer-array '(unsigned-byte 8) '(0 1 2 3) n 3)
+        for c = (make-array n :element-type '(unsigned-byte 8) :initial-element 0)
+        do (vectorize-u8-subtract-checked a b c n)
+           (dotimes (i n)
+             (assert (= (aref c i) (- (aref a i) (aref b i)))))))
+
+(defun vectorize-impure-count (a b c n count-function)
+  (declare (type (simple-array single-float (*)) a b c) (optimize speed))
+  (dotimes (i (the fixnum (funcall count-function)))
+    (setf (aref c i) (- (aref a i) (aref b i))))
+  (declare (ignore n))
+  c)
+
+;;;; Constant offsets in the index, which is what a PNG row filter needs.
+;;;;
+;;;;   filtered[i] = raw[i] - raw[i - bpp]        (Sub)
+;;;;   filtered[i] = raw[i] - prior[i]            (Up)
+;;;;
+;;;; Sub, over the whole buffer, reads and writes at a constant offset from the
+;;;; loop variable; Up is the two-array elementwise shape.  Both are byte arrays
+;;;; in image code, so they declare (safety 0) as image code does.
+
+(defun vectorize-offset-subtract (a b c n offset)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n offset)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref c (+ i offset)) (- (aref a (+ i offset)) (aref b i))))
+  c)
+
+(defun vectorize-png-sub-filter (raw filtered n bpp)
+  "PNG filter type 1 (Sub) over a whole buffer, the way a writer would do it."
+  (declare (type (simple-array (unsigned-byte 8) (*)) raw filtered)
+           (type vectorize-index n bpp) (optimize speed (safety 0)))
+  (dotimes (i (min bpp n))
+    (setf (aref filtered i) (aref raw i)))
+  (dotimes (i (- n bpp))
+    (setf (aref filtered (+ i bpp))
+          (- (aref raw (+ i bpp)) (aref raw i))))
+  filtered)
+
+(defun vectorize-png-up-filter (raw prior filtered n)
+  "PNG filter type 2 (Up): two arrays, elementwise."
+  (declare (type (simple-array (unsigned-byte 8) (*)) raw prior filtered)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n)
+    (setf (aref filtered i) (- (aref raw i) (aref prior i))))
+  filtered)
+
+(with-test (:name :vectorize-offset-subtract)
+  (loop for n in *vectorize-lengths*
+        for offset = 3
+        for a = (vectorize-array 'single-float *vectorize-single-values* (+ n offset))
+        for b = (vectorize-array 'single-float *vectorize-single-values* n 3)
+        for c = (vectorize-sentinel-array 'single-float (+ n offset))
+        do (vectorize-offset-subtract a b c n offset)
+           (dotimes (i n)
+             (let ((want (- (aref a (+ i offset)) (aref b i)))
+                   (got (aref c (+ i offset))))
+               (unless (vectorize-same-value-p got want)
+                 (error "~@<offset loop: element ~D of ~D is ~S, expected ~S.~:@>"
+                        i n got want))))
+           ;; the elements before the offset are untouched
+           (dotimes (i offset)
+             (unless (eql (aref c i) (vectorize-sentinel 'single-float))
+               (error "~@<offset loop wrote element ~D, before its offset.~:@>" i)))))
+
+(with-test (:name :vectorize-png-sub-filter)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop for n in '(0 1 3 4 17 31 64 65 1000)
+          for bpp = 3
+          for raw = (let ((v (make-array n :element-type '(unsigned-byte 8))))
+                      (dotimes (i n v) (setf (aref v i) (mod (+ (* i 7) (* i i)) 256))))
+          for a = (make-array n :element-type '(unsigned-byte 8) :initial-element 200)
+          for b = (make-array n :element-type '(unsigned-byte 8) :initial-element 200)
+          do (vectorize-png-sub-filter raw a n bpp)
+             (vectorize-png-up-filter raw raw b n)
+             (dotimes (i n)
+               (let ((sub (if (< i bpp) (aref raw i)
+                              (logand (- (aref raw i) (aref raw (- i bpp))) #xFF))))
+                 (unless (= (aref a i) sub)
+                   (error "~@<Sub filter, length ~D: element ~D is ~S, expected ~S.~:@>"
+                          n i (aref a i) sub))))
+             (dotimes (i n)
+               (unless (= (aref b i) 0)
+                 (error "~@<Up filter of a buffer with itself, length ~D: element ~D is ~S.~:@>"
+                        n i (aref b i)))))
+    ;; both filters are the packed loop
+    (let ((text (disassembly #'vectorize-png-sub-filter)))
+      (assert (search "psubb" text) () "Sub filter is not packed:~%~A" text))
+    (let ((text (disassembly #'vectorize-png-up-filter)))
+      (assert (search "psubb" text) () "Up filter is not packed:~%~A" text))))
+
+;;; A bound that could have side effects must stay with the scalar loop, and the
+;;; loop must still compute correctly.
+(with-test (:name :vectorize-impure-bound)
+  (let* ((calls 0)
+         (function (lambda (a b c n) (vectorize-impure-count a b c n (lambda () (incf calls) n))))
+         (a (vectorize-array 'single-float '(1.0f0 2.0f0 3.0f0) 8))
+         (b (vectorize-array 'single-float '(0.5f0 1.0f0) 8 1))
+         (c (make-array 8 :element-type 'single-float :initial-element 0.0f0)))
+    (funcall function a b c 4)
+    (dotimes (i 4)
+      (assert (= (aref c i) (- (aref a i) (aref b i)))))))

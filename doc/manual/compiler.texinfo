@@ -1265,12 +1265,18 @@ The supported element types and the operations on them are
 @item @code{double-float}, two at a time, with the same operations;
 @item @code{(signed-byte 32)} and @code{(unsigned-byte 32)}, four at a time,
 and @code{(signed-byte 64)} and @code{(unsigned-byte 64)}, two at a time, with
-@code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor}.
+@code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor};
+@item @code{(unsigned-byte 8)} and @code{(signed-byte 8)}, sixteen at a time,
+with the same operations, but only when the code is compiled at @code{(safety
+0)}.  A packed byte store truncates where the scalar store signals a type error,
+so at the default safety the two do not mean the same thing and the loop is left
+scalar.  Image processing code usually declares @code{(safety 0)} already.
 @end itemize
 
 @noindent
 Integer arithmetic wraps around at the width of the element type, which is what
-a scalar loop storing into an array of that type does.  Multiplication and
+a scalar loop storing into an array of that type does once the range check is
+off.  Multiplication and
 division are available for the float element types only.
 
 The loop may be written as a @code{dotimes}, or as a @code{loop} whose clauses
