@@ -1036,3 +1036,40 @@ a writer with a fixed color type ends up with."
     (funcall function a b c 4)
     (dotimes (i 4)
       (assert (= (aref c i) (- (aref a i) (aref b i)))))))
+
+;;;; A local (MAKE-ARRAY ... :ELEMENT-TYPE 'TYPE) is a declaration the source
+;;;; already wrote, so the bindings are read as one.  An adjustable or displaced
+;;;; array is not a simple array, so it must stay out.
+
+(defun vectorize-made-locals (n)
+  (declare (optimize speed))
+  (let ((a (make-array n :element-type 'single-float :initial-element 1.5))
+        (b (make-array n :element-type 'single-float :initial-element 2.25))
+        (c (make-array n :element-type 'single-float)))
+    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+    c))
+
+(defun vectorize-made-locals-adjustable (n)
+  (declare (optimize speed))
+  (let ((a (make-array n :element-type 'single-float :adjustable t :initial-element 1.5))
+        (b (make-array n :element-type 'single-float :adjustable t :initial-element 2.25))
+        (c (make-array n :element-type 'single-float :adjustable t)))
+    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+    c))
+
+(with-test (:name :vectorize-made-locals)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (let ((text (disassembly #'vectorize-made-locals)))
+      (assert (some (lambda (mnemonic) (search mnemonic text))
+                    *vectorize-packed-mnemonics*)
+              () "a loop over local MAKE-ARRAY results was not vectorized:~%~A" text))
+    (let ((text (disassembly #'vectorize-made-locals-adjustable)))
+      (assert (notany (lambda (mnemonic) (search mnemonic text))
+                      '("addps" "addpd"))
+              () "a loop over adjustable arrays was vectorized:~%~A" text)))
+  (dolist (n '(0 1 2 3 4 7 16 17))
+    (let ((result (vectorize-made-locals n)))
+      (dotimes (i n)
+        (assert (eql (aref result i) 3.75f0))))))
