@@ -25,14 +25,50 @@
 ;;; Set to NIL to compile without automatic vectorization.
 (defvar *auto-vectorize* t)
 
+;;; When true, a vectorized loop produces a compiler note naming the element
+;;; type and how many elements are handled at a time.
+(defvar *auto-vectorize-notes* t)
+
 ;;;; Deciding what a variable is declared to be
 
-;;; The float element type of a declared simple array, or NIL.
+;;; The element types this backend can move and compute a vector at a time.
+(defun vector-supported-element-type-p (element-type)
+  (member element-type '(single-float double-float
+                         (signed-byte 32) (unsigned-byte 32)
+                         (signed-byte 64) (unsigned-byte 64))
+          :test #'equal))
+
+(defun vector-float-element-type-p (element-type)
+  (memq element-type '(single-float double-float)))
+
+;;; The element type of a declared simple array, or NIL.
 (defun vector-element-type (spec)
   (when (and (consp spec) (eq (car spec) 'simple-array))
     (let ((element-type (second spec)))
-      (when (memq element-type '(single-float double-float))
+      (when (vector-supported-element-type-p element-type)
         element-type))))
+
+;;; How many elements the backend handles at a time: 128 bits worth.
+(defun vector-width (element-type)
+  (cond ((eq element-type 'single-float) 4)
+        ((eq element-type 'double-float) 2)
+        ((eql (second element-type) 32) 4)
+        (t 2)))
+
+;;; The primitive base name for OPERATOR over ELEMENT-TYPE, or NIL when this
+;;; pair is not something the backend can do a vector at a time.  Multiplication
+;;; and division are float only (the packed integer forms are narrower than the
+;;; element type); the bitwise operations are integer only.
+(defun vector-operator-base (operator element-type)
+  (let ((floats (vector-float-element-type-p element-type)))
+    (case operator
+      (+ "ADD")
+      (- "SUB")
+      (* (and floats "MUL"))
+      (/ (and floats "DIV"))
+      (logand (and (not floats) "AND"))
+      (logior (and (not floats) "OR"))
+      (logxor (and (not floats) "XOR")))))
 
 ;;; Extend ENV (an alist of variable name to declared type spec) by the
 ;;; declarations found at the head of FORMS.
@@ -55,7 +91,7 @@
 (defun vector-variable-info (variable env)
   (let ((spec (cdr (assq variable env))))
     (cond ((null spec) (values nil nil))
-          ((memq spec '(single-float double-float)) (values :scalar spec))
+          ((vector-supported-element-type-p spec) (values :scalar spec))
           (t (let ((element-type (vector-element-type spec)))
                (if element-type (values :array element-type) (values nil nil)))))))
 
@@ -85,31 +121,37 @@
 ;;;   (:CONST . number) a float constant, broadcast
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
-  element-type index count destination sources expression body)
+  element-type index count destination sources expression body fallback)
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
 (defun vector-match-expression (form env index element-type)
   (cond ((numberp form)
-         (when (typep form element-type) (list :const form)))
+         ;; An integer constant has to fit in a fixnum: anything wider reaches the
+         ;; backend as a bignum, which no splat accepts, so the loop is better
+         ;; left scalar than rejected later.
+         (when (and (typep form element-type)
+                    (or (vector-float-element-type-p element-type)
+                        (typep form 'fixnum)))
+           (list :const form)))
         ((symbolp form)
          (multiple-value-bind (kind type) (vector-variable-info form env)
-           (when (and (eq kind :scalar) (eq type element-type))
+           (when (and (eq kind :scalar) (equal type element-type))
              (list :scalar form))))
         ((atom form) nil)
         ((eq (car form) 'the)
          ;; only a THE that pins the element type exactly is usable
-         (when (eq (second form) element-type)
+         (when (equal (second form) element-type)
            (vector-match-expression (third form) env index element-type)))
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
            (when (and (null (cdr subscripts)) (eq (car subscripts) index))
              (multiple-value-bind (name type) (vector-array-type array env)
-               (when (eq type element-type)
+               (when (equal type element-type)
                  (list :array name))))))
-        ((memq (car form) '(+ - * /))
+        ((memq (car form) '(+ - * / logand logior logxor))
          ;; unary minus is not handled: (- x) differs from (- 0 x) on zeroes
          (let ((arguments (cdr form)))
-           (when (cdr arguments)
+           (when (and (cdr arguments) (vector-operator-base (car form) element-type))
              (let ((subexpressions
                      (mapcar (lambda (argument)
                                (vector-match-expression argument env index element-type))
@@ -164,7 +206,8 @@
                      :destination destination
                      :sources (vector-collect-arrays expression)
                      :expression expression
-                     :body (car statements))))))))))))
+                     :body (car statements)
+                     :fallback form)))))))))))
 
 ;;; The arrays read by an expression tree, in order of first use.
 (defun vector-collect-arrays (expression &optional (accumulator '()))
@@ -181,6 +224,61 @@
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-scalars subexpression accumulator))))
     ((:scalar :const) (adjoin expression accumulator :test #'equal))))
+
+;;; (1- n) and (- n 1) are the same bound as N one step down.
+(defun vector-normalize-bound (count)
+  (if (and (consp count)
+           (or (and (eq (car count) '1-) (null (cddr count)))
+               (and (eq (car count) '-) (eql (third count) 1) (null (cdddr count)))))
+      (second count)
+      count))
+
+;;; A LOOP clause keyword: the symbols in a LOOP form are the user's own, so
+;;; they are matched by name rather than by identity.
+(defun vector-loop-keyword (form name)
+  (and (symbolp form) (string-equal (symbol-name form) name)))
+
+;;; Match the LOOP shapes that mean the same thing as a DOTIMES over an
+;;; elementwise body:
+;;;
+;;;   (loop for index [of-type type] [from 0] below|upto count do body)
+;;;
+;;; BELOW and UPTO are synonyms in LOOP.  A bound written as (1- n) or (- n 1) is
+;;; the same as BELOW N, so it normalizes to that.  Anything else - a nonzero
+;;; start, a TO bound, several body forms, other clauses - is left alone.
+(defun vector-match-loop (form env)
+  (when (and (consp form) (eq (car form) 'loop))
+    (let ((clauses (cdr form)))
+      (when (and (or (vector-loop-keyword (car clauses) "FOR")
+                     (vector-loop-keyword (car clauses) "AS"))
+                 (symbolp (second clauses)))
+        (let ((index (second clauses)))
+          (setf clauses (cddr clauses))
+          (when (vector-loop-keyword (car clauses) "OF-TYPE")
+            (setf clauses (cddr clauses)))
+          (when (vector-loop-keyword (car clauses) "FROM")
+            (unless (equal (second clauses) 0)
+              (return-from vector-match-loop nil))
+            (setf clauses (cddr clauses)))
+          (when (or (vector-loop-keyword (car clauses) "BELOW")
+                    (vector-loop-keyword (car clauses) "UPTO"))
+            (let ((count (vector-normalize-bound (second clauses))))
+              (setf clauses (cddr clauses))
+              (when (and (vector-loop-keyword (car clauses) "DO")
+                         (null (cddr clauses))
+                         (or (symbolp count) (typep count 'unsigned-byte)))
+                (multiple-value-bind (destination element-type expression)
+                    (vector-match-element-store (second clauses) env index)
+                  (when destination
+                    (make-vector-loop
+                     :element-type element-type
+                     :index index
+                     :count count
+                     :destination destination
+                     :sources (vector-collect-arrays expression)
+                     :expression expression
+                     :body (second clauses)
+                     :fallback form)))))))))))
 
 ;;;; Generating the vectorized loop
 
@@ -216,7 +314,7 @@
   (ecase (car expression)
     (:array `(,(vector-primitive "LOAD" element-type) ,(second expression) ,index))
     (:op (let ((operator (second expression)))
-           (let ((name (vector-primitive (vector-arithmetic-base operator) element-type)))
+           (let ((name (vector-primitive (vector-operator-base operator element-type) element-type)))
              (reduce (lambda (left right) `(,name ,left ,right))
                      (mapcar (lambda (subexpression)
                                (vector-emit subexpression element-type index scalars))
@@ -230,7 +328,7 @@
 ;;; being built, before the backend primitives exist).
 (defun vector-expand-loop (loop)
   (let* ((element-type (vloop-element-type loop))
-         (width (if (eq element-type 'single-float) 4 2))
+         (width (vector-width element-type))
          (index (vloop-index loop))
          (count (vloop-count loop))
          (end (make-symbol "VECTOR-END"))
@@ -242,9 +340,12 @@
          (store (vector-primitive "STORE" element-type))
          (splat (and scalars (vector-primitive "SPLAT" element-type)))
          (arithmetic (mapcar (lambda (operator)
-                               (vector-primitive (vector-arithmetic-base operator) element-type))
+                               (vector-primitive (vector-operator-base operator element-type) element-type))
                              (vector-collect-operators expression))))
     (when (and load store (every #'identity arithmetic) (or splat (null scalars)))
+      (when *auto-vectorize-notes*
+        (compiler-notify "vectorized loop over ~a, ~a elements at a time"
+                         element-type width))
       `(if (and (typep ,count 'index)
                 ,@(mapcar (lambda (array) `(>= (length ,array) ,count))
                           (cons (vloop-destination loop) (vloop-sources loop))))
@@ -267,7 +368,7 @@
                (declare (type index ,index))
                ,(vloop-body loop)))
            ;; not the shape we want: the loop the user wrote
-           (dotimes (,index ,count) ,(vloop-body loop))))))
+           ,(vloop-fallback loop)))))
 
 ;;;; Walking a body
 
@@ -288,8 +389,11 @@
                       `(function ,(vector-vectorize-form (second form) env))
                       form))
         (dolist `(dolist ,(second form) ,@(vector-vectorize-body (cddr form) env)))
-        (dotimes (let ((loop (vector-match-dotimes form env)))
-                   (or (and loop (vector-expand-loop loop)) form)))
+        ((dotimes loop)
+         (let ((plan (if (eq (car form) 'dotimes)
+                         (vector-match-dotimes form env)
+                         (vector-match-loop form env))))
+           (or (and plan (vector-expand-loop plan)) form)))
         (lambda `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env)))
         ((let let*)
          (multiple-value-bind (declarations statements) (vector-split-declarations (cddr form))

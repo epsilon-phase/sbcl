@@ -494,3 +494,332 @@ does not involve any array loop and so cannot itself be vectorized."
                   ()
                   "~S loop without declarations contains ~A~%~A"
                   element-type mnemonic scalar))))))
+
+;;;; Integer element types.
+;;;;
+;;;; The same elementwise contract as the float tests, over the four integer
+;;;; element types the vectorizer handles.  The values are chosen so that no
+;;;; result leaves the element type's range: a packed lane wraps around, and what
+;;;; the scalar path does with an out-of-range store is not something this suite
+;;;; is here to pin down.
+
+(defparameter *vectorize-u32-values* '(0 1 2 3 7 11 100 255 1000 65535))
+(defparameter *vectorize-s32-values* '(0 1 -2 3 -7 11 -100 255 -1000 65535 -65535))
+(defparameter *vectorize-u64-values* '(0 1 2 3 1099511627776 4294967296 1000 65535))
+(defparameter *vectorize-s64-values* '(0 1 -2 3 -1099511627776 4294967296 -1000 65535))
+
+;;; A value no loop below can produce, in range for all four element types.
+(defparameter *vectorize-integer-guard* 12345)
+
+(defun vectorize-integer-array (element-type values count &optional (offset 0))
+  (make-array count
+              :element-type element-type
+              :initial-contents (vectorize-fill-list values count offset)))
+
+(defun vectorize-check-integer-elementwise (function operation element-type
+                                            values-a values-b context)
+  "Run FUNCTION over every test length and compare each element against
+OPERATION applied to the same numbers, which involves no array loop."
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array element-type values-a n)
+        for b = (vectorize-integer-array element-type values-b n 3)
+        ;; eight spare elements: a packed store that ran past N would land in them
+        for c = (make-array (+ n 8) :element-type element-type
+                              :initial-element *vectorize-integer-guard*)
+        do (funcall function a b c n)
+           (dotimes (i n)
+             (let ((want (funcall operation (aref a i) (aref b i)))
+                   (got (aref c i)))
+               (unless (= got want)
+                 (error "~@<~A: element ~D of ~D is ~S, expected ~S.~:@>"
+                        context i n got want))))
+           (loop for i from n below (+ n 8)
+                 do (unless (= (aref c i) *vectorize-integer-guard*)
+                      (error "~@<~A: element ~D is past the loop bound but was written: ~S.~:@>"
+                             context i (aref c i))))))
+
+;;; The loops.  Declared, so they vectorize; the operations are elementwise.
+
+(defun vectorize-u32-add (a b c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun vectorize-s32-add (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun vectorize-u64-add (a b c n)
+  (declare (type (simple-array (unsigned-byte 64) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun vectorize-s64-add (a b c n)
+  (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
+
+(defun vectorize-s32-subtract (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+(defun vectorize-s64-subtract (a b c n)
+  (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
+
+(defun vectorize-s32-logand (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (logand (aref a i) (aref b i)))))
+
+(defun vectorize-s32-logior (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (logior (aref a i) (aref b i)))))
+
+(defun vectorize-u64-logxor (a b c n)
+  (declare (type (simple-array (unsigned-byte 64) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (logxor (aref a i) (aref b i)))))
+
+;;; The negative constant is the interesting one: it reaches the backend as a
+;;; tagged fixnum, and a lane that is broadcast from a tagged value has to be
+;;; recovered arithmetically, or -3 comes out as a huge positive.
+(defun vectorize-s32-add-negative-constant (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
+
+(defun vectorize-s64-subtract-scalar (a b c n k)
+  (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
+           (type (signed-byte 64) k) (optimize speed))
+  (dotimes (i n) (setf (aref c i) (- (aref a i) k))))
+
+(with-test (:name :vectorize-integer-add)
+  (vectorize-check-integer-elementwise #'vectorize-u32-add #'+ '(unsigned-byte 32)
+                                       *vectorize-u32-values* *vectorize-u32-values*
+                                       'vectorize-u32-add)
+  (vectorize-check-integer-elementwise #'vectorize-s32-add #'+ '(signed-byte 32)
+                                       *vectorize-s32-values* *vectorize-s32-values*
+                                       'vectorize-s32-add)
+  (vectorize-check-integer-elementwise #'vectorize-u64-add #'+ '(unsigned-byte 64)
+                                       *vectorize-u64-values* *vectorize-u64-values*
+                                       'vectorize-u64-add)
+  (vectorize-check-integer-elementwise #'vectorize-s64-add #'+ '(signed-byte 64)
+                                       *vectorize-s64-values* *vectorize-s64-values*
+                                       'vectorize-s64-add))
+
+(with-test (:name :vectorize-integer-subtract)
+  ;; the minuend pattern is the larger one, so nothing wraps
+  (vectorize-check-integer-elementwise #'vectorize-s32-subtract #'-
+                                       '(signed-byte 32)
+                                       '(65535 1000 255 100 11 7 3 2 1 0)
+                                       *vectorize-s32-values* 'vectorize-s32-subtract)
+  (vectorize-check-integer-elementwise #'vectorize-s64-subtract #'-
+                                       '(signed-byte 64)
+                                       '(4294967296 1099511627776 65535 1000 1 0)
+                                       *vectorize-s64-values* 'vectorize-s64-subtract))
+
+(with-test (:name :vectorize-integer-bitwise)
+  (vectorize-check-integer-elementwise #'vectorize-s32-logand #'logand '(signed-byte 32)
+                                       *vectorize-s32-values* *vectorize-s32-values*
+                                       'vectorize-s32-logand)
+  (vectorize-check-integer-elementwise #'vectorize-s32-logior #'logior '(signed-byte 32)
+                                       '(0 1 2 4 8 16 32 64) '(0 3 5 9 17 33 65 129)
+                                       'vectorize-s32-logior)
+  (vectorize-check-integer-elementwise #'vectorize-u64-logxor #'logxor '(unsigned-byte 64)
+                                       *vectorize-u64-values* '(1 2 3 4 5 6 7 8)
+                                       'vectorize-u64-logxor))
+
+(with-test (:name :vectorize-integer-negative-constant)
+  (vectorize-check-integer-elementwise #'vectorize-s32-add-negative-constant
+                                       (lambda (x ignorable) (declare (ignore ignorable)) (+ x -3))
+                                       '(signed-byte 32)
+                                       *vectorize-s32-values* *vectorize-s32-values*
+                                       'vectorize-s32-add-negative-constant))
+
+(with-test (:name :vectorize-integer-scalar-variable)
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 64) *vectorize-s64-values* n)
+        for c = (make-array (+ n 4) :element-type '(signed-byte 64)
+                              :initial-element *vectorize-integer-guard*)
+        for k = -1099511627776
+        do (vectorize-s64-subtract-scalar a a c n k)
+           (dotimes (i n)
+             (let ((want (- (aref a i) k)))
+               (unless (= (aref c i) want)
+                 (error "~@<element ~D of ~D is ~S, expected ~S.~:@>"
+                        i n (aref c i) want))))))
+
+;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
+;;; not rejected by the backend, and must compute what it always computed.
+(with-test (:name :vectorize-integer-wide-constant)
+  (flet ((loop-with-wide-constant (a c n)
+           (declare (type (simple-array (unsigned-byte 64) (*)) a c)
+                    (type vectorize-index n) (optimize speed))
+           (dotimes (i n) (setf (aref c i) (+ (aref a i) 18446744073709551615)))))
+    (let* ((n 17)
+           (a (make-array n :element-type '(unsigned-byte 64) :initial-element 0))
+           (c (make-array n :element-type '(unsigned-byte 64) :initial-element 0)))
+      (loop-with-wide-constant a c n)
+      (dotimes (i n)
+        (assert (= (aref c i) 18446744073709551615))))))
+
+(with-test (:name :vectorize-integer-disassembly)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (dolist (case (list (cons #'vectorize-s32-add '("paddd" "psubd" "movdqu"))
+                        (cons #'vectorize-u64-add '("paddq" "movdqu"))
+                        (cons #'vectorize-s32-logand '("pand" "movdqu"))))
+      (let ((text (disassembly (car case))))
+        (assert (some (lambda (mnemonic) (search mnemonic text)) (cdr case))
+                ()
+                "~S was not vectorized:~%~A" (car case) text)))))
+
+;;;; LOOP forms.  The vectorizer recognizes
+;;;;
+;;;;   (loop for i [of-type type] [from 0] below|upto n do <elementwise store>)
+;;;;
+;;;; which must produce exactly what the DOTIMES version produces; loop shapes
+;;;; it does not recognize must still compute the right thing, scalar.
+
+(defun vectorize-single-add-dotimes (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-single-add-loop-below (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-single-add-loop-from-0 (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i from 0 below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-single-add-loop-of-type (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i of-type fixnum below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-single-add-loop-upto (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i upto (1- n) do (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(with-test (:name :vectorize-loop-forms)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'single-float *vectorize-single-values* n)
+          for b = (vectorize-array 'single-float *vectorize-single-values* n 3)
+          for reference = (vectorize-array 'single-float *vectorize-single-values* n)
+          do (funcall #'vectorize-single-add-dotimes a b reference n)
+             (dolist (function (list #'vectorize-single-add-loop-below
+                                     #'vectorize-single-add-loop-from-0
+                                     #'vectorize-single-add-loop-of-type
+                                     #'vectorize-single-add-loop-upto))
+               (let ((c (vectorize-sentinel-array 'single-float n)))
+                 (funcall function a b c n)
+                 (dotimes (i n)
+                   (unless (eql (aref c i) (aref reference i))
+                     (error "~@<~S, length ~D: element ~D is ~S, expected ~S.~:@>"
+                            function n i (aref c i) (aref reference i)))))))
+    ;; and each of them really is the packed loop
+    (dolist (function (list #'vectorize-single-add-loop-below
+                            #'vectorize-single-add-loop-from-0
+                            #'vectorize-single-add-loop-of-type
+                            #'vectorize-single-add-loop-upto))
+      (let ((text (disassembly function)))
+        (assert (some (lambda (mnemonic) (search mnemonic text))
+                      *vectorize-packed-mnemonics*)
+                () "~S was not vectorized:~%~A" function text)))))
+
+;;; Loops that must be left alone, and must still be right.
+
+(defun vectorize-single-add-loop-from-1 (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i from 1 below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-single-add-loop-with-finally (a b c n)
+  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i)))
+        finally (return c)))
+
+(defun vectorize-single-accumulate (a c n)
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i below n do (incf (aref c i) (aref a i)))
+  c)
+
+(with-test (:name :vectorize-loop-not-recognized)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'single-float *vectorize-single-values* n)
+          for b = (vectorize-array 'single-float *vectorize-single-values* n 3)
+          do ;; a nonzero start leaves element 0 alone
+             (let ((c (vectorize-sentinel-array 'single-float n)))
+               (vectorize-single-add-loop-from-1 a b c n)
+               (when (plusp n)
+                 (unless (eql (aref c 0) (vectorize-sentinel 'single-float))
+                   (error "~@<a loop from 1 wrote element 0.~:@>")))
+               (loop for i from 1 below n
+                     do (unless (eql (aref c i) (+ (aref a i) (aref b i)))
+                          (error "~@<a loop from 1 is wrong at element ~D of ~D.~:@>" i n))))
+             ;; a FINALLY clause is not one of the shapes recognized
+             (let ((c (vectorize-sentinel-array 'single-float n)))
+               (vectorize-single-add-loop-with-finally a b c n)
+               (dotimes (i n)
+                 (unless (eql (aref c i) (+ (aref a i) (aref b i)))
+                   (error "~@<a loop with FINALLY is wrong at element ~D of ~D.~:@>" i n))))
+             ;; accumulating into the destination is not elementwise assignment
+             (let ((c (make-array n :element-type 'single-float :initial-element 1.0f0)))
+               (vectorize-single-accumulate a c n)
+               (dotimes (i n)
+                 (unless (eql (aref c i) (+ 1.0f0 (aref a i)))
+                   (error "~@<an accumulating loop is wrong at element ~D of ~D.~:@>" i n)))))
+    (dolist (function (list #'vectorize-single-add-loop-from-1
+                            #'vectorize-single-add-loop-with-finally
+                            #'vectorize-single-accumulate))
+      (let ((text (disassembly function)))
+        (assert (notany (lambda (mnemonic) (search mnemonic text))
+                        '("addps" "addpd"))
+                () "~S was vectorized but should not have been:~%~A" function text)))))
+
+;;;; The compiler says what it did.  A vectorized loop is reported by a note,
+;;;; and a loop that is not vectorized is silent about it.
+
+(defun vectorize-note-output (form)
+  (with-output-to-string (stream)
+    (let ((*error-output* stream))
+      (compile nil form))))
+
+(with-test (:name :vectorize-note)
+  (let ((output (vectorize-note-output
+                 '(lambda (a b c n)
+                    (declare (type (simple-array single-float (*)) a b c)
+                             (type vectorize-index n) (optimize speed))
+                    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+    (assert (search "vectorized loop over" output) () "No vectorization note in:~%~A" output))
+  (let ((output (vectorize-note-output
+                 '(lambda (a n)
+                    (declare (type vector n) (optimize speed))
+                    (dotimes (i n) (setf (aref a i) (aref a i)))))))
+    (assert (not (search "vectorized loop over" output))
+            () "A note was emitted for a loop that was not vectorized:~%~A" output)))

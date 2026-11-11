@@ -1228,8 +1228,8 @@ efficient calling convention that forbids redefinition.
 @cindex vectorization
 @cindex SIMD
 
-On x86-64, a simple elementwise loop over float arrays is compiled to packed
-SSE instructions instead of scalar ones, so the loop
+On x86-64, an elementwise loop over an array is compiled to packed SSE
+instructions instead of scalar ones, so the loop
 
 @lisp
 (defun add (a b c n)
@@ -1242,16 +1242,14 @@ SSE instructions instead of scalar ones, so the loop
 
 @noindent
 becomes one @code{movups}-@code{addps}-@code{movups} sequence per four elements
-followed by a scalar loop over the remaining ones; doubles are handled two at a
-time by the same mechanism.
+followed by a scalar loop over the remaining ones.
 
 Vectorization is driven by declarations rather than by type inference: an array
-takes part only when the code declares it to be a @code{(simple-array
-single-float (*))} or a @code{(simple-array double-float (*))}, either in the
-declarations of the enclosing function or by wrapping the reference in a
-@code{the}.  That is deliberate, because the rewrite loads and stores several
-elements without a per-element bounds check, and it is the declaration which
-authorizes that.
+takes part only when the code declares it to be a simple array of a supported
+element type, either in the declarations of the enclosing function or by
+wrapping the reference in a @code{the}.  That is deliberate, because the rewrite
+loads and stores several elements without a per-element bounds check, and it is
+the declaration which authorizes that.
 
 @lisp
 (dotimes (i n)                          ; vectorized, no declarations needed
@@ -1259,36 +1257,60 @@ authorizes that.
         (+ (aref (the (simple-array single-float (*)) a) i) 1.5)))
 @end lisp
 
+The supported element types and the operations on them are
+
+@itemize
+@item @code{single-float}, four elements at a time, with @code{+}, @code{-},
+@code{*} and @code{/};
+@item @code{double-float}, two at a time, with the same operations;
+@item @code{(signed-byte 32)} and @code{(unsigned-byte 32)}, four at a time,
+and @code{(signed-byte 64)} and @code{(unsigned-byte 64)}, two at a time, with
+@code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor}.
+@end itemize
+
 @noindent
-The body must have the shape
+Integer arithmetic wraps around at the width of the element type, which is what
+a scalar loop storing into an array of that type does.  Multiplication and
+division are available for the float element types only.
+
+The loop may be written as a @code{dotimes}, or as a @code{loop} whose clauses
+are a variable, an optional @code{of-type} and @code{from 0}, a
+@code{below}/@code{upto} bound, and a single @code{do} form:
 
 @lisp
-(setf (aref destination index) expression)
+(loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+(loop for i from 0 below n do (setf (aref c i) (+ (aref a i) (aref b i))))
+(loop for i of-type fixnum below n do (setf (aref c i) (+ (aref a i) (aref b i))))
 @end lisp
 
 @noindent
-where the index is the @code{dotimes} variable and the expression is built from
-@code{+}, @code{-}, @code{*} and @code{/} over @code{(aref source index)}
-references, float constants and float-valued variables.  The destination may be
-one of the sources: the elements an iteration touches are all loaded before any
-of them is stored.
+The body must have the shape @code{(setf (aref destination index) expression)},
+where the index is the loop variable and the expression is built from the
+operators above over @code{(aref source index)} references, constants, and
+variables declared to be of the element type.  The destination may be one of
+the sources: the elements an iteration touches are all loaded before any of them
+is stored.
 
-The rewrite computes exactly the values the scalar loop computes, lane by lane,
-and it keeps the behaviour at the end of an array: when @var{n} exceeds an
-array's length the packed loop is skipped and the loop as written runs instead,
+The rewrite computes what the scalar loop computes, element by element, and it
+keeps the behaviour at the end of an array: when @var{n} exceeds an array's
+length the packed loop is skipped and the loop as written runs instead,
 signalling the same error it always would.
 
-It is enabled when @code{speed} is at least 2.  To compile one form or function
-without it,
+Each vectorized loop produces a compiler note naming the element type and how
+many elements are handled at a time, so @code{(compile 'add)} reports that the
+loop was vectorized; @code{SB-C::*AUTO-VECTORIZE-NOTES*} turns the note off.
+Vectorization itself is enabled when @code{speed} is at least 2, and can be
+turned off for a compilation with
 
 @lisp
 (let ((sb-c::*auto-vectorize* nil)) (compile 'add))
 @end lisp
 
 @noindent
-Not handled yet, and compiled exactly as before: reductions such as summation,
-non-elementwise index expressions, loops written with @code{loop}, and element
-types other than @code{single-float} and @code{double-float}.
+Not handled, and compiled exactly as before: reductions such as summation,
+unary minus, integer multiplication and division, offsets and strides in the
+index expression, loops whose bound is a computed form, and element types other
+than the ones listed above.
 
 @node interpreter
 @cindex interpreter
