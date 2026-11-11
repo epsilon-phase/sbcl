@@ -379,10 +379,9 @@
 ;;; The arrays a loop touches, as an alist of name to the largest constant
 ;;; offset it is used at, destination first.
 (defun vector-loop-arrays (loop)
-  (let ((destination (assoc (vloop-destination loop) (vloop-sources loop))))
-    (cons (cons (vloop-destination loop) (vloop-destination-offset loop))
-          (remove (vloop-destination loop) (vloop-sources loop)
-                  :key #'car :test #'eq))))
+  (cons (cons (vloop-destination loop) (vloop-destination-offset loop))
+        (remove (vloop-destination loop) (vloop-sources loop)
+                :key #'car :test #'eq)))
 
 ;;; Return the vectorized form for a matched loop, or NIL if this backend cannot
 ;;; express it (which is the normal answer on a build whose backend has not
