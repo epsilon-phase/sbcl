@@ -453,9 +453,9 @@
                              data-references)))
     (:array (let* ((name (second expression))
                    (offset (third expression))
-                   (reference (or (cdr (assoc name data-references)) name))
-                   (subscript (if (eql offset 0) index `(+ ,index ,offset))))
-              `(,(vector-primitive "LOAD" element-type) ,reference ,subscript)))
+                   (reference (or (cadr (assoc name data-references)) name)))
+              `(,(vector-primitive "LOAD" element-type) ,reference
+                ,(vector-subscript name offset index data-references))))
     (:op (let ((operator (second expression)))
            (let ((name (vector-primitive (vector-operator-base operator element-type) element-type)))
              (reduce (lambda (left right) `(,name ,left ,right))
@@ -470,7 +470,7 @@
 ;;; The arrays a loop touches, as an alist of name to (OFFSETS . SIMPLE-P),
 ;;; destination first.
 (defun vector-loop-arrays (loop)
-  (let ((destination (list (list (vloop-destination-offset loop))
+  (let ((destination (cons (list (vloop-destination-offset loop))
                            (vloop-destination-simple-p loop))))
     (cons (cons (vloop-destination loop) destination)
           (remove (vloop-destination loop) (vloop-sources loop)
@@ -483,14 +483,25 @@
         unless simple-p
           collect (cons name (cons (make-symbol "DATA") (make-symbol "START")))))
 
+;;; The index expression for element I plus OFFSET of the array NAME: when the
+;;; array's data is not inline, the element is at START + I + OFFSET of the data
+;;; vector.
+(defun vector-subscript (name offset index data-references)
+  (let ((start (cddr (assoc name data-references))))
+    (cond ((null start) (if (eql offset 0) index `(+ ,index ,offset)))
+          ((eql offset 0) `(+ ,index ,start))
+          (t `(+ ,index ,start ,offset)))))
+
 ;;; Wrap FORMS in one WITH-ARRAY-DATA per array whose data is not inline, so the
 ;;; data vector and start index are found once per call instead of per element.
 (defun vector-with-data-vectors (references form)
   (if (null references)
       form
-      `(sb-kernel:with-array-data ((,(cadr (first references)) ,(car (first references)))
-                                   (,(cddr (first references))))
-         ,(vector-with-data-vectors (rest references) form))))
+      (destructuring-bind (name data . start) (first references)
+        (let ((end (make-symbol "END")))
+          `(sb-kernel:with-array-data ((,data ,name) (,start) (,end) :force-inline t)
+             (declare (ignore ,end))
+             ,(vector-with-data-vectors (rest references) form))))))
 
 ;;; Return the vectorized form for a matched loop, or NIL if this backend cannot
 ;;; express it (which is the normal answer on a build whose backend has not
@@ -522,8 +533,7 @@
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
-      (flet ((subscript (offset) (if (eql offset 0) index `(+ ,index ,offset)))
-             (reference (name) (or (cdr (assoc name references)) name)))
+      (flet ((reference (name) (or (cadr (assoc name references)) name)))
         (let ((guard
                 (loop for entry in arrays
                       for name = (first entry)
@@ -542,7 +552,9 @@
                       (declare (type index ,index))
                       (,store ,(vector-emit expression element-type index scalars references)
                               ,(reference (vloop-destination loop))
-                              ,(subscript destination-offset)))
+                              ,(vector-subscript (vloop-destination loop)
+                                                 destination-offset
+                                                 index references)))
                     ;; the tail, element by element, exactly as written
                     (do ((,index ,end (1+ ,index)))
                         ((>= ,index ,count))
