@@ -79,7 +79,10 @@
       (logand (and (not floats) "AND"))
       (logior (and (not floats) "OR"))
       (logxor (and (not floats) "XOR"))
-      (:negate (and floats "NEG")))))
+      (:negate (and floats "NEG"))
+      ;; SSE2 has byte-wise minimum and maximum for unsigned lanes only
+      (min (and (equal element-type '(unsigned-byte 8)) "MIN"))
+      (max (and (equal element-type '(unsigned-byte 8)) "MAX")))))
 
 ;;; Extend ENV (an alist of variable name to declared type spec) by the
 ;;; declarations found at the head of FORMS.
@@ -261,7 +264,7 @@
              (if (vector-float-element-type-p element-type)
                  (list :negate subexpression)
                  (list :op '- (list :const 0) subexpression)))))
-        ((memq (car form) '(+ - * / logand logior logxor))
+        ((memq (car form) '(+ - * / logand logior logxor min max))
          (let ((arguments (cdr form)))
            (when (and (cdr arguments) (vector-operator-base (car form) element-type))
              (let ((subexpressions
@@ -273,8 +276,18 @@
         (t nil)))
 
 ;;; Match (SETF (AREF name index) expression) writing an element type slice.
+;;; (INCF place delta) and (DECF place delta) are the stores the matcher
+;;; understands, with the destination on the right of the operator.
+(defun vector-normalize-store (form)
+  (if (and (consp form) (memq (car form) '(incf decf)))
+      (let ((place (second form))
+            (delta (if (cddr form) (third form) 1)))
+        `(setf ,place (,(if (eq (car form) 'incf) '+ '-) ,place ,delta)))
+      form))
+
 (defun vector-match-element-store (form env index)
-  (when (and (consp form) (eq (car form) 'setf) (null (cdddr form)))
+  (let ((form (vector-normalize-store form)))
+    (when (and (consp form) (eq (car form) 'setf) (null (cdddr form)))
     (let ((place (second form)))
       (when (and (consp place) (eq (car place) 'aref))
         (destructuring-bind (array . subscripts) (cdr place)
@@ -286,8 +299,9 @@
                   (when name
                     (let ((expression
                             (vector-match-expression (third form) env index element-type)))
-                      (when expression
-                        (values name element-type expression offset simple-p literal-p)))))))))))))
+                        (when expression
+                          (values name element-type expression offset
+                                  simple-p literal-p))))))))))))))
 
 ;;; Split leading DECLARE forms from a body.
 (defun vector-split-declarations (forms)
@@ -414,6 +428,62 @@
                      :expression expression
                      :body (second clauses)
                      :fallback form)))))))))))
+
+;;; (1+ index) or (+ index 1) in a DO loop's step.
+(defun vector-increments-index-p (step index)
+  (or (and (consp step) (eq (car step) '1+) (null (cddr step)) (eq (second step) index))
+      (and (consp step) (eq (car step) '+)
+           (let ((arguments (cdr step)))
+             (and (= (length arguments) 2)
+                  (member index arguments :test #'eq)
+                  (eql (if (eq (first arguments) index)
+                           (second arguments)
+                           (first arguments))
+                       1))))))
+
+;;; Match the DO loops that mean the same thing as a DOTIMES over an elementwise
+;;; body:
+;;;
+;;;   (do ((index 0 (1+ index))) ((>= index count)) body)
+;;;
+;;; Anything else - several bindings, a different step, result forms, another
+;;; end test - is left alone.
+(defun vector-match-do (form env)
+  (when (and (consp form) (memq (car form) '(do do*)))
+    (destructuring-bind (bindings end-clause . body) (cdr form)
+      (when (and (consp bindings) (null (cdr bindings)) (consp (first bindings))
+                 (consp end-clause) (null (cdr end-clause)))
+        (destructuring-bind (index &optional (init nil init-p) (step nil step-p))
+            (first bindings)
+          (when (and (symbolp index)
+                     init-p step-p
+                     (eql init 0)
+                     (vector-increments-index-p step index))
+            (let ((test (first end-clause)))
+              (when (and (consp test) (memq (car test) '(>= =)) (= (length test) 3)
+                         (eq (second test) index))
+                (let ((count (third test)))
+                  (when (vector-pure-count-p count)
+                    (multiple-value-bind (declarations statements)
+                        (vector-split-declarations body)
+                      (when (and (null (cdr statements))
+                                 (not (vector-special-declaration-p declarations)))
+                        (multiple-value-bind (destination element-type expression
+                                              offset simple-p literal-p)
+                            (vector-match-element-store (first statements) env index)
+                          (when destination
+                            (make-vector-loop
+                             :element-type element-type
+                             :index index
+                             :count count
+                             :destination destination
+                             :destination-offset offset
+                             :destination-simple-p simple-p
+                             :destination-literal-p literal-p
+                             :sources (vector-collect-arrays expression)
+                             :expression expression
+                             :body (first statements)
+                             :fallback form)))))))))))))))
 
 ;;;; Generating the vectorized loop
 
@@ -591,10 +661,11 @@
                       `(function ,(vector-vectorize-form (second form) env))
                       form))
         (dolist `(dolist ,(second form) ,@(vector-vectorize-body (cddr form) env)))
-        ((dotimes loop)
-         (let ((plan (if (eq (car form) 'dotimes)
-                         (vector-match-dotimes form env)
-                         (vector-match-loop form env))))
+        ((dotimes loop do do*)
+         (let ((plan (case (car form)
+                       (loop (vector-match-loop form env))
+                       ((do do*) (vector-match-do form env))
+                       (t (vector-match-dotimes form env)))))
            (or (and plan (vector-expand-loop plan)) form)))
         (lambda `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env)))
         ((let let*)
