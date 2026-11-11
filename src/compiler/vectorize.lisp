@@ -80,6 +80,7 @@
       (logior (and (not floats) "OR"))
       (logxor (and (not floats) "XOR"))
       (:negate (and floats "NEG"))
+      (:index (and floats "SPLAT-INDEX"))
       ;; SSE2 has byte-wise minimum and maximum for unsigned lanes only
       (min (and (equal element-type '(unsigned-byte 8)) "MIN"))
       (max (and (equal element-type '(unsigned-byte 8)) "MAX")))))
@@ -246,6 +247,16 @@
          ;; only a THE that pins the element type exactly is usable
          (when (equal (second form) element-type)
            (vector-match-expression (third form) env index element-type)))
+        ;; the loop index itself, converted to the element type: a value that
+        ;; depends on where it is, like a gradient or a ramp table
+        ((and (eq (car form) 'float) (null (cddr form))
+              (eq (second form) index)
+              (vector-float-element-type-p element-type))
+         (list :index))
+        ((and (eq (car form) 'coerce) (= (length form) 3) (eq (second form) index)
+              (equal (third form) element-type)
+              (vector-float-element-type-p element-type))
+         (list :index))
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
            (when (null (cdr subscripts))
@@ -359,7 +370,7 @@
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-arrays subexpression accumulator))))
     (:negate (vector-collect-arrays (second expression) accumulator))
-    ((:scalar :const) accumulator)))
+    ((:scalar :const :index) accumulator)))
 
 ;;; The loop invariant parts of an expression tree, in order of first use.
 (defun vector-collect-scalars (expression &optional (accumulator '()))
@@ -368,6 +379,7 @@
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-scalars subexpression accumulator))))
     (:negate (vector-collect-scalars (second expression) accumulator))
+    (:index accumulator)
     ((:scalar :const) (adjoin expression accumulator :test #'equal))
     (t accumulator)))
 
@@ -561,12 +573,16 @@
              (adjoin (second expression) accumulator))
            (setf accumulator (vector-collect-operators subexpression accumulator))))
     (:negate (adjoin :negate (vector-collect-operators (second expression) accumulator)))
+    (:index (adjoin :index accumulator))
     (t accumulator)))
 
 ;;; Emit an expression tree over SIMD packs. SCALARS maps each loop invariant
 ;;; leaf to the variable holding its broadcast pack.
 (defun vector-emit (expression element-type index scalars data-references)
   (ecase (car expression)
+    (:index `(,(vector-primitive "ADD" element-type)
+               (,(vector-primitive "SPLAT-INDEX" element-type) ,index)
+               ,(cdr (assoc :ramp scalars))))
     (:negate `(,(vector-primitive "NEG" element-type)
                ,(vector-emit (second expression) element-type index scalars
                              data-references)))
@@ -649,9 +665,14 @@
          (arithmetic (mapcar (lambda (operator)
                                (vector-primitive (vector-operator-base operator element-type)
                                                  element-type))
-                             (vector-collect-operators expression))))
+                             (vector-collect-operators expression)))
+         (indexed (and (memq :index arithmetic) t))
+         (ramp (and indexed (vector-primitive "RAMP" element-type))))
+    (when indexed
+      (setf scalars (acons :ramp (make-symbol "RAMP") scalars)))
     (when (and load store
                (every #'identity arithmetic)
+               (if indexed ramp t)
                (or splat (null scalars))
                (or (/= width 16) *vectorize-byte-lanes*))
       (when *auto-vectorize-notes*
@@ -686,7 +707,9 @@
                       ,(vloop-body loop))))))
           `(if (and (typep ,count 'index) ,@guard)
                (let* (,@(mapcar (lambda (scalar)
-                                  `(,(cdr scalar) (,splat ,(second (car scalar)))))
+                                  (if (eq (car scalar) :ramp)
+                                      `(,(cdr scalar) (,ramp))
+                                      `(,(cdr scalar) (,splat ,(second (car scalar))))))
                                 scalars)
                       (,end (- ,count (mod ,count ,width))))
                  (declare (type index ,end)
@@ -725,6 +748,7 @@
                                                  element-type))
                              (vector-collect-operators expression))))
     (when (and load store splat add (every #'identity arithmetic)
+               (not (memq :index (vector-collect-operators expression)))
                (or (/= width 16) *vectorize-byte-lanes*))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized reduction over ~a, ~a elements at a time"
