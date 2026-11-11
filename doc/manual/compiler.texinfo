@@ -10,6 +10,7 @@
 * Compiler Policy: compiler policy.
 * Compiler Errors: compiler errors.
 * Open Coding and Inline Expansion: open coding and inline expansion.
+* Automatic Vectorization: automatic vectorization.
 * Interpreter: interpreter.
 @end menu
 
@@ -1221,6 +1222,73 @@ when not open-coded, a call to a standard function may be
 transformed into a different function call (as in the last example)
 or compiled as @emph{static call}. Static function calls use a more
 efficient calling convention that forbids redefinition.
+
+@node automatic vectorization
+@section Automatic Vectorization
+@cindex vectorization
+@cindex SIMD
+
+On x86-64, a simple elementwise loop over float arrays is compiled to packed
+SSE instructions instead of scalar ones, so the loop
+
+@lisp
+(defun add (a b c n)
+  (declare (type (simple-array single-float (*)) a b c)
+           (type fixnum n)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref c i) (+ (aref a i) (aref b i)))))
+@end lisp
+
+@noindent
+becomes one @code{movups}-@code{addps}-@code{movups} sequence per four elements
+followed by a scalar loop over the remaining ones; doubles are handled two at a
+time by the same mechanism.
+
+Vectorization is driven by declarations rather than by type inference: an array
+takes part only when the code declares it to be a @code{(simple-array
+single-float (*))} or a @code{(simple-array double-float (*))}, either in the
+declarations of the enclosing function or by wrapping the reference in a
+@code{the}.  That is deliberate, because the rewrite loads and stores several
+elements without a per-element bounds check, and it is the declaration which
+authorizes that.
+
+@lisp
+(dotimes (i n)                          ; vectorized, no declarations needed
+  (setf (aref (the (simple-array single-float (*)) c) i)
+        (+ (aref (the (simple-array single-float (*)) a) i) 1.5)))
+@end lisp
+
+@noindent
+The body must have the shape
+
+@lisp
+(setf (aref destination index) expression)
+@end lisp
+
+@noindent
+where the index is the @code{dotimes} variable and the expression is built from
+@code{+}, @code{-}, @code{*} and @code{/} over @code{(aref source index)}
+references, float constants and float-valued variables.  The destination may be
+one of the sources: the elements an iteration touches are all loaded before any
+of them is stored.
+
+The rewrite computes exactly the values the scalar loop computes, lane by lane,
+and it keeps the behaviour at the end of an array: when @var{n} exceeds an
+array's length the packed loop is skipped and the loop as written runs instead,
+signalling the same error it always would.
+
+It is enabled when @code{speed} is at least 2.  To compile one form or function
+without it,
+
+@lisp
+(let ((sb-c::*auto-vectorize* nil)) (compile 'add))
+@end lisp
+
+@noindent
+Not handled yet, and compiled exactly as before: reductions such as summation,
+non-elementwise index expressions, loops written with @code{loop}, and element
+types other than @code{single-float} and @code{double-float}.
 
 @node interpreter
 @cindex interpreter
