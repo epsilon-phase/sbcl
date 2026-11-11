@@ -145,6 +145,41 @@
          (and (= (length count) 2) (symbolp (second count))))
         (t nil)))
 
+;;; The declared type implied by a local binding of the form
+;;; (MAKE-ARRAY ... :ELEMENT-TYPE 'TYPE), or NIL.  This is not inference: the
+;;; element type is written in the source, and the result is a simple array as
+;;; long as none of ADJUSTABLE, FILL-POINTER or DISPLACED-TO is given, so it can
+;;; be treated exactly like a declaration of that type.
+(defun vector-make-array-type (form)
+  (when (and (consp form) (eq (car form) 'make-array))
+    (let ((element-type nil)
+          (displaced-p nil))
+      ;; (MAKE-ARRAY dimensions :element-type ...): the keywords start at the
+      ;; second argument
+      (loop for (key value) on (cddr form) by #'cddr
+            do (case key
+                 (:element-type (setf element-type value))
+                 ((:adjustable :fill-pointer :displaced-to) (setf displaced-p t))))
+      (when (and element-type (not displaced-p))
+        (let ((spec (if (and (consp element-type) (eq (car element-type) 'quote))
+                        (second element-type)
+                        element-type)))
+          (let ((element (cond ((member spec '(single-float double-float) :test #'equal) spec)
+                               ((and (consp spec)
+                                     (memq (car spec) '(signed-byte unsigned-byte)))
+                                spec)
+                               (t nil))))
+            (when (and element (vector-supported-element-type-p element))
+              `(simple-array ,element (*)))))))))
+
+;;; Extend ENV by the bindings of a LET/LET* that are MAKE-ARRAY forms with a
+;;; literal element type.
+(defun vector-extend-env-from-bindings (bindings env)
+  (dolist (binding bindings env)
+    (when (and (consp binding) (symbolp (first binding)))
+      (let ((type (and (cdr binding) (vector-make-array-type (second binding)))))
+        (when type (push (cons (first binding) type) env))))))
+
 ;;; The offset of a subscript from the loop variable: (aref a i) is 0,
 ;;; (aref a (+ i 3)) and (aref a (+ 3 i)) are 3.  A negative offset would index
 ;;; before the loop variable's range, so it is not taken.
@@ -472,7 +507,11 @@
                             binding))
                       (second form))
              ,@declarations
-             ,@(vector-vectorize-body statements (vector-extend-env declarations env)))))
+             ,@(vector-vectorize-body
+                statements
+                (vector-extend-env
+                 declarations
+                 (vector-extend-env-from-bindings (second form) env))))))
         (locally
          (multiple-value-bind (declarations statements) (vector-split-declarations (cdr form))
            `(locally ,@declarations
