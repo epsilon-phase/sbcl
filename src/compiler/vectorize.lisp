@@ -485,6 +485,13 @@
                              :body (first statements)
                              :fallback form)))))))))))))))
 
+;;; The part of VALUE that is being added to the accumulator PLACE:
+;;; (+ place expression) or (+ expression place), and nothing else.
+(defun vector-reduction-increment (value place)
+  (when (and (consp value) (eq (car value) '+) (= (length value) 3))
+    (cond ((eq (second value) place) (third value))
+          ((eq (third value) place) (second value)))))
+
 ;;; A sum of a fixed-width integer array into a variable of that same width:
 ;;;
 ;;;   (dotimes (i count) (incf accumulator expression))
@@ -508,8 +515,14 @@
                         (multiple-value-bind (kind type) (vector-variable-info place env)
                           (when (and (eq kind :scalar)
                                      (not (vector-float-element-type-p type)))
+                            ;; only the part being added is vectorized; if the
+                            ;; accumulator itself appears there, the loop is not a
+                            ;; plain sum of the arrays
                             (let ((expression
-                                    (vector-match-expression (third store) env index type)))
+                                    (vector-reduction-increment (third store) place)))
+                              (when expression
+                                (setf expression
+                                      (vector-match-expression expression env index type)))
                               (when expression
                                 (make-vector-loop
                                  :element-type type
