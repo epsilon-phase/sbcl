@@ -1264,8 +1264,11 @@ The supported element types and the operations on them are
 and @code{(signed-byte 64)} and @code{(unsigned-byte 64)}, two at a time, with
 @code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor};
 @item @code{(unsigned-byte 8)} and @code{(signed-byte 8)}, sixteen at a time,
-with the same operations, but only when the code is compiled at @code{(safety
-0)}.  A packed byte store truncates where the scalar store signals a type error,
+with the same operations plus @code{min} and @code{max}, but only when the code
+is compiled at @code{(safety 0)}.  The byte-wise minimum and maximum are
+@code{PMINUB} and @code{PMAXUB}, which SSE2 has for unsigned lanes only, so
+@code{min} and @code{max} on signed bytes stay scalar rather than use an
+instruction that would give the wrong answer.  A packed byte store truncates where the scalar store signals a type error,
 so at the default safety the two do not mean the same thing and the loop is left
 scalar.  Image processing code usually declares @code{(safety 0)} already.
 @end itemize
@@ -1276,9 +1279,10 @@ a scalar loop storing into an array of that type does once the range check is
 off.  Multiplication and
 division are available for the float element types only.
 
-The loop may be written as a @code{dotimes}, or as a @code{loop} whose clauses
-are a variable, an optional @code{of-type} and @code{from 0}, a
-@code{below}/@code{upto} bound, and a single @code{do} form:
+The loop may be written as a @code{dotimes}, as a @code{do} whose single binding
+counts from zero by one and whose end test is @code{(>= i n)} or @code{(= i n)},
+or as a @code{loop} whose clauses are a variable, an optional @code{of-type} and
+@code{from 0}, a @code{below}/@code{upto} bound, and a single @code{do} form:
 
 @lisp
 (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i))))
@@ -1295,6 +1299,23 @@ in a variable is not seen.  Offsets are what a PNG row filter needs:
 (dotimes (i (- n 3))                    ; PNG filter type 1, three-byte pixels
   (setf (aref filtered (+ i 3)) (- (aref raw (+ i 3)) (aref raw i))))
 @end lisp
+
+@noindent
+The body is a store: @code{(setf (aref destination index) expression)},
+@code{(incf (aref destination index) expression)} or the same with
+@code{decf}.  A reduction rather than an elementwise update also vectorizes when
+the accumulator is a fixed-width integer:
+
+@lisp
+(dotimes (i n) (incf total (aref a i)))   ; total declared (unsigned-byte 32)
+@end lisp
+
+@noindent
+Integer addition wraps at the declared width and does not care about the order of
+the additions, so summing lanes and folding them into the variable at the end
+gives the same answer.  A @code{single-float} or @code{double-float} accumulator
+is refused: adding floats in a different order gives a different result, and this
+pass promises the same values as the loop it rewrites.
 
 @noindent
 The body must have the shape @code{(setf (aref destination index) expression)},
