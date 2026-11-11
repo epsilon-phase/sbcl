@@ -1290,6 +1290,16 @@ are a variable, an optional @code{of-type} and @code{from 0}, a
 @end lisp
 
 @noindent
+An index may be the loop variable or the loop variable plus a constant, as in
+@code{(aref raw (+ i 3))}; the constant has to be a literal, so a pixel size held
+in a variable is not seen.  Offsets are what a PNG row filter needs:
+
+@lisp
+(dotimes (i (- n 3))                    ; PNG filter type 1, three-byte pixels
+  (setf (aref filtered (+ i 3)) (- (aref raw (+ i 3)) (aref raw i))))
+@end lisp
+
+@noindent
 The body must have the shape @code{(setf (aref destination index) expression)},
 where the index is the loop variable and the expression is built from the
 operators above over @code{(aref source index)} references, constants, and

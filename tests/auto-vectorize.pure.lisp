@@ -937,9 +937,9 @@ test length, and check that nothing was written past N."
 
 (defun vectorize-impure-count (a b c n count-function)
   (declare (type (simple-array single-float (*)) a b c) (optimize speed))
+  (declare (ignore n))
   (dotimes (i (the fixnum (funcall count-function)))
     (setf (aref c i) (- (aref a i) (aref b i))))
-  (declare (ignore n))
   c)
 
 ;;;; Constant offsets in the index, which is what a PNG row filter needs.
@@ -958,15 +958,17 @@ test length, and check that nothing was written past N."
     (setf (aref c (+ i offset)) (- (aref a (+ i offset)) (aref b i))))
   c)
 
-(defun vectorize-png-sub-filter (raw filtered n bpp)
-  "PNG filter type 1 (Sub) over a whole buffer, the way a writer would do it."
+(defun vectorize-png-sub-filter (raw filtered n)
+  "PNG filter type 1 (Sub) for three-byte pixels over a whole buffer.  The
+element offset has to be a literal for the vectorizer to see it, which is what
+a writer with a fixed color type ends up with."
   (declare (type (simple-array (unsigned-byte 8) (*)) raw filtered)
-           (type vectorize-index n bpp) (optimize speed (safety 0)))
-  (dotimes (i (min bpp n))
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i (min 3 n))
     (setf (aref filtered i) (aref raw i)))
-  (dotimes (i (- n bpp))
-    (setf (aref filtered (+ i bpp))
-          (- (aref raw (+ i bpp)) (aref raw i))))
+  (dotimes (i (- n 3))
+    (setf (aref filtered (+ i 3))
+          (- (aref raw (+ i 3)) (aref raw i))))
   filtered)
 
 (defun vectorize-png-up-filter (raw prior filtered n)
@@ -1005,7 +1007,7 @@ test length, and check that nothing was written past N."
                       (dotimes (i n v) (setf (aref v i) (mod (+ (* i 7) (* i i)) 256))))
           for a = (make-array n :element-type '(unsigned-byte 8) :initial-element 200)
           for b = (make-array n :element-type '(unsigned-byte 8) :initial-element 200)
-          do (vectorize-png-sub-filter raw a n bpp)
+          do (vectorize-png-sub-filter raw a n)
              (vectorize-png-up-filter raw raw b n)
              (dotimes (i n)
                (let ((sub (if (< i bpp) (aref raw i)
