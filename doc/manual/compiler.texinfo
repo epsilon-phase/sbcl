@@ -1311,6 +1311,22 @@ the accumulator is a fixed-width integer:
 @end lisp
 
 @noindent
+A value that depends on where it is — a gradient, a ramp table, gamma correction —
+is vectorized too, when the loop index is converted to the element type:
+
+@lisp
+(dotimes (i n) (setf (aref c i) (* (float i) 0.01)))
+(dotimes (i n) (setf (aref c i) (+ (* (float i) 0.01) (* (aref a i) 1.5))))
+@end lisp
+
+@noindent
+The index becomes a lane vector once and advances by a constant per iteration.
+This pays only while the loop is limited by arithmetic rather than memory: on a
+buffer large enough to stream, a loop writing one four-byte element at a time is
+bound by memory bandwidth either way, and vectorizing it changes nothing.  Where
+the data stays in cache it is worth 2.7 to 4 times.
+
+@noindent
 Integer addition wraps at the declared width and does not care about the order of
 the additions, so summing lanes and folding them into the variable at the end
 gives the same answer.  A @code{single-float} or @code{double-float} accumulator
