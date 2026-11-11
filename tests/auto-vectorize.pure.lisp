@@ -652,7 +652,12 @@ OPERATION applied to the same numbers, which involves no array loop."
              (let ((want (- (aref a i) k)))
                (unless (= (aref c i) want)
                  (error "~@<element ~D of ~D is ~S, expected ~S.~:@>"
-                        i n (aref c i) want))))))
+                        i n (aref c i) want)))))
+  ;; a scalar operand is broadcast, so the loop must really be packed
+  (let ((text (string-downcase (with-output-to-string (stream)
+                                 (disassemble #'vectorize-s64-subtract-scalar
+                                              :stream stream)))))
+    (assert (search "psubq" text) () "a loop with a scalar variable was not packed:~%~A" text)))
 
 ;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
 ;;; not rejected by the backend, and must compute what it always computed.
@@ -1481,7 +1486,7 @@ a writer with a fixed color type ends up with."
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
-    (loop with total0 = (logand #xFFFFFFF0 #xFFFFFFFF)
+    (loop with total0 = 100
           for n in *vectorize-lengths*
           for a = (vectorize-integer-array '(unsigned-byte 32) '(1 2 3 4 5 6 7) n)
           do (let ((sum (vectorize-u32-sum a n total0)))
