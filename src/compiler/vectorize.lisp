@@ -556,10 +556,15 @@
 (defun vector-parameter-environment (vars)
   (let ((env '()))
     (dolist (var vars env)
-      (let ((name (leaf-%source-name var))
-            (type (lambda-var-type var)))
-        (when (and (symbolp name) (not (eq type *universal-type*)))
-          (push (cons name (type-specifier type)) env))))))
+      (let ((name (leaf-%source-name var)))
+        (when (symbolp name)
+          ;; An FTYPE declaration does not set the var's type; the compiler
+          ;; records it in the leaf's defined type instead, so both are read.
+          (dolist (ctype (list (lambda-var-type var) (leaf-defined-type var)))
+            (unless (or (null ctype) (eq ctype *universal-type*))
+              (let ((spec (type-specifier ctype)))
+                (when (vector-element-type spec)
+                  (push (cons name spec) env))))))))))
 
 ;;; Called on the body of every lambda before it is converted to IR1. Returns a
 ;;; body that is either unchanged or has its elementwise loops vectorized.
