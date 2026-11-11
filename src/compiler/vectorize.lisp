@@ -666,16 +666,18 @@
                                                  element-type))
                              operators))
          (indexed (and (memq :index operators) t))
-         (ramp (and indexed (vector-primitive "RAMP" element-type))))
+         (ramp (and indexed (vector-primitive "RAMP" element-type)))
+         (stride (and indexed (vector-primitive "STRIDE" element-type))))
     (when indexed
       ;; the lane offsets for the first iteration, then a constant step per
       ;; iteration: converting and broadcasting the index each time costs four
       ;; instructions and a dependency chain, where keeping the pack costs one add
       (setf scalars (acons :ramp (make-symbol "RAMP") scalars))
-      (setf scalars (acons :index (make-symbol "INDEX-LANES") scalars)))
+      (setf scalars (acons :index (make-symbol "INDEX-LANES") scalars))
+      (setf scalars (acons :stride (make-symbol "STRIDE") scalars)))
     (when (and load store
                (every #'identity arithmetic)
-               (if indexed ramp t)
+               (if indexed (and ramp stride) t)
                (or splat (null scalars))
                (or (/= width 16) *vectorize-byte-lanes*))
       (when *auto-vectorize-notes*
@@ -706,12 +708,11 @@
                       ,@(when indexed
                           ;; leave the pack holding the offsets for the next
                           ;; iteration
-                          (let ((lanes (cdr (assoc :index scalars))))
+                          (let ((lanes (cdr (assoc :index scalars)))
+                                (stride (cdr (assoc :stride scalars))))
                             `((setf ,lanes
                                     (,(vector-primitive "ADD" element-type)
-                                     ,lanes
-                                     (,(vector-primitive "INDEX" element-type)
-                                      (+ ,index ,width))))))))
+                                     ,lanes ,stride))))))
                     ;; the tail, element by element, exactly as written
                     (do ((,index ,end (1+ ,index)))
                         ((>= ,index ,count))
@@ -720,6 +721,8 @@
           `(if (and (typep ,count 'index) ,@guard)
                (let* (,@(mapcar (lambda (scalar)
                                   (case (car scalar)
+                                    (:stride `(,(cdr scalar)
+                                               (,(vector-primitive "STRIDE" element-type))))
                                     ((:ramp :index) `(,(cdr scalar) (,ramp)))
                                     (t `(,(cdr scalar)
                                          (,splat ,(second (car scalar)))))))
