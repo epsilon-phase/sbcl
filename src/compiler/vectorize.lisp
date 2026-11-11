@@ -580,9 +580,7 @@
 ;;; leaf to the variable holding its broadcast pack.
 (defun vector-emit (expression element-type index scalars data-references)
   (ecase (car expression)
-    (:index `(,(vector-primitive "ADD" element-type)
-               (,(vector-primitive "INDEX" element-type) ,index)
-               ,(cdr (assoc :ramp scalars))))
+    (:index (cdr (assoc :index scalars)))
     (:negate `(,(vector-primitive "NEG" element-type)
                ,(vector-emit (second expression) element-type index scalars
                              data-references)))
@@ -670,7 +668,11 @@
          (indexed (and (memq :index operators) t))
          (ramp (and indexed (vector-primitive "RAMP" element-type))))
     (when indexed
-      (setf scalars (acons :ramp (make-symbol "RAMP") scalars)))
+      ;; the lane offsets for the first iteration, then a constant step per
+      ;; iteration: converting and broadcasting the index each time costs four
+      ;; instructions and a dependency chain, where keeping the pack costs one add
+      (setf scalars (acons :ramp (make-symbol "RAMP") scalars))
+      (setf scalars (acons :index (make-symbol "INDEX-LANES") scalars)))
     (when (and load store
                (every #'identity arithmetic)
                (if indexed ramp t)
@@ -700,7 +702,15 @@
                               ,(reference (vloop-destination loop))
                               ,(vector-subscript (vloop-destination loop)
                                                  destination-offset
-                                                 index references)))
+                                                 index references))
+                      ,@(when indexed
+                          ;; leave the pack holding the offsets for the next iteration
+                          (let ((lanes (cdr (assoc :index scalars))))
+                            `((setf ,lanes
+                                    (,(vector-primitive "ADD" element-type)
+                                     ,lanes
+                                     (,(vector-primitive "INDEX" element-type)
+                                      (+ ,index ,width)))))))
                     ;; the tail, element by element, exactly as written
                     (do ((,index ,end (1+ ,index)))
                         ((>= ,index ,count))
@@ -708,9 +718,10 @@
                       ,(vloop-body loop))))))
           `(if (and (typep ,count 'index) ,@guard)
                (let* (,@(mapcar (lambda (scalar)
-                                  (if (eq (car scalar) :ramp)
-                                      `(,(cdr scalar) (,ramp))
-                                      `(,(cdr scalar) (,splat ,(second (car scalar))))))
+                                  (case (car scalar)
+                                    ((:ramp :index) `(,(cdr scalar) (,ramp)))
+                                    (t `(,(cdr scalar)
+                                         (,splat ,(second (car scalar)))))))
                                 scalars)
                       (,end (- ,count (mod ,count ,width))))
                  (declare (type index ,end)
