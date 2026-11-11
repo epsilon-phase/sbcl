@@ -1013,6 +1013,65 @@
     (inst pmaxub arith-tmp b)
     (move result arith-tmp)))
 
+;;;; A lane vector holding the loop index: [i, i+1, ... ].  The scalar index is
+;;;; converted to float and broadcast, and a constant ramp supplies the lane
+;;;; offsets, so a loop whose value is a function of its index can be done a vector
+;;;; at a time.
+;;;;
+;;;; The index arrives tagged, so it is untagged into a general-purpose register
+;;;; before the conversion (CVTSI2SS/CVTSI2SD take a sized integer source).
+
+(defknown (%vec-splat-index-single) (index) (simd-pack single-float) (flushable movable))
+(defknown (%vec-splat-index-double) (index) (simd-pack double-float) (flushable movable))
+(defknown (%vec-ramp-single) () (simd-pack single-float) (flushable movable))
+(defknown (%vec-ramp-double) () (simd-pack double-float) (flushable movable))
+
+(define-vop (%vec-splat-index-single)
+  (:translate %vec-splat-index-single)
+  (:args (index :scs (any-reg)))
+  (:arg-types index)
+  (:temporary (:sc signed-reg) word)
+  (:results (result :scs (single-sse-reg)))
+  (:result-types simd-pack-single)
+  (:generator 3
+    (move word index)
+    (inst sar word n-fixnum-tag-bits)
+    (inst cvtsi2ss result word)
+    (inst shufps result result #b00000000)))
+
+(define-vop (%vec-splat-index-double)
+  (:translate %vec-splat-index-double)
+  (:args (index :scs (any-reg)))
+  (:arg-types index)
+  (:temporary (:sc signed-reg) word)
+  (:results (result :scs (double-sse-reg)))
+  (:result-types simd-pack-double)
+  (:generator 3
+    (move word index)
+    (inst sar word n-fixnum-tag-bits)
+    (inst cvtsi2sd result word)
+    (inst unpcklpd result result)))
+
+;;; The lane offsets: single-floats 0, 1, 2, 3 and doubles 0, 1, as one 128-bit
+;;; constant each (1.0f0 is #x3F800000, 2.0f0 #x40000000, 3.0f0 #x40400000, and
+;;; 1.0d0 is #x3FF0000000000000).
+(define-vop (%vec-ramp-single)
+  (:translate %vec-ramp-single)
+  (:results (result :scs (single-sse-reg)))
+  (:result-types simd-pack-single)
+  (:generator 1
+    (inst movaps result
+          (register-inline-constant
+           :oword (logior (ash #x3F800000 32) (ash #x40000000 64) (ash #x40400000 96))))))
+
+(define-vop (%vec-ramp-double)
+  (:translate %vec-ramp-double)
+  (:results (result :scs (double-sse-reg)))
+  (:result-types simd-pack-double)
+  (:generator 1
+    (inst movaps result
+          (register-inline-constant :oword (ash #x3FF0000000000000 64)))))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1035,6 +1094,10 @@
     (publish "DIV" double-float %vec-div-double)
     (publish "NEG" single-float %vec-negate-single)
     (publish "NEG" double-float %vec-negate-double)
+    (publish "INDEX" single-float %vec-splat-index-single)
+    (publish "INDEX" double-float %vec-splat-index-double)
+    (publish "RAMP" single-float %vec-ramp-single)
+    (publish "RAMP" double-float %vec-ramp-double)
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)

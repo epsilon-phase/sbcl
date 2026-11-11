@@ -1516,3 +1516,62 @@ a writer with a fixed color type ends up with."
                (dotimes (i n) (setf expected (+ expected (aref a i))))
                (unless (eql (vectorize-single-sum a n 0.5f0) expected)
                  (error "~@<scalar float sum of ~D elements changed.~:@>" n))))))
+
+;;;; A value that depends on where it is: the loop index converted to the element
+;;;; type becomes a lane vector, and a constant ramp supplies the lane offsets.
+
+(defun vectorize-gradient (c n)
+  (declare (type (simple-array single-float (*)) c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (* (float i) 0.5)))
+  c)
+
+(defun vectorize-gradient-coerce (c n)
+  (declare (type (simple-array double-float (*)) c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (coerce i 'double-float) 1d0)))
+  c)
+
+(defun vectorize-index-and-array (a c n)
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (* (float i) 2.0) (aref a i))))
+  c)
+
+(defun vectorize-index-into-integers (c n)
+  "An integer element type would need its own index conversion: left scalar."
+  (declare (type (simple-array (unsigned-byte 32) (*)) c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) i))
+  c)
+
+(with-test (:name :vectorize-index-affine)
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (loop for n in *vectorize-lengths*
+          for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+          do (vectorize-gradient c n)
+             (dotimes (i n)
+               (unless (eql (aref c i) (coerce (* (float i) 0.5) 'single-float))
+                 (error "~@<gradient: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
+    (loop for n in *vectorize-lengths*
+          for c = (make-array n :element-type 'double-float :initial-element 0d0)
+          do (vectorize-gradient-coerce c n)
+             (dotimes (i n)
+               (unless (= (aref c i) (+ (coerce i 'double-float) 1d0))
+                 (error "~@<double gradient: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-array 'single-float *vectorize-single-values* n)
+          for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+          do (vectorize-index-and-array a c n)
+             (dotimes (i n)
+               (unless (eql (aref c i) (+ (coerce (* (float i) 2.0) 'single-float) (aref a i)))
+                 (error "~@<index + array: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
+    (let ((text (disassembly #'vectorize-gradient)))
+      (assert (some (lambda (mnemonic) (search mnemonic text))
+                    '("cvtsi2ss" "addps" "movaps"))
+              () "the gradient loop was not vectorized:~%~A" text))
+    (let ((text (disassembly #'vectorize-index-into-integers)))
+      (assert (notany (lambda (mnemonic) (search mnemonic text)) '("paddd" "movdqu"))
+              () "an integer index loop was vectorized:~%~A" text))))
