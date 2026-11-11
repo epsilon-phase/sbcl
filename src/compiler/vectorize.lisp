@@ -80,7 +80,7 @@
       (logior (and (not floats) "OR"))
       (logxor (and (not floats) "XOR"))
       (:negate (and floats "NEG"))
-      (:index (and floats "SPLAT-INDEX"))
+      (:index (and floats "INDEX"))
       ;; SSE2 has byte-wise minimum and maximum for unsigned lanes only
       (min (and (equal element-type '(unsigned-byte 8)) "MIN"))
       (max (and (equal element-type '(unsigned-byte 8)) "MAX")))))
@@ -581,7 +581,7 @@
 (defun vector-emit (expression element-type index scalars data-references)
   (ecase (car expression)
     (:index `(,(vector-primitive "ADD" element-type)
-               (,(vector-primitive "SPLAT-INDEX" element-type) ,index)
+               (,(vector-primitive "INDEX" element-type) ,index)
                ,(cdr (assoc :ramp scalars))))
     (:negate `(,(vector-primitive "NEG" element-type)
                ,(vector-emit (second expression) element-type index scalars
