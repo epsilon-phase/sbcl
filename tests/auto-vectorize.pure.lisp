@@ -11,6 +11,11 @@
 ;;;; absolutely no warranty. See the COPYING and CREDITS files for
 ;;;; more information.
 
+;;; These tests assert that a loop became instructions of a particular
+;;; instruction set, so they mean something only on a backend that has the vops
+;;; for it.  The pass itself declines everywhere else, so the loops are merely
+;;; scalar there and still compute the right values.
+
 ;;; A loop such as
 ;;;
 ;;;   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
@@ -307,35 +312,35 @@ does not involve any array loop and so cannot itself be vectorized."
 
 ;;;; Correctness: every operation, both element types, every test length.
 
-(with-test (:name :vectorize-single-add)
+(test-util:with-test (:name :vectorize-single-add :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-add #'+
                                'single-float
                                *vectorize-single-values*
                                *vectorize-single-values*
                                'vectorize-single-add))
 
-(with-test (:name :vectorize-single-sub)
+(test-util:with-test (:name :vectorize-single-sub :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-sub #'-
                                'single-float
                                *vectorize-single-values*
                                *vectorize-single-values*
                                'vectorize-single-sub))
 
-(with-test (:name :vectorize-single-mul)
+(test-util:with-test (:name :vectorize-single-mul :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-mul #'*
                                'single-float
                                *vectorize-single-values*
                                *vectorize-single-values*
                                'vectorize-single-mul))
 
-(with-test (:name :vectorize-single-div)
+(test-util:with-test (:name :vectorize-single-div :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-div #'/
                                'single-float
                                *vectorize-single-values*
                                *vectorize-single-divisors*
                                'vectorize-single-div))
 
-(with-test (:name :vectorize-single-negate)
+(test-util:with-test (:name :vectorize-single-negate :skipped-on (not :x86-64))
   (vectorize-check-unary #'vectorize-single-negate #'-
                          'single-float
                          *vectorize-single-values*
@@ -343,14 +348,14 @@ does not involve any array loop and so cannot itself be vectorized."
 
 ;;; The loops below multiply by a literal; the references multiply by the
 ;;; matching special variable, whose value is that same literal.
-(with-test (:name :vectorize-single-scale)
+(test-util:with-test (:name :vectorize-single-scale :skipped-on (not :x86-64))
   (vectorize-check-unary #'vectorize-single-scale
                          (lambda (x) (* x *vectorize-single-scale*))
                          'single-float
                          *vectorize-single-values*
                          'vectorize-single-scale))
 
-(with-test (:name :vectorize-single-add-scale)
+(test-util:with-test (:name :vectorize-single-add-scale :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-add-scale
                                (lambda (x y) (* (+ x y) *vectorize-single-add-scale*))
                                'single-float
@@ -358,48 +363,48 @@ does not involve any array loop and so cannot itself be vectorized."
                                *vectorize-single-values*
                                'vectorize-single-add-scale))
 
-(with-test (:name :vectorize-double-add)
+(test-util:with-test (:name :vectorize-double-add :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-add #'+
                                'double-float
                                *vectorize-double-values*
                                *vectorize-double-values*
                                'vectorize-double-add))
 
-(with-test (:name :vectorize-double-sub)
+(test-util:with-test (:name :vectorize-double-sub :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-sub #'-
                                'double-float
                                *vectorize-double-values*
                                *vectorize-double-values*
                                'vectorize-double-sub))
 
-(with-test (:name :vectorize-double-mul)
+(test-util:with-test (:name :vectorize-double-mul :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-mul #'*
                                'double-float
                                *vectorize-double-values*
                                *vectorize-double-values*
                                'vectorize-double-mul))
 
-(with-test (:name :vectorize-double-div)
+(test-util:with-test (:name :vectorize-double-div :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-div #'/
                                'double-float
                                *vectorize-double-values*
                                *vectorize-double-divisors*
                                'vectorize-double-div))
 
-(with-test (:name :vectorize-double-negate)
+(test-util:with-test (:name :vectorize-double-negate :skipped-on (not :x86-64))
   (vectorize-check-unary #'vectorize-double-negate #'-
                          'double-float
                          *vectorize-double-values*
                          'vectorize-double-negate))
 
-(with-test (:name :vectorize-double-scale)
+(test-util:with-test (:name :vectorize-double-scale :skipped-on (not :x86-64))
   (vectorize-check-unary #'vectorize-double-scale
                          (lambda (x) (* x *vectorize-double-scale*))
                          'double-float
                          *vectorize-double-values*
                          'vectorize-double-scale))
 
-(with-test (:name :vectorize-double-add-scale)
+(test-util:with-test (:name :vectorize-double-add-scale :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-add-scale
                                (lambda (x y) (* (+ x y) *vectorize-double-add-scale*))
                                'double-float
@@ -409,13 +414,13 @@ does not involve any array loop and so cannot itself be vectorized."
 
 ;;;; Aliasing: C may be the same array as A, and A may be the same as B.
 
-(with-test (:name :vectorize-single-aliasing)
+(test-util:with-test (:name :vectorize-single-aliasing :skipped-on (not :x86-64))
   (vectorize-check-aliasing #'vectorize-single-add 'single-float
                             *vectorize-single-values*
                             *vectorize-single-values*
                             'vectorize-single-aliasing))
 
-(with-test (:name :vectorize-double-aliasing)
+(test-util:with-test (:name :vectorize-double-aliasing :skipped-on (not :x86-64))
   (vectorize-check-aliasing #'vectorize-double-add 'double-float
                             *vectorize-double-values*
                             *vectorize-double-values*
@@ -426,7 +431,7 @@ does not involve any array loop and so cannot itself be vectorized."
 ;;;; bounds checks off - SAFETY is still 1 - which is what makes the error
 ;;;; observable.
 
-(with-test (:name :vectorize-single-n-exceeds-length)
+(test-util:with-test (:name :vectorize-single-n-exceeds-length :skipped-on (not :x86-64))
   (loop for (size . n) in '((0 . 1) (1 . 2) (1 . 5) (3 . 4) (4 . 5)
                             (8 . 9) (8 . 17) (1000 . 1001))
         do (let ((a (vectorize-array 'single-float *vectorize-single-values* size))
@@ -435,7 +440,7 @@ does not involve any array loop and so cannot itself be vectorized."
              (assert-error (funcall #'vectorize-single-add a b c n)
                            sb-int:invalid-array-index-error))))
 
-(with-test (:name :vectorize-double-n-exceeds-length)
+(test-util:with-test (:name :vectorize-double-n-exceeds-length :skipped-on (not :x86-64))
   (loop for (size . n) in '((0 . 1) (1 . 2) (1 . 5) (3 . 4) (4 . 5)
                             (8 . 9) (8 . 17) (1000 . 1001))
         do (let ((a (vectorize-array 'double-float *vectorize-double-values* size))
@@ -447,14 +452,14 @@ does not involve any array loop and so cannot itself be vectorized."
 ;;;; The same loop without declarations cannot be vectorized, and must still
 ;;;; compute the right values.
 
-(with-test (:name :vectorize-single-no-declarations)
+(test-util:with-test (:name :vectorize-single-no-declarations :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-single-add-undeclared #'+
                                'single-float
                                *vectorize-single-values*
                                *vectorize-single-values*
                                'vectorize-single-add-undeclared))
 
-(with-test (:name :vectorize-double-no-declarations)
+(test-util:with-test (:name :vectorize-double-no-declarations :skipped-on (not :x86-64))
   (vectorize-check-elementwise #'vectorize-double-add-undeclared #'+
                                'double-float
                                *vectorize-double-values*
@@ -466,7 +471,7 @@ does not involve any array loop and so cannot itself be vectorized."
 ;;;; packed SIMD mnemonic, the undeclared one must not, whatever instructions
 ;;;; the vectorizer settles on in detail.
 
-(with-test (:name :vectorize-disassembly)
+(test-util:with-test (:name :vectorize-disassembly :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            ;; Mnemonic case varies between disassemblers.
            (string-downcase
@@ -598,7 +603,7 @@ OPERATION applied to the same numbers, which involves no array loop."
            (type (signed-byte 64) k) (optimize speed))
   (dotimes (i n) (setf (aref c i) (- (aref a i) k))))
 
-(with-test (:name :vectorize-integer-add)
+(test-util:with-test (:name :vectorize-integer-add :skipped-on (not :x86-64))
   (vectorize-check-integer-elementwise #'vectorize-u32-add #'+ '(unsigned-byte 32)
                                        *vectorize-u32-values* *vectorize-u32-values*
                                        'vectorize-u32-add)
@@ -612,7 +617,7 @@ OPERATION applied to the same numbers, which involves no array loop."
                                        *vectorize-s64-values* *vectorize-s64-values*
                                        'vectorize-s64-add))
 
-(with-test (:name :vectorize-integer-subtract)
+(test-util:with-test (:name :vectorize-integer-subtract :skipped-on (not :x86-64))
   ;; the minuend pattern is the larger one, so nothing wraps
   (vectorize-check-integer-elementwise #'vectorize-s32-subtract #'-
                                        '(signed-byte 32)
@@ -623,7 +628,7 @@ OPERATION applied to the same numbers, which involves no array loop."
                                        '(4294967296 1099511627776 65535 1000 1 0)
                                        *vectorize-s64-values* 'vectorize-s64-subtract))
 
-(with-test (:name :vectorize-integer-bitwise)
+(test-util:with-test (:name :vectorize-integer-bitwise :skipped-on (not :x86-64))
   (vectorize-check-integer-elementwise #'vectorize-s32-logand #'logand '(signed-byte 32)
                                        *vectorize-s32-values* *vectorize-s32-values*
                                        'vectorize-s32-logand)
@@ -634,14 +639,14 @@ OPERATION applied to the same numbers, which involves no array loop."
                                        *vectorize-u64-values* '(1 2 3 4 5 6 7 8)
                                        'vectorize-u64-logxor))
 
-(with-test (:name :vectorize-integer-negative-constant)
+(test-util:with-test (:name :vectorize-integer-negative-constant :skipped-on (not :x86-64))
   (vectorize-check-integer-elementwise #'vectorize-s32-add-negative-constant
                                        (lambda (x ignorable) (declare (ignore ignorable)) (+ x -3))
                                        '(signed-byte 32)
                                        *vectorize-s32-values* *vectorize-s32-values*
                                        'vectorize-s32-add-negative-constant))
 
-(with-test (:name :vectorize-integer-scalar-variable)
+(test-util:with-test (:name :vectorize-integer-scalar-variable :skipped-on (not :x86-64))
   (loop for n in *vectorize-lengths*
         for a = (vectorize-integer-array '(signed-byte 64) *vectorize-s64-values* n)
         for c = (make-array (+ n 4) :element-type '(signed-byte 64)
@@ -661,7 +666,7 @@ OPERATION applied to the same numbers, which involves no array loop."
 
 ;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
 ;;; not rejected by the backend, and must compute what it always computed.
-(with-test (:name :vectorize-integer-wide-constant)
+(test-util:with-test (:name :vectorize-integer-wide-constant :skipped-on (not :x86-64))
   (flet ((loop-with-wide-constant (a c n)
            (declare (type (simple-array (unsigned-byte 64) (*)) a c)
                     (type vectorize-index n) (optimize speed))
@@ -673,7 +678,7 @@ OPERATION applied to the same numbers, which involves no array loop."
       (dotimes (i n)
         (assert (= (aref c i) 18446744073709551615))))))
 
-(with-test (:name :vectorize-integer-disassembly)
+(test-util:with-test (:name :vectorize-integer-disassembly :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -722,7 +727,7 @@ OPERATION applied to the same numbers, which involves no array loop."
   (loop for i upto (1- n) do (setf (aref c i) (+ (aref a i) (aref b i))))
   c)
 
-(with-test (:name :vectorize-loop-forms)
+(test-util:with-test (:name :vectorize-loop-forms :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -774,7 +779,7 @@ instruction side."
   (loop for i below n do (incf (aref c i) (aref a i)))
   c)
 
-(with-test (:name :vectorize-loop-not-recognized)
+(test-util:with-test (:name :vectorize-loop-not-recognized :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -817,7 +822,7 @@ instruction side."
     (let ((*error-output* stream))
       (compile nil form))))
 
-(with-test (:name :vectorize-note)
+(test-util:with-test (:name :vectorize-note :skipped-on (not :x86-64))
   (let ((output (vectorize-note-output
                  '(lambda (a b c n)
                     (declare (type (simple-array single-float (*)) a b c)
@@ -893,27 +898,27 @@ test length, and check that nothing was written past N."
 (defparameter *vectorize-u8-values* '(0 1 2 3 7 11 100 255 128 64))
 (defparameter *vectorize-s8-values* '(0 1 -2 3 -7 11 -100 127 -128 64))
 
-(with-test (:name :vectorize-byte-subtract)
+(test-util:with-test (:name :vectorize-byte-subtract :skipped-on (not :x86-64))
   (vectorize-check-byte-elementwise #'vectorize-u8-subtract #'- '(unsigned-byte 8)
                                     *vectorize-u8-values* *vectorize-u8-values*
                                     'vectorize-u8-subtract))
 
-(with-test (:name :vectorize-byte-add)
+(test-util:with-test (:name :vectorize-byte-add :skipped-on (not :x86-64))
   (vectorize-check-byte-elementwise #'vectorize-u8-add #'+ '(unsigned-byte 8)
                                     *vectorize-u8-values* *vectorize-u8-values*
                                     'vectorize-u8-add))
 
-(with-test (:name :vectorize-byte-bitwise)
+(test-util:with-test (:name :vectorize-byte-bitwise :skipped-on (not :x86-64))
   (vectorize-check-byte-elementwise #'vectorize-u8-logxor #'logxor '(unsigned-byte 8)
                                     *vectorize-u8-values* *vectorize-u8-values*
                                     'vectorize-u8-logxor))
 
-(with-test (:name :vectorize-signed-byte-subtract)
+(test-util:with-test (:name :vectorize-signed-byte-subtract :skipped-on (not :x86-64))
   (vectorize-check-byte-elementwise #'vectorize-s8-subtract #'- '(signed-byte 8)
                                     *vectorize-s8-values* *vectorize-s8-values*
                                     'vectorize-s8-subtract))
 
-(with-test (:name :vectorize-byte-disassembly)
+(test-util:with-test (:name :vectorize-byte-disassembly :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -927,7 +932,7 @@ test length, and check that nothing was written past N."
 
 ;;; At the default safety the scalar loop may signal, so the vectorizer must not
 ;;; take it; the values it computes are still right when nothing signals.
-(with-test (:name :vectorize-byte-needs-safety-0)
+(test-util:with-test (:name :vectorize-byte-needs-safety-0 :skipped-on (not :x86-64))
   (let ((text (string-downcase (with-output-to-string (stream)
                                  (disassemble #'vectorize-u8-subtract-checked
                                               :stream stream)))))
@@ -986,7 +991,7 @@ a writer with a fixed color type ends up with."
     (setf (aref filtered i) (- (aref raw i) (aref prior i))))
   filtered)
 
-(with-test (:name :vectorize-offset-subtract)
+(test-util:with-test (:name :vectorize-offset-subtract :skipped-on (not :x86-64))
   (loop for n in *vectorize-lengths*
         for offset = 3
         for a = (vectorize-array 'single-float *vectorize-single-values* (+ n offset))
@@ -1004,7 +1009,7 @@ a writer with a fixed color type ends up with."
              (unless (eql (aref c i) (vectorize-sentinel 'single-float))
                (error "~@<offset loop wrote element ~D, before its offset.~:@>" i)))))
 
-(with-test (:name :vectorize-png-sub-filter)
+(test-util:with-test (:name :vectorize-png-sub-filter :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1034,7 +1039,7 @@ a writer with a fixed color type ends up with."
 
 ;;; A bound that could have side effects must stay with the scalar loop, and the
 ;;; loop must still compute correctly.
-(with-test (:name :vectorize-impure-bound)
+(test-util:with-test (:name :vectorize-impure-bound :skipped-on (not :x86-64))
   (let* ((calls 0)
          (function (lambda (a b c n) (vectorize-impure-count a b c n (lambda () (incf calls) n))))
          (a (vectorize-array 'single-float '(1.0f0 2.0f0 3.0f0) 8))
@@ -1064,7 +1069,7 @@ a writer with a fixed color type ends up with."
     (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
     c))
 
-(with-test (:name :vectorize-made-locals)
+(test-util:with-test (:name :vectorize-made-locals :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1108,7 +1113,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (setf (aref c i) (- (aref a i))))
   c)
 
-(with-test (:name :vectorize-unary-minus)
+(test-util:with-test (:name :vectorize-unary-minus :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1153,7 +1158,7 @@ a writer with a fixed color type ends up with."
            (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
 
-(with-test (:name :vectorize-16-bit-lanes)
+(test-util:with-test (:name :vectorize-16-bit-lanes :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1190,7 +1195,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
   c)
 
-(with-test (:name :vectorize-vector-declared)
+(test-util:with-test (:name :vectorize-vector-declared :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1229,7 +1234,7 @@ a writer with a fixed color type ends up with."
     (setf (aref c i) (+ (aref a i) (aref b (+ i k)))))
   c)
 
-(with-test (:name :vectorize-variable-offset)
+(test-util:with-test (:name :vectorize-variable-offset :skipped-on (not :x86-64))
   (loop for k in '(0 1 3 8)
         do (loop for n in '(0 1 2 3 5 17)
                  for a = (vectorize-array 'single-float *vectorize-single-values* n)
@@ -1271,7 +1276,7 @@ a writer with a fixed color type ends up with."
            (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) 300))))
 
-(with-test (:name :vectorize-negative-narrow-splat)
+(test-util:with-test (:name :vectorize-negative-narrow-splat :skipped-on (not :x86-64))
   (loop for n in *vectorize-lengths*
         for a = (vectorize-integer-array '(unsigned-byte 8) '(0 1 2 200 255 7) n)
         for c = (make-array n :element-type '(unsigned-byte 8) :initial-element 0)
@@ -1323,7 +1328,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (setf (aref c i) (min (aref a i) (aref b i))))
   c)
 
-(with-test (:name :vectorize-byte-min-max)
+(test-util:with-test (:name :vectorize-byte-min-max :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1376,7 +1381,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (decf (aref c i) (aref b i)))
   c)
 
-(with-test (:name :vectorize-incf-store)
+(test-util:with-test (:name :vectorize-incf-store :skipped-on (not :x86-64))
   (loop for n in *vectorize-lengths*
         for a = (vectorize-integer-array '(unsigned-byte 8) '(1 2 3 4 5) n)
         for c = (vectorize-integer-array '(unsigned-byte 8) '(10 20 30 40 50) n 1)
@@ -1430,7 +1435,7 @@ a writer with a fixed color type ends up with."
       ((>= i n) c)
     (setf (aref c i) (+ (aref a i) (aref b i)))))
 
-(with-test (:name :vectorize-do-loop)
+(test-util:with-test (:name :vectorize-do-loop :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1482,7 +1487,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (incf total (aref a i)))
   total)
 
-(with-test (:name :vectorize-integer-reduction)
+(test-util:with-test (:name :vectorize-integer-reduction :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
@@ -1545,7 +1550,7 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (setf (aref c i) i))
   c)
 
-(with-test (:name :vectorize-index-affine)
+(test-util:with-test (:name :vectorize-index-affine :skipped-on (not :x86-64))
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
