@@ -1613,16 +1613,16 @@ a writer with a fixed color type ends up with."
                    (declare (type (simple-array single-float (*)) a c) (type fixnum n)
                             (optimize speed))
                    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
-    (assert (vectorize-note-mentions notes "unable to vectorize"), () "no note: ~s" notes)
-    (assert (vectorize-note-mentions notes "simple-array SINGLE-FLOAT"), ()
+    (assert (vectorize-note-mentions notes "unable to vectorize") () "no note: ~s" notes)
+    (assert (vectorize-note-mentions notes "simple-array SINGLE-FLOAT") ()
             "the note does not suggest a declaration: ~s" notes)
-    (assert (vectorize-note-mentions notes "B"), () "the note does not name B: ~s" notes))
+    (assert (vectorize-note-mentions notes "B") () "the note does not name B: ~s" notes))
   ;; and with no declarations at all it still says something
   (let ((notes (vectorize-notes-for
                 '(lambda (a c n)
                    (declare (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (aref a i)))))))
-    (assert (vectorize-note-mentions notes "array declaration"), () "no note: ~s" notes)))
+    (assert (vectorize-note-mentions notes "array declaration") () "no note: ~s" notes)))
 
 (test-util:with-test (:name :vectorize-missed-operator-note :skipped-on (not :x86-64))
   ;; SSE2 has no lane multiply for 32-bit integers; say so rather than nothing
@@ -1631,14 +1631,14 @@ a writer with a fixed color type ends up with."
                    (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
                             (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))))))
-    (assert (vectorize-note-mentions notes "not available for"), () "no note: ~s" notes))
+    (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes))
   ;; byte lanes outside (safety 0)
   (let ((notes (vectorize-notes-for
                 '(lambda (a b c n)
                    (declare (type (simple-array (unsigned-byte 8) (*)) a b c)
                             (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
-    (assert (vectorize-note-mentions notes "safety 0"), () "no note: ~s" notes)))
+    (assert (vectorize-note-mentions notes "safety 0") () "no note: ~s" notes)))
 
 (test-util:with-test (:name :vectorize-no-note-when-quiet :skipped-on (not :x86-64))
   ;; a loop the pass does vectorize gets the success note and no complaint
