@@ -70,7 +70,11 @@
     (case operator
       (+ "ADD")
       (- "SUB")
-      (* (and floats "MUL"))
+      ;; the primitive table decides the rest: MUL exists for the floats and, in
+      ;; the backend, for 16-bit lanes through PMULLW
+      (* (and (or floats (member element-type '((signed-byte 16) (unsigned-byte 16))
+                                 :test #'equal))
+                     "MUL"))
       (/ (and floats "DIV"))
       (logand (and (not floats) "AND"))
       (logior (and (not floats) "OR"))

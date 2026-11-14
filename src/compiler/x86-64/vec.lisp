@@ -1096,6 +1096,38 @@
           (register-inline-constant
            :oword (logior #x4000000000000000 (ash #x4000000000000000 64))))))
 
+;;;; 16-bit multiply: PMULLW is SSE2 and gives the low 16 bits of each product,
+;;;; which is what the scalar loop's value is once it is stored in a 16-bit
+;;;; element.
+
+(defknown (%vec-mul-ub16) ((simd-pack (unsigned-byte 16)) (simd-pack (unsigned-byte 16))) (simd-pack (unsigned-byte 16)) (flushable movable))
+
+(define-vop (%vec-mul-ub16)
+  (:translate %vec-mul-ub16)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub16 simd-pack-ub16)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub16)
+  (:generator 3
+    (move arith-tmp a)
+    (inst pmullw arith-tmp b)
+    (move result arith-tmp)))
+
+(defknown (%vec-mul-sb16) ((simd-pack (signed-byte 16)) (simd-pack (signed-byte 16))) (simd-pack (signed-byte 16)) (flushable movable))
+
+(define-vop (%vec-mul-sb16)
+  (:translate %vec-mul-sb16)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb16 simd-pack-sb16)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb16)
+  (:generator 3
+    (move arith-tmp a)
+    (inst pmullw arith-tmp b)
+    (move result arith-tmp)))
+
 ;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1124,6 +1156,8 @@
     (publish "RAMP" double-float %vec-ramp-double)
     (publish "STRIDE" single-float %vec-stride-single)
     (publish "STRIDE" double-float %vec-stride-double)
+    (publish "MUL" (unsigned-byte 16) %vec-mul-ub16)
+    (publish "MUL" (signed-byte 16) %vec-mul-sb16)
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)
