@@ -10,9 +10,10 @@
 ;;;; scalar tail loop, where W is 4 for single-float and 2 for double-float
 ;;;; (SSE2, which is baseline for x86-64, so no runtime CPU dispatch is needed).
 ;;;;
-;;;; The pass runs inside IR1 conversion, on each form as it is converted, so what
-;;;; it sees is macroexpanded code: a loop written inline and one produced by a
-;;;; macro arrive identically.  The types it uses are the compiler's own - the ctype
+;;;; The pass runs inside IR1 conversion, before macroexpansion: it sees the form
+;;;; the user wrote, so it rewrites DOTIMES and DO and LOOP by name, and a loop that
+;;;; a macro expands to is not rewritten (a known limitation).  The types it uses
+;;;; are the compiler's own - the ctype
 ;;;; of each variable's leaf, in the lexenv the form is being converted in - so a
 ;;;; declaration, a THE cast, a let-bound MAKE-ARRAY result and an inferred type all
 ;;;; count, and shadowed names and nested LOCALLY scopes are handled by the compiler
@@ -22,7 +23,9 @@
 ;;;; short to cover N.
 ;;;;
 ;;;; The elements each iteration touches are read before any of them is written,
-;;;; so the rewrite is valid even when the destination aliases a source.
+;;;; so the rewrite matches the scalar loop when the destination aliases a source
+;;;; and is written at or behind it; a destination that is written ahead of a read
+;;;; would be read back by the scalar loop and not by this one, so it is refused.
 
 (in-package "SB-C")
 
@@ -34,15 +37,6 @@
 (defvar *auto-vectorize-notes* t)
 
 ;;;; Deciding what a variable is declared to be
-
-;;; The element types this backend can move and compute a vector at a time.
-(defun vector-supported-element-type-p (element-type)
-  (member element-type '(single-float double-float
-                         (signed-byte 8) (unsigned-byte 8)
-                         (signed-byte 16) (unsigned-byte 16)
-                         (signed-byte 32) (unsigned-byte 32)
-                         (signed-byte 64) (unsigned-byte 64))
-          :test #'equal))
 
 (defun vector-float-element-type-p (element-type)
   (memq element-type '(single-float double-float)))
@@ -159,7 +153,7 @@
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
   element-type index count destination destination-offset destination-simple-p
-  destination-literal-p sources expression body fallback accumulator unchecked-p)
+  sources expression body fallback accumulator unchecked-p)
 
 ;;; A loop bound the generated code may evaluate more than once: a variable, a
 ;;; literal, or arithmetic on one of those, which has no side effects.  A bound
@@ -248,7 +242,7 @@ up in a guard evaluated outside the loop and so may not mention the index."
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
            (when (null (cdr subscripts))
-             (multiple-value-bind (offset literal-p)
+              (multiple-value-bind (offset literal-p)
                  (vector-subscript-offset (car subscripts) index)
                (when offset
                  (multiple-value-bind (name type simple-p) (vector-array-type array env)
@@ -310,8 +304,13 @@ up in a guard evaluated outside the loop and so may not mention the index."
     (values (nreverse declarations) forms)))
 
 (defun vector-special-declaration-p (declarations)
+  "Whether a loop body's declarations forbid vectorizing it, or change what its
+code means.  SPECIAL and TRULY-THE refer to bindings and types this pass would
+have to reproduce; an OPTIMIZE declaration sets the policy of the scalar store,
+which is not the policy the loop form itself is compiled under, so a body that
+declares (SAFETY 3) must not be rewritten as if it were unchecked."
   (some (lambda (declaration)
-          (some (lambda (spec) (memq (car spec) '(special sb-ext:truly-the)))
+          (some (lambda (spec) (memq (car spec) '(special sb-ext:truly-the optimize)))
                 (cdr declaration)))
         declarations))
 
@@ -326,7 +325,7 @@ up in a guard evaluated outside the loop and so may not mention the index."
                      (vector-pure-count-p count))
             (multiple-value-bind (declarations statements) (vector-split-declarations body)
               (when (and (null (cdr statements)) (not (vector-special-declaration-p declarations)))
-                (multiple-value-bind (destination element-type expression offset simple-p literal-p)
+                (multiple-value-bind (destination element-type expression offset simple-p)
                     (vector-match-element-store (car statements) env index)
                   (when destination
                     (make-vector-loop
@@ -336,7 +335,6 @@ up in a guard evaluated outside the loop and so may not mention the index."
                      :destination destination
                      :destination-offset offset
                      :destination-simple-p simple-p
-                     :destination-literal-p literal-p
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (car statements)
@@ -373,12 +371,17 @@ up in a guard evaluated outside the loop and so may not mention the index."
     (t accumulator)))
 
 ;;; (1- n) and (- n 1) are the same bound as N one step down.
-(defun vector-normalize-bound (count)
-  (if (and (consp count)
-           (or (and (eq (car count) '1-) (null (cddr count)))
-               (and (eq (car count) '-) (eql (third count) 1) (null (cdddr count)))))
-      (second count)
-      count))
+;;; The number of elements a LOOP clause covers: BELOW B is B, UPTO B is B+1, and
+;;; (1+ (1- N)) is N, so that UPTO (1- N) is written as the count N rather than as
+;;; arithmetic on it - the count reaches the generated guard and both loops.
+(defun vector-loop-count (bound upto)
+  (cond ((not upto) bound)
+        ((and (consp bound)
+              (or (and (eq (car bound) '1-) (null (cddr bound)))
+                  (and (eq (car bound) '-) (null (cdddr bound)) (eql (third bound) 1))))
+         ;; (1+ (1- N)) and (1+ (- N 1)) are N
+         (second bound))
+        (t `(1+ ,bound))))
 
 ;;; A LOOP clause keyword: the symbols in a LOOP form are the user's own, so
 ;;; they are matched by name rather than by identity.
@@ -409,12 +412,18 @@ up in a guard evaluated outside the loop and so may not mention the index."
             (setf clauses (cddr clauses)))
           (when (or (vector-loop-keyword (car clauses) "BELOW")
                     (vector-loop-keyword (car clauses) "UPTO"))
-            (let ((count (vector-normalize-bound (second clauses))))
+            ;; UPTO and BELOW are synonyms in LOOP only in taking a bound: BELOW N
+            ;; stops at N-1 and UPTO N stops at N, so the element count is one
+            ;; larger for UPTO.  Getting that wrong drops an iteration, which no
+            ;; runtime guard can notice.  UPTO (1- N) is then the common UPTO N-1,
+            ;; whose count is N.
+            (let* ((upto (and (vector-loop-keyword (car clauses) "UPTO") t))
+                   (count (vector-loop-count (second clauses) upto)))
               (setf clauses (cddr clauses))
               (when (and (vector-loop-keyword (car clauses) "DO")
                          (null (cddr clauses))
                          (vector-pure-count-p count))
-                (multiple-value-bind (destination element-type expression offset simple-p literal-p)
+                (multiple-value-bind (destination element-type expression offset simple-p)
                     (vector-match-element-store (second clauses) env index)
                   (when destination
                     (make-vector-loop
@@ -424,7 +433,6 @@ up in a guard evaluated outside the loop and so may not mention the index."
                      :destination destination
                      :destination-offset offset
                      :destination-simple-p simple-p
-                     :destination-literal-p literal-p
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (second clauses)
@@ -471,7 +479,7 @@ up in a guard evaluated outside the loop and so may not mention the index."
                       (when (and (null (cdr statements))
                                  (not (vector-special-declaration-p declarations)))
                         (multiple-value-bind (destination element-type expression
-                                              offset simple-p literal-p)
+                                              offset simple-p)
                             (vector-match-element-store (first statements) env index)
                           (when destination
                             (make-vector-loop
@@ -481,7 +489,6 @@ up in a guard evaluated outside the loop and so may not mention the index."
                              :destination destination
                              :destination-offset offset
                              :destination-simple-p simple-p
-                             :destination-literal-p literal-p
                              :sources (vector-collect-arrays expression)
                              :expression expression
                              :body (first statements)
@@ -595,6 +602,22 @@ up in a guard evaluated outside the loop and so may not mention the index."
 
 ;;; The arrays a loop touches, as an alist of name to (OFFSETS . SIMPLE-P),
 ;;; destination first.
+;;; The offsets a plan's destination is both written and read at.  The rewrite
+;;; reads every element of an iteration before writing any of them, which is only
+;;; the same as the scalar loop when the destination is written at or behind every
+;;; place it is read: writing ahead of a read (destination offset greater than the
+;;; source offset) means the scalar loop reads back a value it has just written,
+;;; while the packed one reads the value that was there before the iteration.
+(defun vector-alias-safe-p (destination-offset source-offsets)
+  (every (lambda (source-offset)
+           (or (eql destination-offset source-offset)
+               (and (integerp destination-offset) (integerp source-offset)
+                    (<= destination-offset source-offset))
+               ;; a variable offset is guarded to be non-negative at run time, so a
+               ;; destination at 0 is never ahead of it
+               (and (eql destination-offset 0) (not (integerp source-offset)))))
+         source-offsets))
+
 (defun vector-loop-arrays (loop)
   "The arrays a loop touches: the destination first, then the sources.  When the
 destination is also a source - (setf (aref c i) (+ (aref c (+ i 3)) ...)) - its
@@ -660,6 +683,10 @@ guard still covers the reads."
          (arrays (vector-loop-arrays loop))
          (references (vector-data-references loop))
          (end (make-symbol "VECTOR-END"))
+         ;; COUNT is a form, and it is used in the guard and in both loops: bind it
+         ;; once so that a COUNT that is a SYMBOL-MACROLET over a side effect runs
+         ;; as often as it does in the DOTIMES it replaces, which is once.
+         (count-var (make-symbol "COUNT"))
          ;; A read at (- I 1) would leave the array on the first packed iteration,
          ;; and the scalar loop it replaces would fault at I = 0 too: that loop is
          ;; bogus as written.  Real stencils write the interior and shift the
@@ -697,7 +724,9 @@ guard still covers the reads."
                                           scalars)))
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop))
-               (not negative-literals))
+               (not negative-literals)
+               (vector-alias-safe-p destination-offset
+                                    (rest (second (first arrays)))))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
@@ -706,7 +735,7 @@ guard still covers the reads."
                 (loop for entry in arrays
                       for name = (first entry)
                       for offsets = (second entry)
-                      append (cons `(>= (length ,name) (+ ,count (max 0 ,@offsets)))
+                      append (cons `(>= (length ,name) (+ ,count-var (max 0 ,@offsets)))
                                    (loop for offset in offsets
                                          unless (typep offset '(integer 0 *))
                                            collect `(>= ,offset 0)))))
@@ -733,7 +762,7 @@ guard still covers the reads."
                                      ,lanes ,stride))))))
                     ;; the tail, element by element, exactly as written
                     (do ((,index ,end (1+ ,index)))
-                        ((>= ,index ,count))
+                        ((>= ,index ,count-var))
                       (declare (type index ,index))
                       ,(vloop-body loop))))))
           ;; The guard chooses END rather than branching between two copies of the
@@ -742,22 +771,23 @@ guard still covers the reads."
           ;; work.  So the loop is emitted twice in total (packed and scalar)
           ;; instead of three times, which matters because the code is what makes
           ;; compiling loop-heavy code slower.
-          `(let* (,@(mapcar (lambda (scalar)
-                             (case (car scalar)
-                               (:stride `(,(cdr scalar)
-                                          (,(vector-primitive "STRIDE" element-type))))
-                               (:index `(,(cdr scalar) (,ramp)))
-                               (t `(,(cdr scalar)
-                                    (,splat ,(second (car scalar)))))))
-                           scalars)
-                  (,end (if (and (typep ,count 'index) ,@guard)
-                            (- ,count (mod ,count ,width))
-                            0)))
-             (declare (type index ,end)
-                      ,@(mapcar (lambda (scalar)
-                                  `(type ,pack-type ,(cdr scalar)))
-                                scalars))
-             ,body))))))
+          `(let ((,count-var ,count))
+             (let* (,@(mapcar (lambda (scalar)
+                                (case (car scalar)
+                                  (:stride `(,(cdr scalar)
+                                             (,(vector-primitive "STRIDE" element-type))))
+                                  (:index `(,(cdr scalar) (,ramp)))
+                                  (t `(,(cdr scalar)
+                                       (,splat ,(second (car scalar)))))))
+                              scalars)
+                     (,end (if (and (typep ,count-var 'index) ,@guard)
+                               (- ,count-var (mod ,count-var ,width))
+                               0)))
+               (declare (type index ,end)
+                        ,@(mapcar (lambda (scalar)
+                                    `(type ,pack-type ,(cdr scalar)))
+                                  scalars))
+               ,body)))))))
 
 ;;; Expand a reduction: add the elementwise expression into a vector accumulator,
 ;;; run the same expression over the tail one element at a time, then add the
@@ -792,9 +822,13 @@ guard still covers the reads."
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop))
                ;; no head peel here: a reduction reads its sources from 0, so a
-               ;; negative offset is not taken
-               (every (lambda (entry) (every (lambda (offset) (>= offset 0))
-                                             (second entry)))
+               ;; literal negative offset is not taken.  A variable offset arrives
+               ;; as a symbol and is checked by the generated guard instead -
+               ;; comparing it here would be a compile-time call on a variable.
+               (every (lambda (entry)
+                        (every (lambda (offset)
+                                 (or (not (integerp offset)) (>= offset 0)))
+                               (second entry)))
                       arrays))
       (when *auto-vectorize-notes*
         (compiler-notify "~@<vectorized reduction over ~a, ~a elements at a time; ~
@@ -803,8 +837,10 @@ guard still covers the reads."
                          element-type width
                          (if (vector-float-element-type-p element-type)
                              "which reorders the additions"
-                             "so a total that would overflow it differs from the scalar ~
-                              loop, where such an overflow was already undefined")))
+                             (concatenate
+                              'string
+                              "so a total that overflows the element type differs from "
+                              "the scalar loop, which does not truncate it"))))
       `(if (and (typep ,count 'index)
                 ,@(loop for entry in arrays
                         for name = (first entry)
@@ -1040,8 +1076,12 @@ guard still covers the reads."
 (defun vector-standard-loop-form-p (form lexenv)
   (not (nth-value 1 (lexenv-find (car form) funs :lexenv lexenv))))
 
+;;; The manual documents this pass as a SPEED 2 optimization, and compiling that is
+;;; the one visible cost: the code is emitted twice, so do not spend it on code
+;;; compiled for space.
 (defun vectorize-loop-form (form lexenv)
   (when (and *auto-vectorize*
+             (policy lexenv (>= speed 2))
              (consp form)
              (memq (car form) '(dotimes do do* loop))
              (vector-standard-loop-form-p form lexenv))
