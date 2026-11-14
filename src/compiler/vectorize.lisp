@@ -184,19 +184,29 @@
 ;;; negative at run time, so the generated guard checks it, which a literal does
 ;;; not need.
 (defun vector-subscript-offset (subscript index)
+  "The constant displacement of SUBSCRIPT from INDEX, and whether it is a literal.
+(AREF A I) is 0, (AREF A (+ I 3)) is 3, (AREF A (- I 1)) is -1.  A literal may be
+negative: the loop is then split so that the packed part only reads offsets that are
+in range.  A non-literal offset is used only when it is a variable, because it ends
+up in a guard evaluated outside the loop and so may not mention the index."
   (cond ((eq subscript index) (values 0 t))
-        ((and (consp subscript) (eq (car subscript) '+))
+        ((and (consp subscript) (member (car subscript) '(+ -)))
          (let ((arguments (cdr subscript)))
            (when (and (= (length arguments) 2)
-                      (member index arguments :test #'eq))
-             (let ((other (if (eq (first arguments) index)
-                              (second arguments)
-                              (first arguments))))
-                ;; the offset ends up in a guard evaluated outside the loop, so it
-                ;; may not mention the loop index
-                (cond ((typep other '(integer 0 *)) (values other t))
-                      ((and (symbolp other) (not (eq other index)))
-                       (values other nil)))))))))
+                      (eq (first arguments) index))
+             (let ((other (second arguments)))
+               (cond ((typep other 'integer)
+                      (values (if (eq (car subscript) '-) (- other) other) t))
+                     ((and (eq (car subscript) '+)
+                           (symbolp other)
+                           (not (eq other index)))
+                      (values other nil)))))))
+        ;; (+ 3 i) as well as (+ i 3)
+        ((and (consp subscript) (eq (car subscript) '+)
+              (= (length (cdr subscript)) 2)
+              (typep (first (cdr subscript)) 'integer)
+              (eq (second (cdr subscript)) index))
+         (values (first (cdr subscript)) t))))
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
 (defun vector-match-expression (form env index element-type)
@@ -640,12 +650,18 @@ guard still covers the reads."
          (index (vloop-index loop))
          (count (vloop-count loop))
          (destination-offset (vloop-destination-offset loop))
-         (end (make-symbol "VECTOR-END"))
          (expression (vloop-expression loop))
          (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
                           (vector-collect-scalars expression)))
          (arrays (vector-loop-arrays loop))
          (references (vector-data-references loop))
+         (end (make-symbol "VECTOR-END"))
+         ;; A read at (- I 1) would leave the array on the first packed iteration,
+         ;; and the scalar loop it replaces would fault at I = 0 too: that loop is
+         ;; bogus as written.  Real stencils write the interior and shift the
+         ;; destination - (+ I 1) on the store, non-negative reads - which this pass
+         ;; takes.  So a negative offset is declined, and the note says why.
+         (min-offset (loop for entry in arrays minimize (reduce #'min (second entry))))
          (pack-type `(simd-pack ,element-type))
          (load (vector-primitive "LOAD" element-type))
          (store (vector-primitive "STORE" element-type))
@@ -671,7 +687,8 @@ guard still covers the reads."
                                             (memq (car scalar) '(:index :stride)))
                                           scalars)))
                (or (vector-float-element-type-p element-type)
-                   (vloop-unchecked-p loop)))
+                   (vloop-unchecked-p loop))
+               (>= min-offset 0))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
@@ -680,7 +697,7 @@ guard still covers the reads."
                 (loop for entry in arrays
                       for name = (first entry)
                       for offsets = (second entry)
-                      append (cons `(>= (length ,name) (+ ,count (max ,@offsets)))
+                      append (cons `(>= (length ,name) (+ ,count (max 0 ,@offsets)))
                                    (loop for offset in offsets
                                          unless (typep offset '(integer 0 *))
                                            collect `(>= ,offset 0)))))
@@ -764,7 +781,12 @@ guard still covers the reads."
     (when (and load store splat add (every #'identity arithmetic)
                (not (memq :index (vector-collect-operators expression)))
                (or (vector-float-element-type-p element-type)
-                   (vloop-unchecked-p loop)))
+                   (vloop-unchecked-p loop))
+               ;; no head peel here: a reduction reads its sources from 0, so a
+               ;; negative offset is not taken
+               (every (lambda (entry) (every (lambda (offset) (>= offset 0))
+                                             (second entry)))
+                      arrays))
       (when *auto-vectorize-notes*
         (compiler-notify "~@<vectorized reduction over ~a, ~a elements at a time; ~
                           the sum is computed modulo the element type, ~
@@ -778,7 +800,7 @@ guard still covers the reads."
                 ,@(loop for entry in arrays
                         for name = (first entry)
                         for offsets = (second entry)
-                        append (cons `(>= (length ,name) (+ ,count (max ,@offsets)))
+                        append (cons `(>= (length ,name) (+ ,count (max 0 ,@offsets)))
                                      (loop for offset in offsets
                                            unless (typep offset '(integer 0 *))
                                              collect `(>= ,offset 0)))))
@@ -884,7 +906,8 @@ guard still covers the reads."
          (values t '() '()))
         ((and (consp expression) (eq (car expression) '-) (null (cddr expression)))
          (vector-shape-expression (second expression) index))
-        ((and (consp expression) (memq (car expression) '(+ * / logand logior logxor min max)))
+        ((and (consp expression)
+              (memq (car expression) '(+ - * / logand logior logxor min max)))
          (let ((arrays '()) (scalars '()))
            (dolist (argument (cdr expression))
              (multiple-value-bind (ok argument-arrays argument-scalars)
@@ -917,7 +940,7 @@ guard still covers the reads."
             (unless shape
               (return-from vector-missed-diagnosis nil))
             (vector-diagnose-types (adjoin (second place) arrays-in-expression) env
-                                   (third store) (policy env (= safety 0)))))))))
+                                   (third store) (policy env (= safety 0)) index)))))))
 
 ;;; The operator symbols an elementwise expression is built from.
 (defun vector-shape-operators (expression)
@@ -929,11 +952,30 @@ guard still covers the reads."
                      (mapcan #'vector-shape-operators (cdr expression)))))
       '()))
 
+;;; A subscript that reads before the loop variable cannot be vectorized, and the
+;;; scalar loop it stands for would fault at index 0 anyway.  Say so, because the
+;;; fix is a rewrite the user can do.
+(defun vector-negative-offset-reason (form index)
+  (labels ((walk (form)
+             (cond ((not (consp form)) nil)
+                   ((and (eq (car form) 'aref) (= (length form) 3)
+                         (consp (third form)))
+                    (multiple-value-bind (offset literal)
+                        (vector-subscript-offset (third form) index)
+                      (cond ((and literal (minusp offset))
+                             (format nil "~s is read at ~s, before the loop variable; ~
+                                          loop over the interior and shift the destination ~
+                                          instead, as in (setf (aref out (+ i 1)) ...)"
+                                     (second form) (third form)))
+                            (t (walk (third form))))))
+                   (t (some #'walk (cdr form))))))
+    (walk form)))
+
 ;;; What stops ARRAYS and EXPRESSION from being vectorized, in the voice of a
 ;;; compiler note?  Two things can: an array with no usable declaration, or lanes
 ;;; the element type does not have - an operator without a primitive, or byte lanes
 ;;; outside (safety 0).
-(defun vector-diagnose-types (arrays lexenv expression unchecked-p)
+(defun vector-diagnose-types (arrays lexenv expression unchecked-p index)
   (let ((element-type nil)
         (unregistered '())
         (reasons '()))
@@ -952,6 +994,8 @@ guard still covers the reads."
                              allow this loop to be vectorized"
                         name))
             reasons))
+    (let ((reason (vector-negative-offset-reason expression index)))
+      (when reason (push reason reasons)))
     (when element-type
       (dolist (operator (remove-duplicates (vector-shape-operators expression) :test #'eq))
         (unless (vector-operator-base operator element-type)
