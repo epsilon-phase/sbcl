@@ -707,22 +707,28 @@ guard still covers the reads."
                         ((>= ,index ,count))
                       (declare (type index ,index))
                       ,(vloop-body loop))))))
-          `(if (and (typep ,count 'index) ,@guard)
-               (let* (,@(mapcar (lambda (scalar)
-                                  (case (car scalar)
-                                    (:stride `(,(cdr scalar)
-                                               (,(vector-primitive "STRIDE" element-type))))
-                                    (:index `(,(cdr scalar) (,ramp)))
-                                    (t `(,(cdr scalar)
-                                         (,splat ,(second (car scalar)))))))
-                                scalars)
-                      (,end (- ,count (mod ,count ,width))))
-                 (declare (type index ,end)
-                          ,@(mapcar (lambda (scalar)
-                                      `(type ,pack-type ,(cdr scalar)))
-                                    scalars))
-                 ,body)
-               ,(vloop-fallback loop)))))))
+          ;; The guard chooses END rather than branching between two copies of the
+          ;; loop: when it fails, END is 0, the vector loop does not run, and the
+          ;; tail loop - which is the original loop, written once - does all the
+          ;; work.  So the loop is emitted twice in total (packed and scalar)
+          ;; instead of three times, which matters because the code is what makes
+          ;; compiling loop-heavy code slower.
+          `(let* (,@(mapcar (lambda (scalar)
+                             (case (car scalar)
+                               (:stride `(,(cdr scalar)
+                                          (,(vector-primitive "STRIDE" element-type))))
+                               (:index `(,(cdr scalar) (,ramp)))
+                               (t `(,(cdr scalar)
+                                    (,splat ,(second (car scalar)))))))
+                           scalars)
+                  (,end (if (and (typep ,count 'index) ,@guard)
+                            (- ,count (mod ,count ,width))
+                            0)))
+             (declare (type index ,end)
+                      ,@(mapcar (lambda (scalar)
+                                  `(type ,pack-type ,(cdr scalar)))
+                                scalars))
+             ,body))))))
 
 ;;; Expand a reduction: add the elementwise expression into a vector accumulator,
 ;;; run the same expression over the tail one element at a time, then add the
