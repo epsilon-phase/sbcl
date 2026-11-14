@@ -972,18 +972,14 @@ guard still covers the reads."
 ;;; LEXENV is the environment it is being converted in, which is what makes the type
 ;;; lookups right for shadowed names, (THE ...) casts and a nested LOCALLY's
 ;;; OPTIMIZE declarations.
-;;; The macro functions of the control forms this pass reads as syntax, captured
-;;; when this file is loaded.  A program that rebinds one of them - by MACROLET, or
-;;; by redefining it globally - means something else by the form, so the pass leaves
-;;; such forms to the compiler.
-(defparameter *vector-loop-macros*
-  (mapcar (lambda (name) (cons name (macro-function name)))
-          '(dotimes do do* loop)))
-
+;;; A control form is syntax only when its name is not bound in the lexenv: a
+;;; MACROLET or FLET of DOTIMES, DO or LOOP means something else by the form, and the
+;;; compiler is the one that knows.  (Redefining one of them globally needs a package
+;;; lock violation, so it is not a case worth paying for here.)  A snapshot of the
+;;; standard macro functions would not work anyway: this file is loaded by the host
+;;; compiler during the build, so the functions it captured would be the host's.
 (defun vector-standard-loop-form-p (form lexenv)
-  (let ((name (car form)))
-    (and (not (nth-value 1 (lexenv-find name funs :lexenv lexenv)))
-         (eq (macro-function name) (cdr (assoc name *vector-loop-macros*))))))
+  (not (nth-value 1 (lexenv-find (car form) funs :lexenv lexenv))))
 
 (defun vectorize-loop-form (form lexenv)
   (when (and *auto-vectorize*
