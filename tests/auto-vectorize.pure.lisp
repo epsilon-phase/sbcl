@@ -1860,3 +1860,28 @@ a writer with a fixed color type ends up with."
                      (dotimes (i n) (setf (aref out i) (- (aref in i) (aref in (- i 1)))))))))
       (assert (vectorize-note-mentions notes "shift the destination")
               () "no advice for the negative offset: ~s" notes))))
+
+;;;; 16-bit lanes can multiply: PMULLW gives the low 16 bits of each product, which
+;;;; is what storing into a 16-bit element gives, so the values agree with the
+;;;; scalar loop at (safety 0).
+
+(defun vectorize-u16-multiply (a b c n)
+  (declare (type (simple-array (unsigned-byte 16) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))
+  c)
+
+(test-util:with-test (:name :vectorize-16-bit-multiply :skipped-on (not :x86-64))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 16) '(3 300 1000 65535 7) n)
+        for b = (vectorize-integer-array '(unsigned-byte 16) '(5 400 500 65535 11) n 2)
+        for c = (make-array n :element-type '(unsigned-byte 16) :initial-element 0)
+        do (vectorize-u16-multiply a b c n)
+           (dotimes (i n)
+             (let ((want (logand (* (aref a i) (aref b i)) #xFFFF)))
+               (unless (= (aref c i) want)
+                 (error "~@<u16 multiply: element ~D of ~D is ~S, expected ~S.~:@>"
+                        i n (aref c i) want)))))
+  (let ((text (string-downcase (with-output-to-string (stream)
+                                 (disassemble #'vectorize-u16-multiply :stream stream)))))
+    (assert (search "pmullw" text) () "u16 multiply is not packed:~%~A" text)))
