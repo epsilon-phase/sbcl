@@ -634,6 +634,17 @@
 (defun ir1-convert (start next result form)
   (declare (type ctran start next)
            (type (or lvar null) result))
+  ;; The automatic vectorizer gets every form as it is converted, which is after
+  ;; macroexpansion: a loop the user wrote and a loop a macro produced are the same
+  ;; form by the time it arrives here.  A replacement is converted under
+  ;; *VECTORIZE-INHIBITED* so that its own fallback branch, the original loop, is
+  ;; not rewritten again.
+  (unless *vectorize-inhibited*
+    (let ((replacement (vectorize-loop-form form *lexenv*)))
+      (when replacement
+        (let ((*vectorize-inhibited* t))
+          (return-from ir1-convert
+            (ir1-convert start next result replacement))))))
   (let* ((*current-path* (ensure-source-path form))
          (start (instrument-coverage start nil form)))
     (ir1-error-bailout (start next result form)

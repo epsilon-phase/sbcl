@@ -208,8 +208,6 @@
                                 local-policy
                                 value-source-forms)
   (declare (list body vars aux-vars aux-vals))
-  ;; Rewrite elementwise array loops into SIMD loops before converting.
-  (setf body (vectorize-lambda-body body *lexenv* local-policy vars))
 
   (let* ((bind (make-bind))
          (lambda (make-clambda :vars vars
