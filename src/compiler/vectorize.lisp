@@ -902,7 +902,7 @@ guard still covers the reads."
             (unless shape
               (return-from vector-missed-diagnosis nil))
             (vector-diagnose-types (adjoin (second place) arrays-in-expression) env
-                                   (third store) (policy env (= safety 0))))))))
+                                   (third store) (policy env (= safety 0)))))))))
 
 ;;; The operator symbols an elementwise expression is built from.
 (defun vector-shape-operators (expression)
@@ -918,23 +918,22 @@ guard still covers the reads."
 ;;; compiler note?  Two things can: an array with no usable declaration, or lanes
 ;;; the element type does not have - an operator without a primitive, or byte lanes
 ;;; outside (safety 0).
-(defun vector-diagnose-types (arrays env expression unchecked-p)
+(defun vector-diagnose-types (arrays lexenv expression unchecked-p)
   (let ((element-type nil)
-        (undeclared '())
+        (unregistered '())
         (reasons '()))
     (dolist (name arrays)
-      (multiple-value-bind (kind type) (vector-variable-info name env)
+      (multiple-value-bind (kind type) (vector-variable-info name lexenv)
         (cond ((and (eq kind :array) (null element-type))
                (setf element-type (car type)))
               ((null kind)
-               (unless (cdr (assq name env))
-                 (push name undeclared))))))
-    (dolist (name (nreverse undeclared))
+               (push name unregistered)))))
+    (dolist (name (nreverse unregistered))
       (push (if element-type
-                (format nil "~s has no array declaration; (declare (type (simple-array ~a (*)) ~s)) ~
+                (format nil "~s is not known to be an array; a (declare (type (simple-array ~a (*)) ~s)) ~
                              would allow this loop to be vectorized"
                         name element-type name)
-                (format nil "~s has no array declaration; declaring its element type would ~
+                (format nil "~s is not known to be an array; declaring its element type would ~
                              allow this loop to be vectorized"
                         name))
             reasons))
@@ -943,10 +942,9 @@ guard still covers the reads."
         (unless (vector-operator-base operator element-type)
           (push (format nil "~a is not available for ~a lanes" operator element-type)
                 reasons)))
-      (when (and (not (vector-float-element-type-p element-type))
-                 (not unchecked-p)))
-        (push (format nil "~a lanes wrap where a checked loop would signal, so they ~
-                           are only used when compiled at (safety 0)"
+      (unless (or (vector-float-element-type-p element-type) unchecked-p)
+        (push (format nil "~a lanes wrap where a checked loop would signal, so they are ~
+                           only used when compiled at (safety 0)"
                       element-type)
               reasons)))
     (nreverse reasons)))
