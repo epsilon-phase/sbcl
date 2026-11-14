@@ -805,6 +805,167 @@
              nil)
            ,(vloop-fallback loop)))))
 
+;;;; Missed-optimization notes.
+;;;;
+;;;; The pass declines silently, and the most common reason is a type declaration
+;;;; the user did not write.  That is the one thing they can fix, so a loop whose
+;;;; SHAPE is the one this pass rewrites - same control form, same single store,
+;;;; same elementwise expression - that was nevertheless not rewritten gets a note
+;;;; saying what was missing.  This is the same service SBCL does when a vop's
+;;;; translation fails: "unable to open-code X due to type uncertainty".
+;;;;
+;;;; Notes are only issued for a near miss, never for a loop that was simply not
+;;;; this pass's business, so ordinary code that happens to contain loops stays
+;;;; quiet.
+
+;;; The index, count and body of a loop in one of the shapes the pass takes, with
+;;; no regard for types.
+(defun vector-shape-loop (form)
+  (cond ((and (consp form) (eq (car form) 'dotimes)
+              (consp (second form)) (null (cddr (second form))))
+         (values (first (second form)) (second (second form)) (cddr form)))
+        ((and (consp form) (memq (car form) '(do do*)))
+         (let ((bindings (second form))
+               (end-clause (third form)))
+           (when (and (consp bindings) (null (cdr bindings))
+                      (consp end-clause) (null (cdr end-clause))
+                      (consp (first bindings)))
+             (destructuring-bind (index &optional (init nil init-p) (step nil step-p))
+                 (first bindings)
+               (declare (ignore init))
+               (let ((test (first end-clause)))
+                 (when (and (symbolp index) init-p step-p
+                            (vector-increments-index-p step index)
+                            (consp test) (= (length test) 3))
+                   (values index (third test) (cdddr form))))))))
+        ((and (consp form) (eq (car form) 'loop))
+         (vector-shape-loop-clauses (cdr form)))))
+
+;;; (loop for index [of-type ...] [from 0] below/upto/below count do body)
+(defun vector-shape-loop-clauses (clauses)
+  (let ((index nil) (count nil) (body '()))
+    (loop while clauses
+          do (case (car clauses)
+               (for (push (second clauses) index) (setf clauses (cddr clauses)))
+               (below (push (second clauses) count) (setf clauses (cddr clauses)))
+               (upto (push (second clauses) count) (setf clauses (cddr clauses)))
+               (do (push (second clauses) body) (setf clauses (cddr clauses)))
+               (of-type (setf clauses (cddr clauses)))
+               (from (setf clauses (cddr clauses)))
+               (t (return-from vector-shape-loop-clauses nil))))
+    (when (and index count (= (length index) 1) (= (length count) 1) (= (length body) 1))
+      (values (first index) (first count) body))))
+
+;;; Is EXPRESSION built only from the operators, array references and constants the
+;;; pass understands?  Returns (values T arrays variables) or NIL.  The arrays and
+;;; variables are returned rather than accumulated in place, since rebinding a
+;;; parameter would not be visible to the caller.
+(defun vector-shape-expression (expression index)
+  (cond ((numberp expression) (values t '() '()))
+        ((symbolp expression)
+         (if (keywordp expression)
+             (values nil nil nil)
+             (values t '() (list expression))))
+        ((and (consp expression) (eq (car expression) 'aref) (= (length expression) 3)
+              (symbolp (second expression)))
+         (if (vector-subscript-offset (third expression) index)
+             (values t (list (second expression)) '())
+             (values nil nil nil)))
+        ((and (consp expression) (eq (car expression) 'float) (null (cddr expression))
+              (eq (second expression) index))
+         (values t '() '()))
+        ((and (consp expression) (eq (car expression) 'coerce) (= (length expression) 3)
+              (eq (second expression) index))
+         (values t '() '()))
+        ((and (consp expression) (eq (car expression) '-) (null (cddr expression)))
+         (vector-shape-expression (second expression) index))
+        ((and (consp expression) (memq (car expression) '(+ * / logand logior logxor min max)))
+         (let ((arrays '()) (scalars '()))
+           (dolist (argument (cdr expression))
+             (multiple-value-bind (ok argument-arrays argument-scalars)
+                 (vector-shape-expression argument index)
+               (unless ok
+                 (return-from vector-shape-expression (values nil nil nil)))
+               (setf arrays (append argument-arrays arrays)
+                     scalars (append argument-scalars scalars))))
+           (values t arrays scalars)))
+        (t (values nil nil nil))))
+
+;;; The reasons FORM, a loop in this pass's shape, was not rewritten.
+(defun vector-missed-diagnosis (form env)
+  (multiple-value-bind (index count body) (vector-shape-loop form)
+    (unless (and index count (= (length body) 1))
+      (return-from vector-missed-diagnosis nil))
+    (multiple-value-bind (declarations statements) (vector-split-declarations body)
+      (declare (ignore declarations))
+      (unless (= (length statements) 1)
+        (return-from vector-missed-diagnosis nil))
+      (let ((store (vector-normalize-store (first statements))))
+        (unless (and (consp store) (eq (car store) 'setf) (null (cdddr store)))
+          (return-from vector-missed-diagnosis nil))
+        (let ((place (second store)))
+          (unless (and (consp place) (eq (car place) 'aref) (= (length place) 3)
+                       (eq (third place) index) (symbolp (second place)))
+            (return-from vector-missed-diagnosis nil))
+          (multiple-value-bind (shape arrays-in-expression)
+              (vector-shape-expression (third store) index)
+            (unless shape
+              (return-from vector-missed-diagnosis nil))
+            (vector-diagnose-types (adjoin (second place) arrays-in-expression) env
+                                   (third store))))))))
+
+;;; The operator symbols an elementwise expression is built from.
+(defun vector-shape-operators (expression)
+  (if (consp expression)
+      (cond ((memq (car expression) '(aref float coerce)) '())
+            ((eq (car expression) '-)
+             (cons '- (vector-shape-operators (second expression))))
+            (t (cons (car expression)
+                     (mapcan #'vector-shape-operators (cdr expression)))))
+      '()))
+
+;;; What stops ARRAYS and EXPRESSION from being vectorized, in the voice of a
+;;; compiler note?  Two things can: an array with no usable declaration, or lanes
+;;; the element type does not have - an operator without a primitive, or byte lanes
+;;; outside (safety 0).
+(defun vector-diagnose-types (arrays env expression)
+  (let ((element-type nil)
+        (undeclared '())
+        (reasons '()))
+    (dolist (name arrays)
+      (multiple-value-bind (kind type) (vector-variable-info name env)
+        (cond ((and (eq kind :array) (null element-type))
+               (setf element-type (car type)))
+              ((null kind)
+               (unless (cdr (assq name env))
+                 (push name undeclared))))))
+    (dolist (name (nreverse undeclared))
+      (push (if element-type
+                (format nil "~s has no array declaration; (declare (type (simple-array ~a (*)) ~s)) ~
+                             would allow this loop to be vectorized"
+                        name element-type name)
+                (format nil "~s has no array declaration; declaring its element type would ~
+                             allow this loop to be vectorized"
+                        name))
+            reasons))
+    (when element-type
+      (dolist (operator (remove-duplicates (vector-shape-operators expression) :test #'eq))
+        (unless (vector-operator-base operator element-type)
+          (push (format nil "~a is not available for ~a lanes" operator element-type)
+                reasons)))
+      (when (and (= (vector-width element-type) 16)
+                 (not *vectorize-byte-lanes*))
+        (push (format nil "lanes of ~a are only used when compiled at (safety 0)"
+                      element-type)
+              reasons)))
+    (nreverse reasons)))
+
+;;; Report them, once per loop.
+(defun vector-note-missed-optimization (form env)
+  (when *auto-vectorize-notes*
+    (dolist (reason (vector-missed-diagnosis form env))
+      (compiler-notify "~@<unable to vectorize this loop: ~2I~_~A~:>" reason))))
+
 ;;;; Walking a body
 
 (defun vector-vectorize-body (forms env)
@@ -830,7 +991,8 @@
                        ((do do*) (vector-match-do form env))
                        (t (or (vector-match-dotimes form env)
                               (vector-match-reduction form env))))))
-           (or (and plan (vector-expand-loop plan)) form)))
+            (or (and plan (vector-expand-loop plan))
+                (progn (vector-note-missed-optimization form env) form))))
         (lambda `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env)))
         ((let let*)
          (multiple-value-bind (declarations statements) (vector-split-declarations (cddr form))
