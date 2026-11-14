@@ -1275,8 +1275,9 @@ scalar.  Image processing code usually declares @code{(safety 0)} already.
 @noindent
 Integer arithmetic wraps around at the width of the element type, which is what
 a scalar loop storing into an array of that type does once the range check is
-off.  Multiplication and
-division are available for the float element types only.
+off.  Multiplication is available for the float element types and for the 16-bit
+integer ones, where it produces the low 16 bits of each product exactly as storing
+into such an element does; division is available for the floats only.
 
 The loop may be written as a @code{dotimes}, as a @code{do} whose single binding
 counts from zero by one and whose end test is @code{(>= i n)} or @code{(= i n)},
@@ -1290,9 +1291,11 @@ or as a @code{loop} whose clauses are a variable, an optional @code{of-type} and
 @end lisp
 
 @noindent
-An index may be the loop variable or the loop variable plus a constant, as in
-@code{(aref raw (+ i 3))}; the constant has to be a literal, so a pixel size held
-in a variable is not seen.  Offsets are what a PNG row filter needs:
+An index may be the loop variable or the loop variable plus an offset, as in
+@code{(aref raw (+ i 3))}.  A literal offset is folded into the generated loop; an
+offset held in a variable is allowed when it can be shown to be non-negative, and
+is then checked outside the loop.  A literal negative offset is refused, because the
+scalar loop would read before the start of the array at @code{i} equal to zero.  Offsets are what a PNG row filter needs:
 
 @lisp
 (dotimes (i (- n 3))                    ; PNG filter type 1, three-byte pixels
@@ -1377,10 +1380,16 @@ turned off for a compilation with
 @end lisp
 
 @noindent
-Not handled, and compiled exactly as before: reductions such as summation,
-unary minus, integer multiplication and division, offsets and strides in the
-index expression, loops whose bound is a computed form, and element types other
-than the ones listed above.
+Integer lanes are used only at @code{(safety 0)}: a packed lane wraps around where
+a checked store signals an error, so the loop is left alone when the store is
+checked.  A loop whose body carries its own policy declaration is also left alone,
+since that policy is not the one the loop form is compiled under.
+
+Not handled, and compiled exactly as before: float reductions, where summing the
+lanes would reorder the additions; signed-byte @code{min} and @code{max}, which need
+SSE4.1; integer division; a destination that is also written ahead of where it is
+read; loops whose bound is a computed form, and element types other than the ones
+listed above.
 
 @node interpreter
 @cindex interpreter

@@ -1885,3 +1885,134 @@ a writer with a fixed color type ends up with."
   (let ((text (string-downcase (with-output-to-string (stream)
                                  (disassemble #'vectorize-u16-multiply :stream stream)))))
     (assert (search "pmullw" text) () "u16 multiply is not packed:~%~A" text)))
+
+;;;; Regression tests for the five findings of the second review.
+
+;;; 1. UPTO includes its bound.  It is a synonym for BELOW in LOOP only in the
+;;; sense that both take a bound; the last iteration differs, and the packed loop
+;;; covering a shorter range is not something a runtime guard can notice.
+(defun vectorize-loop-upto-count (a c n)
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i upto n do (setf (aref c i) (+ (aref a i) 1.0)))
+  c)
+
+(defun vectorize-loop-below-count (a c n)
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (loop for i below n do (setf (aref c i) (+ (aref a i) 1.0)))
+  c)
+
+(with-test (:name :vectorize-loop-upto-includes-bound :skipped-on (not :x86-64))
+  ;; the destination holds one element more than the loop's loop-variable bound
+  (loop for n from 0 to 20
+        do (let* ((size (+ n 2))
+                  (a (make-array size :element-type 'single-float
+                                      :initial-element 1.5))
+                  (c (make-array size :element-type 'single-float
+                                      :initial-element -1.0)))
+             (vectorize-loop-upto-count a c n)
+             (loop for i from 0 to n
+                   do (assert (= (aref c i) 2.5) ()
+                              "~@<UPTO dropped iteration ~D of 0..~D~:@>" i n))
+             (let ((c2 (make-array size :element-type 'single-float
+                                        :initial-element -1.0)))
+               (vectorize-loop-below-count a c2 n)
+               (loop for i from 0 to n
+                     do (assert (if (< i n) (= (aref c2 i) 2.5) (= (aref c2 i) -1.0)) ()
+                                "~@<BELOW ran iteration ~D of 0..~D~:@>" i n)))))
+  (let ((notes (vectorize-notes-for
+                '(lambda (a c n)
+                   (declare (type (simple-array single-float (*)) a c)
+                            (type vectorize-index n) (optimize speed))
+                   (loop for i upto n do (setf (aref c i) (+ (aref a i) 1.0)))))))
+    (assert (some (lambda (line) (search "vectorized" line :test #'char-equal)) notes)
+            () "UPTO loops are no longer vectorized: ~A" notes)))
+
+;;; 2. A destination written ahead of a read is not the same loop once the loop is
+;;; packed: the scalar one reads back what it just stored.
+(defun vectorize-alias-ahead (c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c (+ i 1)) (+ (aref c i) 1)))
+  c)
+
+(with-test (:name :vectorize-alias-ahead-declined :skipped-on (not :x86-64))
+  (let ((notes (vectorize-notes-for
+                '(lambda (c n)
+                   (declare (type (simple-array (unsigned-byte 32) (*)) c)
+                            (type vectorize-index n) (optimize speed (safety 0)))
+                   (dotimes (i n) (setf (aref c (+ i 1)) (+ (aref c i) 1)))))))
+    (assert (notany (lambda (line) (search "vectorized loop" line :test #'char-equal)) notes)
+            () "A destination written ahead of its source was vectorized: ~A" notes))
+  ;; and the values are whatever the scalar loop gives: a running total from 0
+  (loop for n from 0 to 20
+        do (let* ((c (make-array (1+ n) :element-type '(unsigned-byte 32)
+                                       :initial-element 0))
+                  (want (make-array (1+ n) :element-type '(unsigned-byte 32)
+                                          :initial-element 0)))
+             (dotimes (i n)
+               (setf (aref want (+ i 1)) (1+ (aref want i))))
+             (vectorize-alias-ahead c n)
+             (assert (equalp c want) ()
+                     "~@<aliasing ahead: got ~S, the scalar loop gives ~S~:@>"
+                     (coerce c 'list) (coerce want 'list)))))
+
+;;; 3. A policy declaration inside the body is not the policy the loop form is
+;;; compiled under, so the loop must not be rewritten as if it were unchecked.
+(with-test (:name :vectorize-body-optimize-declined :skipped-on (not :x86-64))
+  (let ((notes (vectorize-notes-for
+                '(lambda (a b c n)
+                   (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
+                            (type vectorize-index n) (optimize (speed 3) (safety 0)))
+                   (dotimes (i n)
+                     (declare (optimize (safety 3)))
+                     (setf (aref c i) (+ (aref a i) (aref b i))))))))
+    (assert (notany (lambda (line) (search "vectorized loop" line :test #'char-equal)) notes)
+            () "A body that declares (SAFETY 3) was vectorized unchecked: ~A" notes)))
+
+;;; 4. A reduction over a variable offset must compile, and take the same elements
+;;; as the scalar loop.
+(defun vectorize-sum-variable-offset (a k n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a) (type vectorize-index k n)
+           (optimize speed (safety 0)))
+  (let ((acc 0))
+    (declare (type (unsigned-byte 32) acc))
+    (dotimes (i n) (incf acc (aref a (+ i k))))
+    acc))
+
+(with-test (:name :vectorize-sum-variable-offset :skipped-on (not :x86-64))
+  (loop for n in *vectorize-lengths*
+        for k in '(0 1 2 3 0 1 2 3 0 1 2 3 0 1)
+        do (let* ((size (+ n k))
+                  (a (vectorize-integer-array '(unsigned-byte 32) '(1 2 3 4 5 6 7) size))
+                  (want (let ((acc 0))
+                          (dotimes (i n) (incf acc (aref a (+ i k))))
+                          (logand acc #xFFFFFFFF))))
+             (assert (= (vectorize-sum-variable-offset a k n) want) ()
+                     "~@<variable-offset sum with k=~D, n=~D: got ~S, expected ~S~:@>"
+                     k n (vectorize-sum-variable-offset a k n) want))))
+
+;;; 5. The count is a form: it must be evaluated as often as DOTIMES evaluates it,
+;;; which is once, even when it is a symbol macro over a side effect.
+(defvar *vectorize-count-calls* 0)
+
+(with-test (:name :vectorize-count-evaluated-once :skipped-on (not :x86-64))
+  (let ((function
+          (compile nil '(lambda (a c n)
+                          (declare (type (simple-array single-float (*)) a c)
+                                   (type vectorize-index n) (optimize speed))
+                          (symbol-macrolet ((bound (progn (incf *vectorize-count-calls*) n)))
+                            (dotimes (i bound)
+                              (setf (aref c i) (+ (aref a i) 1.0))))
+                          c))))
+    (loop for n in *vectorize-lengths*
+          do (let ((a (make-array n :element-type 'single-float :initial-element 1.0))
+                   (c (make-array n :element-type 'single-float :initial-element 0.0)))
+               (setf *vectorize-count-calls* 0)
+               (funcall function a c n)
+               (assert (= *vectorize-count-calls* 1) ()
+                       "~@<the loop bound was evaluated ~D times for n=~D~:@>"
+                       *vectorize-count-calls* n)
+               (loop for i below n
+                     do (assert (= (aref c i) 2.0) () "element ~D of ~D is ~S" i n (aref c i)))))))
