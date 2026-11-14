@@ -10,16 +10,20 @@
 ;;;; scalar tail loop, where W is 4 for single-float and 2 for double-float
 ;;;; (SSE2, which is baseline for x86-64, so no runtime CPU dispatch is needed).
 ;;;;
-;;;; The pass runs on the *source* of a lambda body before IR1 conversion, so
-;;;; what it knows are DECLARATIONS, not inferred types: an array takes part only
-;;;; if it is declared (SIMPLE-ARRAY SINGLE-FLOAT (*)) or the DOUBLE-FLOAT
-;;;; equivalent. In exchange the pass is small and cannot break code it does not
-;;;; understand: every form it does not recognize is returned untouched, and every
-;;;; rewrite keeps the original loop as the fallback branch when the arrays are
-;;;; too short to cover N.
+;;;; The pass runs inside IR1 conversion, on each form as it is converted, so what
+;;;; it sees is macroexpanded code: a loop written inline and one produced by a
+;;;; macro arrive identically.  The types it uses are the compiler's own - the ctype
+;;;; of each variable's leaf, in the lexenv the form is being converted in - so a
+;;;; declaration, a THE cast, a let-bound MAKE-ARRAY result and an inferred type all
+;;;; count, and shadowed names and nested LOCALLY scopes are handled by the compiler
+;;;; rather than by this pass.  What it does with them is still small and local: it
+;;;; returns a replacement form, which IR1 then converts like any other, and every
+;;;; rewrite keeps the original loop as the fallback branch when the arrays are too
+;;;; short to cover N.
 ;;;;
 ;;;; The elements each iteration touches are read before any of them is written,
 ;;;; so the rewrite is valid even when the destination aliases a source.
+
 (in-package "SB-C")
 
 ;;; Set to NIL to compile without automatic vectorization.
@@ -44,12 +48,6 @@
   (memq element-type '(single-float double-float)))
 
 ;;; The element type of a declared simple array, or NIL.
-(defun vector-element-type (spec)
-  (when (and (consp spec) (eq (car spec) 'simple-array))
-    (let ((element-type (second spec)))
-      (when (vector-supported-element-type-p element-type)
-        element-type))))
-
 ;;; How many elements the backend handles at a time: 128 bits worth.
 (defun vector-width (element-type)
   (cond ((eq element-type 'single-float) 4)
@@ -59,16 +57,10 @@
         ((eql (second element-type) 32) 4)
         (t 2)))
 
-;;; Byte lanes only carry the meaning of the scalar loop when the scalar loop is
-;;; not checking the element type: at any safety above 0, storing a byte that
-;;; does not fit signals a type error, where a packed store truncates.  Set by
-;;; VECTORIZE-LAMBDA-BODY from the policy and read when expanding.
-(defvar *vectorize-unchecked-lanes* nil
-  "True when the code being compiled is at (safety 0).  Storing an integer that does
-not fit the destination's element type signals a type error in a checked loop and
-wraps in a packed one, so integer lanes are only used where the scalar loop would
-wrap too.  Float lanes cannot overflow their element type and are unaffected.")
-
+;;; Integer lanes only carry the meaning of the scalar loop when the scalar loop is
+;;; not checking the element type: above (safety 0), storing a value that does not
+;;; fit signals a type error, where a packed store wraps.  Read from the lexenv when
+;;; a loop is matched, and carried on the plan, so a nested LOCALLY is honoured.
 ;;; The primitive base name for OPERATOR over ELEMENT-TYPE, or NIL when this
 ;;; pair is not something the backend can do a vector at a time.  Multiplication
 ;;; and division are float only (the packed integer forms are narrower than the
@@ -91,30 +83,49 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
 
 ;;; Extend ENV (an alist of variable name to declared type spec) by the
 ;;; declarations found at the head of FORMS.
-(defun vector-extend-env (forms env)
-  (dolist (form forms env)
-    (when (and (consp form) (eq (car form) 'declare))
-      (dolist (spec (cdr form))
-        (case (car spec)
-          (type
-           (destructuring-bind (type-spec . variables) (cdr spec)
-             (dolist (variable variables)
-               (push (cons variable type-spec) env))))
-          ;; the standard abbreviations may be used without TYPE
-          ((single-float double-float fixnum index)
-           (dolist (variable (cdr spec))
-             (push (cons variable (car spec)) env))))))))
+;;; The element types the backend can move and compute a vector at a time, in the
+;;; order the classifier below tries them.
+(defparameter +vector-element-types+
+  '(single-float double-float
+    (signed-byte 8) (unsigned-byte 8)
+    (signed-byte 16) (unsigned-byte 16)
+    (signed-byte 32) (unsigned-byte 32)
+    (signed-byte 64) (unsigned-byte 64)))
 
-;;; (VALUES KIND ELEMENT-TYPE) for a variable, KIND being :SCALAR when it is
-;;; declared to be a float itself and :ARRAY when it is a declared float array.
-(defun vector-variable-info (variable env)
-  (let ((spec (cdr (assq variable env))))
-    (cond ((null spec) (values nil nil))
-          ((vector-supported-element-type-p spec) (values :scalar spec))
-          (t (let ((element-type (vector-array-element-type spec)))
-               (if element-type
-                   (values :array (cons element-type (vector-simple-spec-p spec)))
-                   (values nil nil)))))))
+;;; The ctype of a variable at the point where a form is being converted, or NIL.
+;;; This is the compiler's own answer - declarations, THE casts, let-bound
+;;; MAKE-ARRAY results and inferred types all arrive here already resolved - so
+;;; the vectorizer does not have to model types itself.
+(defun vector-variable-ctype (variable lexenv)
+  (multiple-value-bind (var found) (lexenv-find variable vars :lexenv lexenv)
+    (when (and found (lambda-var-p var))
+      (lambda-var-type var))))
+
+;;; What CTYPE says about a value this pass can use, as
+;;;   (:ARRAY element-type . simple-p)  an array to load and store elements of
+;;;   (:SCALAR . element-type)          a value of that type, to be broadcast
+;;; or NIL for anything else.  Simple arrays are tried first, because a
+;;; declaration of (VECTOR T) or (ARRAY T (*)) says what the elements are but not
+;;; that the data is inline; those get their data vector once with WITH-ARRAY-DATA.
+(defun vector-ctype-info (ctype)
+  (when (and ctype (neq ctype *universal-type*))
+    (or (loop for element-type in +vector-element-types+
+              when (csubtypep ctype (specifier-type `(simple-array ,element-type (*))))
+                return (list* :array element-type t))
+        (loop for element-type in +vector-element-types+
+              when (csubtypep ctype (specifier-type `(vector ,element-type)))
+                return (list* :array element-type nil))
+        (loop for element-type in +vector-element-types+
+              when (csubtypep ctype (specifier-type element-type))
+                return (cons :scalar element-type)))))
+
+;;; (VALUES KIND TYPE): KIND is :ARRAY with TYPE (ELEMENT-TYPE . SIMPLE-P), or
+;;; :SCALAR with TYPE an element type, or NIL when the variable is not usable.
+(defun vector-variable-info (variable lexenv)
+  (let ((info (vector-ctype-info (vector-variable-ctype variable lexenv))))
+    (if info
+        (values (car info) (cdr info))
+        (values nil nil))))
 
 ;;; Strip any (THE type form) wrappers of FORM, returning (VALUES form type).
 (defun vector-unwrap-the (form)
@@ -123,34 +134,17 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
           do (setf type (second form) form (third form)))
     (values form type)))
 
-;;; (VALUES ARRAY ELEMENT-TYPE) if FORM names a declared float array, following
-;;; (THE (SIMPLE-ARRAY SINGLE-FLOAT (*)) name) as well as plain declarations.
-;;; (VALUES NAME ELEMENT-TYPE SIMPLE-P) for an array reference, or NILs.  A
-;;; declaration of (VECTOR element-type) or (ARRAY element-type (*)) tells us the
-;;; element type but not whether the data is inline, so SIMPLE-P is NIL there and
-;;; the generated code fetches the data vector once with WITH-ARRAY-DATA.
-(defun vector-array-type (form env)
+;;; (VALUES NAME ELEMENT-TYPE SIMPLE-P) for an array reference, or NILs.  A THE
+;;; cast is answered from the cast, anything else from the variable's own ctype.
+(defun vector-array-type (form lexenv)
   (multiple-value-bind (inner spec) (vector-unwrap-the form)
-    (let ((element-type (and spec (vector-array-element-type spec))))
-      (cond (element-type (values inner element-type (vector-simple-spec-p spec)))
-            ((and (symbolp inner) (null spec))
-             (multiple-value-bind (kind type) (vector-variable-info inner env)
-               (if (eq kind :array)
-                   (values inner (car type) (cdr type))
-                   (values nil nil nil))))
-            (t (values nil nil nil))))))
-
-;;; The element type of a declared array type, whether or not it is simple.
-(defun vector-array-element-type (spec)
-  (when (consp spec)
-    (cond ((eq (car spec) 'simple-array) (vector-element-type spec))
-          ((eq (car spec) 'vector)
-           (and (vector-supported-element-type-p (second spec)) (second spec)))
-          ((eq (car spec) 'array)
-           (and (vector-supported-element-type-p (second spec)) (second spec))))))
-
-(defun vector-simple-spec-p (spec)
-  (and (consp spec) (eq (car spec) 'simple-array)))
+    (let* ((ctype (if spec
+                      (specifier-type spec)
+                      (and (symbolp inner) (vector-variable-ctype inner lexenv))))
+           (info (vector-ctype-info ctype)))
+      (if (and info (eq (car info) :array))
+          (values inner (second info) (cddr info))
+          (values nil nil nil)))))
 
 ;;;; Recognizing a loop
 
@@ -161,7 +155,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
 ;;;   (:OP operator subexpression ...) elementwise float arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
   element-type index count destination destination-offset destination-simple-p
-  destination-literal-p sources expression body fallback accumulator)
+  destination-literal-p sources expression body fallback accumulator unchecked-p)
 
 ;;; A loop bound the generated code may evaluate more than once: a variable, a
 ;;; literal, or arithmetic on one of those, which has no side effects.  A bound
@@ -182,61 +176,6 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
 ;;; element type is written in the source, and the result is a simple array as
 ;;; long as none of ADJUSTABLE, FILL-POINTER or DISPLACED-TO is given, so it can
 ;;; be treated exactly like a declaration of that type.
-(defun vector-make-array-type (form)
-  (when (and (consp form) (eq (car form) 'make-array))
-    (let ((element-type nil)
-          (displaced-p nil))
-      ;; (MAKE-ARRAY dimensions :element-type ...): the keywords start at the
-      ;; second argument
-      (loop for (key value) on (cddr form) by #'cddr
-            do (case key
-                 (:element-type (setf element-type value))
-                 ((:adjustable :fill-pointer :displaced-to) (setf displaced-p t))))
-      (when (and element-type (not displaced-p))
-        (let ((spec (if (and (consp element-type) (eq (car element-type) 'quote))
-                        (second element-type)
-                        element-type)))
-          (let ((element (cond ((member spec '(single-float double-float) :test #'equal) spec)
-                               ((and (consp spec)
-                                     (memq (car spec) '(signed-byte unsigned-byte)))
-                                spec)
-                               (t nil))))
-            (when (and element (vector-supported-element-type-p element))
-              `(simple-array ,element (*)))))))))
-
-;;; The SAFETY quality a declaration list asks for, if any.
-(defun vector-declared-safety (declarations)
-  (let ((safety nil))
-    (dolist (declaration declarations safety)
-      (when (and (consp declaration) (eq (car declaration) 'optimize))
-        (loop for (quality value) on (cdr declaration) by #'cddr
-              when (member quality '(safety)) do (setf safety value))))))
-
-;;; The names this pass reads as CL syntax or functions.  A lexical binding of one
-;;; of them changes what a form means, so a form that does so is left untouched.
-(defparameter *vector-special-names*
-  '(dotimes do do* loop setf let let* lambda locally flet labels macrolet progn the
-    if cond when unless and or not aref + - * / logand logior logxor min max eq eql
-    = >= > < <= float coerce incf decf))
-
-;;; Drop the entries for names a binding form shadows: a declared array rebound to
-;;; something else is not that array inside the binding form, and an outer scalar
-;;; rebound to a loop index is not that scalar.
-(defun vector-unbind (env names)
-  (remove-if (lambda (entry) (member (car entry) names :test #'eq)) env))
-
-;;; The names bound by a LET-like binding list.
-(defun vector-binding-names (bindings)
-  (mapcar (lambda (binding) (if (consp binding) (first binding) binding)) bindings))
-
-;;; Extend ENV by the bindings of a LET/LET* that are MAKE-ARRAY forms with a
-;;; literal element type.
-(defun vector-extend-env-from-bindings (bindings env)
-  (dolist (binding bindings env)
-    (when (and (consp binding) (symbolp (first binding)))
-      (let ((type (and (cdr binding) (vector-make-array-type (second binding)))))
-        (when type (push (cons (first binding) type) env))))))
-
 ;;; The offset of a subscript from the loop variable: (aref a i) is 0,
 ;;; (aref a (+ i 3)) and (aref a (+ 3 i)) are 3.  A negative offset would index
 ;;; before the loop variable's range, so it is not taken.
@@ -270,9 +209,12 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                         (typep form 'fixnum)))
            (list :const form)))
         ((symbolp form)
-         (multiple-value-bind (kind type) (vector-variable-info form env)
-           (when (and (eq kind :scalar) (equal type element-type))
-             (list :scalar form))))
+         ;; the loop index shadows whatever the enclosing scope says about that
+         ;; name, so it is never a broadcast operand
+         (unless (eq form index)
+           (multiple-value-bind (kind type) (vector-variable-info form env)
+             (when (and (eq kind :scalar) (equal type element-type))
+               (list :scalar form)))))
         ((atom form) nil)
         ((eq (car form) 'the)
          ;; only a THE that pins the element type exactly is usable
@@ -329,8 +271,6 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
       form))
 
 (defun vector-match-element-store (form env index)
-  ;; the loop index shadows anything the enclosing scope declared about that name
-  (setf env (vector-unbind env (list index)))
   (let ((form (vector-normalize-store form)))
     (when (and (consp form) (eq (car form) 'setf) (null (cdddr form)))
     (let ((place (second form)))
@@ -385,7 +325,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (car statements)
-                     :fallback form)))))))))))
+                     :fallback form :unchecked-p (policy env (= safety 0)))))))))))))
 
 ;;; The arrays read by an expression tree, as an alist of name to
 ;;; (OFFSETS . SIMPLE-P), in order of first use, where OFFSETS is every offset the
@@ -473,7 +413,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                      :sources (vector-collect-arrays expression)
                      :expression expression
                      :body (second clauses)
-                     :fallback form)))))))))))
+                     :fallback form :unchecked-p (policy env (= safety 0)))))))))))))
 
 ;;; (1+ index) or (+ index 1) in a DO loop's step.
 (defun vector-increments-index-p (step index)
@@ -529,7 +469,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                              :sources (vector-collect-arrays expression)
                              :expression expression
                              :body (first statements)
-                             :fallback form)))))))))))))))
+                             :fallback form :unchecked-p (policy env (= safety 0)))))))))))))))))
 
 ;;; The part of VALUE that is being added to the accumulator PLACE:
 ;;; (+ place expression) or (+ expression place), and nothing else.
@@ -569,7 +509,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                               (when expression
                                 (setf expression
                                       (vector-match-expression
-                                       expression (vector-unbind env (list index)) index type)))
+                                       expression env index type)))
                               (when expression
                                 (let ((plan (make-vector-loop
                                              :element-type type
@@ -579,7 +519,7 @@ wrap too.  Float lanes cannot overflow their element type and are unaffected.")
                                              :sources (vector-collect-arrays expression)
                                              :expression expression
                                              :body (first statements)
-                                             :fallback form)))
+                                             :fallback form :unchecked-p (policy env (= safety 0)))))
                                   ;; the reduction expansion addresses the sources
                                   ;; directly, so it needs their data inline
                                   (when (vector-loop-all-simple-p plan)
@@ -728,7 +668,7 @@ guard still covers the reads."
                                             (memq (car scalar) '(:index :stride)))
                                           scalars)))
                (or (vector-float-element-type-p element-type)
-                   *vectorize-unchecked-lanes*))
+                   (vloop-unchecked-p loop)))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
@@ -815,7 +755,7 @@ guard still covers the reads."
     (when (and load store splat add (every #'identity arithmetic)
                (not (memq :index (vector-collect-operators expression)))
                (or (vector-float-element-type-p element-type)
-                   *vectorize-unchecked-lanes*))
+                   (vloop-unchecked-p loop)))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized reduction over ~a, ~a elements at a time"
                          element-type width))
@@ -962,7 +902,7 @@ guard still covers the reads."
             (unless shape
               (return-from vector-missed-diagnosis nil))
             (vector-diagnose-types (adjoin (second place) arrays-in-expression) env
-                                   (third store))))))))
+                                   (third store) (policy env (= safety 0))))))))
 
 ;;; The operator symbols an elementwise expression is built from.
 (defun vector-shape-operators (expression)
@@ -978,7 +918,7 @@ guard still covers the reads."
 ;;; compiler note?  Two things can: an array with no usable declaration, or lanes
 ;;; the element type does not have - an operator without a primitive, or byte lanes
 ;;; outside (safety 0).
-(defun vector-diagnose-types (arrays env expression)
+(defun vector-diagnose-types (arrays env expression unchecked-p)
   (let ((element-type nil)
         (undeclared '())
         (reasons '()))
@@ -1004,7 +944,7 @@ guard still covers the reads."
           (push (format nil "~a is not available for ~a lanes" operator element-type)
                 reasons)))
       (when (and (not (vector-float-element-type-p element-type))
-                 (not *vectorize-unchecked-lanes*))
+                 (not unchecked-p)))
         (push (format nil "~a lanes wrap where a checked loop would signal, so they ~
                            are only used when compiled at (safety 0)"
                       element-type)
@@ -1017,137 +957,28 @@ guard still covers the reads."
     (dolist (reason (vector-missed-diagnosis form env))
       (compiler-notify "~@<unable to vectorize this loop: ~2I~_~A~:>" reason))))
 
-;;;; Walking a body
-
-(defun vector-vectorize-body (forms env)
-  (multiple-value-bind (declarations statements) (vector-split-declarations forms)
-    (let ((env (vector-extend-env declarations env)))
-      (append declarations
-              (mapcar (lambda (form) (vector-vectorize-form form env)) statements)))))
-
-;;; Rewrite the loops we understand in FORM, leaving everything else alone.
-;;; Only the constructs listed here are descended into; anything else is opaque.
-(defun vector-vectorize-form (form env)
-  (if (atom form)
-      form
-      (case (car form)
-        ((quote declare) form)
-        (function (if (and (consp (second form)) (eq (car (second form)) 'lambda))
-                      `(function ,(vector-vectorize-form (second form) env))
-                      form))
-        (dolist `(dolist ,(second form) ,@(vector-vectorize-body (cddr form) env)))
-        ((dotimes loop do do*)
-         (let ((plan (case (car form)
-                       (loop (vector-match-loop form env))
-                       ((do do*) (vector-match-do form env))
-                       (t (or (vector-match-dotimes form env)
-                              (vector-match-reduction form env))))))
-            (or (and plan (vector-expand-loop plan))
-                (progn (vector-note-missed-optimization form env) form))))
-        (lambda
-         (let ((env (vector-unbind env (mapcar (lambda (parameter)
-                                                 (if (consp parameter) (first parameter) parameter))
-                                               (second form)))))
-           `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env))))
-        ((destructuring-bind symbol-macrolet macrolet)
-         ;; DESTRUCTURING-BIND binds names this pass cannot enumerate cheaply, and a
-         ;; local macro or symbol macro may redefine anything this pass reads
-         (if (and (eq (car form) 'macrolet)
-                  (notany (lambda (name) (memq name *vector-special-names*))
-                          (mapcar #'first (second form))))
-             (cons 'macrolet
-                   (cons (second form) (vector-vectorize-body (cddr form) env)))
-             form))
-        ((let let*)
-         (multiple-value-bind (declarations statements) (vector-split-declarations (cddr form))
-           `(,(car form)
-             ,(mapcar (lambda (binding)
-                        (if (consp binding)
-                            (list (car binding) (vector-vectorize-form (second binding) env))
-                            binding))
-                      (second form))
-             ,@declarations
-             ,@(vector-vectorize-body
-                statements
-                (vector-extend-env
-                 declarations
-                 (vector-extend-env-from-bindings
-                  (second form) (vector-unbind env (vector-binding-names (second form)))))))))
-        (locally
-         (multiple-value-bind (declarations statements) (vector-split-declarations (cdr form))
-           (let ((safety (vector-declared-safety declarations)))
-             `(locally ,@declarations
-                       ,@(if safety
-                             (let ((*vectorize-unchecked-lanes* (= safety 0)))
-                               (vector-vectorize-body
-                                statements (vector-extend-env declarations env)))
-                             (vector-vectorize-body
-                              statements (vector-extend-env declarations env)))))))
-        (progn (cons 'progn (vector-vectorize-body (cdr form) env)))
-        (the `(the ,(second form) ,(vector-vectorize-form (third form) env)))
-        ((flet labels)
-         (when (some (lambda (name) (memq name *vector-special-names*))
-                     (mapcar #'first (second form)))
-           (return-from vector-vectorize-form form))
-         `(,(car form)
-           ,(mapcar (lambda (definition)
-                      `(,(car definition) ,(second definition)
-                        ,@(vector-vectorize-body (cddr definition) env)))
-                    (second form))
-           ,@(vector-vectorize-body (cddr form) env)))
-        (multiple-value-bind
-            (destructuring-bind (variables value-form . body) (cdr form)
-              (let ((env (vector-unbind env (remove-if-not #'symbolp variables))))
-                `(multiple-value-bind ,variables ,(vector-vectorize-form value-form env)
-                   ,@(vector-vectorize-body body env)))))
-        ((when unless and or prog1 prog2) (cons (car form) (vector-vectorize-body (cdr form) env)))
-        (if (destructuring-bind (test then &optional else) (cdr form)
-              `(if ,(vector-vectorize-form test env)
-                   ,(vector-vectorize-form then env)
-                   ,@(when else (list (vector-vectorize-form else env))))))
-        (cond `(cond ,@(mapcar (lambda (clause)
-                                 (cons (vector-vectorize-form (car clause) env)
-                                       (vector-vectorize-body (cdr clause) env)))
-                               (cdr form))))
-        ((block catch return-from)
-         (if (eq (car form) 'return-from)
-             `(return-from ,(second form) ,(vector-vectorize-form (third form) env))
-             `(,(car form) ,(second form) ,@(vector-vectorize-body (cddr form) env))))
-        (unwind-protect
-         `(unwind-protect ,(vector-vectorize-form (second form) env)
-                           ,@(vector-vectorize-body (cddr form) env)))
-        (t form))))
-
 ;;;; Entry point
 
-;;; The declared types of a lambda's parameters, as an alist for the walker.
-;;; IR1 has already applied the body's declarations to the vars by the time the
-;;; body is handed to us, so this is where (DECLARE (TYPE (SIMPLE-ARRAY
-;;; SINGLE-FLOAT (*)) a)) shows up for a function's arguments.
-(defun vector-parameter-environment (vars)
-  (let ((env '()))
-    (dolist (var vars env)
-      (let ((name (leaf-%source-name var)))
-        (when (symbolp name)
-          ;; An FTYPE declaration does not set the var's type; the compiler
-          ;; records it in the leaf's defined type instead, so both are read.
-          (dolist (ctype (list (lambda-var-type var) (leaf-defined-type var)))
-            (unless (or (null ctype) (eq ctype *universal-type*))
-              (let ((spec (type-specifier ctype)))
-                ;; a variable of a supported scalar type is a broadcast operand,
-                ;; and a declaration of (VECTOR T) or (ARRAY T (*)) counts as a
-                ;; usable array: its element type is known and the data vector is
-                ;; found at run time
-                (when (or (vector-supported-element-type-p spec)
-                          (vector-array-element-type spec))
-                  (push (cons name spec) env))))))))))
+;;; The replacement for FORM, a loop this pass understands, or NIL.  Called from
+;;; IR1-CONVERT for each form as it is converted, so FORM is macroexpanded code - a
+;;; loop written inline and one generated by a macro arrive here identically - and
+;;; LEXENV is the environment it is being converted in, which is what makes the type
+;;; lookups right for shadowed names, (THE ...) casts and a nested LOCALLY's
+;;; OPTIMIZE declarations.
+(defun vectorize-loop-form (form lexenv)
+  (when (and *auto-vectorize*
+             (consp form)
+             (memq (car form) '(dotimes do do* loop)))
+    (let ((plan (case (car form)
+                  (loop (vector-match-loop form lexenv))
+                  ((do do*) (vector-match-do form lexenv))
+                  (t (or (vector-match-dotimes form lexenv)
+                         (vector-match-reduction form lexenv))))))
+      (if plan
+          (vector-expand-loop plan)
+          (progn (vector-note-missed-optimization form lexenv) nil)))))
 
-;;; Called on the body of every lambda before it is converted to IR1. Returns a
-;;; body that is either unchanged or has its elementwise loops vectorized.
-(defun vectorize-lambda-body (body lexenv &optional local-policy vars)
-  (if (and *auto-vectorize*
-           (member :x86-64 *features*)
-           (policy (or local-policy lexenv) (>= speed 2)))
-      (let ((*vectorize-unchecked-lanes* (policy (or local-policy lexenv) (= safety 0))))
-        (vector-vectorize-body body (vector-parameter-environment vars)))
-      body))
+;;; Converting the form this pass returns must not re-enter the pass, or the
+;;; fallback branch - the original loop - would be rewritten too.  IR1-CONVERT binds
+;;; this while, and only while, it converts a replacement.
+(defvar *vectorize-inhibited* nil)
