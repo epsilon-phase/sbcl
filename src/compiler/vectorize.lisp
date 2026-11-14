@@ -672,7 +672,6 @@
       ;; the lane offsets for the first iteration, then a constant step per
       ;; iteration: converting and broadcasting the index each time costs four
       ;; instructions and a dependency chain, where keeping the pack costs one add
-      (setf scalars (acons :ramp (make-symbol "RAMP") scalars))
       (setf scalars (acons :index (make-symbol "INDEX-LANES") scalars))
       (setf scalars (acons :stride (make-symbol "STRIDE") scalars)))
     (when (and load store
@@ -723,7 +722,7 @@
                                   (case (car scalar)
                                     (:stride `(,(cdr scalar)
                                                (,(vector-primitive "STRIDE" element-type))))
-                                    ((:ramp :index) `(,(cdr scalar) (,ramp)))
+                                    (:index `(,(cdr scalar) (,ramp)))
                                     (t `(,(cdr scalar)
                                          (,splat ,(second (car scalar)))))))
                                 scalars)
