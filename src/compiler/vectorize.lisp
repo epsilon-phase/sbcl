@@ -661,7 +661,12 @@ guard still covers the reads."
          ;; bogus as written.  Real stencils write the interior and shift the
          ;; destination - (+ I 1) on the store, non-negative reads - which this pass
          ;; takes.  So a negative offset is declined, and the note says why.
-         (min-offset (loop for entry in arrays minimize (reduce #'min (second entry))))
+         ;; only a literal can be known negative here; a variable offset is
+         ;; guarded at run time by (>= offset 0)
+         (negative-literals
+          (loop for entry in arrays
+                thereis (some (lambda (offset) (and (typep offset 'integer) (minusp offset)))
+                              (second entry))))
          (pack-type `(simd-pack ,element-type))
          (load (vector-primitive "LOAD" element-type))
          (store (vector-primitive "STORE" element-type))
@@ -688,7 +693,7 @@ guard still covers the reads."
                                           scalars)))
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop))
-               (>= min-offset 0))
+               (not negative-literals))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
