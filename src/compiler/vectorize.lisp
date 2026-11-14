@@ -766,8 +766,14 @@ guard still covers the reads."
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop)))
       (when *auto-vectorize-notes*
-        (compiler-notify "vectorized reduction over ~a, ~a elements at a time"
-                         element-type width))
+        (compiler-notify "~@<vectorized reduction over ~a, ~a elements at a time; ~
+                          the sum is computed modulo the element type, ~
+                          ~a~:>"
+                         element-type width
+                         (if (vector-float-element-type-p element-type)
+                             "which reorders the additions"
+                             "so a total that would overflow it differs from the scalar ~
+                              loop, where such an overflow was already undefined")))
       `(if (and (typep ,count 'index)
                 ,@(loop for entry in arrays
                         for name = (first entry)

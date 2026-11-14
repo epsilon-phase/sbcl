@@ -1545,6 +1545,20 @@ a writer with a fixed color type ends up with."
                  (error "~@<s32 sum of ~D elements is ~S.~:@>" n sum))))
     (assert (search "paddd" (disassembly #'vectorize-u32-sum))
             () "an integer reduction was not vectorized")
+    ;; A total that overflows the accumulator's declared width is undefined
+    ;; behaviour in the scalar loop at (safety 0) - it does not truncate, it just
+    ;; produces a value outside the declared type - so the packed sum, which is
+    ;; computed modulo that width, agrees with the scalar one only up to
+    ;; congruence.  Record that boundary rather than pretending it is not there.
+    (let* ((n 4000)
+           (a (make-array n :element-type '(unsigned-byte 32) :initial-element #xFFFFFFFF))
+           (total (vectorize-u32-sum a n 0))
+           (exact (* n #xFFFFFFFF)))
+      (assert (= (mod (- exact total) (expt 2 32)) 0)
+              () "the packed sum of ~D elements is ~D, not congruent to ~D mod 2^32"
+              n total exact)
+      (when (< exact (expt 2 32))
+        (assert (= total exact) () "a sum that fits was not exact")))
     ;; a float sum changes with the order of the additions, so it stays scalar
     (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-single-sum)))
                     '("addps" "addpd"))
