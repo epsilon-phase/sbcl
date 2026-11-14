@@ -13,29 +13,37 @@
 (defparameter *sizes* (list (* 8 1024) (* 1024 1024)))
 ;;; THE INTERNAL TIMER IS MILLISECOND-RESOLUTION, so time enough work per size
 ;;; that each measurement is tens of milliseconds long.
+(defun element-size (element-type)
+  "Bytes per element.  The two arrays are read and the third written, so the
+traffic per element is twice this."
+  (cond ((equal element-type 'single-float) 4)
+        ((equal element-type 'double-float) 8)
+        ((equal element-type '(unsigned-byte 16)) 2)
+        ((equal element-type '(unsigned-byte 32)) 4)
+        ((equal element-type '(unsigned-byte 64)) 8)
+        (t (error "no size for ~a" element-type))))
+
 (defun repetitions-for (size)
   (max 20 (ceiling 1000000000 size)))
 
-(defmacro define-pair (name element-type op)
-  "Define NAME (vectorized) and NAME/SCALAR (the same loop, vectorizer off)."
-  `(progn
-     (defun ,name (a b c n)
-       (declare (type (simple-array ,element-type (*)) a b c)
-                (type sb-int:index n)
-                (optimize speed))
-       (dotimes (i n)
-         (declare (type sb-int:index i))
-         (setf (aref c i) (,op (aref a i) (aref b i))))
-       c)
-     (let ((sb-c::*auto-vectorize* nil))
-       (eval `(defun ,(intern (concatenate 'string (symbol-name ',name) "/SCALAR")) (a b c n)
-                (declare (type (simple-array ,',element-type (*)) a b c)
-                         (type sb-int:index n)
-                         (optimize speed))
-                (dotimes (i n)
-                  (declare (type sb-int:index i))
-                  (setf (aref c i) (,',op (aref a i) (aref b i))))
-                c)))))
+(defmacro define-pair (name element-type op &key safety-zero)
+  "Define NAME (vectorized) and NAME/SCALAR (the same loop, vectorizer off).
+
+Integer lanes are only used at (safety 0) - a packed lane wraps where a checked
+store would signal - so the integer pairs ask for it; float lanes do not care."
+  (flet ((definition (name)
+           `(defun ,name (a b c n)
+              (declare (type (simple-array ,element-type (*)) a b c)
+                       (type sb-int:index n)
+                       (optimize speed ,@(when safety-zero '((safety 0)))))
+              (dotimes (i n)
+                (declare (type sb-int:index i))
+                (setf (aref c i) (,op (aref a i) (aref b i))))
+              c)))
+    `(progn
+       ,(definition name)
+       (let ((sb-c::*auto-vectorize* nil))
+         (eval ',(definition (intern (concatenate 'string (symbol-name name) "/SCALAR"))))))))
 
 (define-pair add-single single-float +)
 (define-pair add-double double-float +)
@@ -43,9 +51,9 @@
 (define-pair mul-double double-float *)
 
 ;;; Integer lanes: four 32-bit or two 64-bit at a time.
-(define-pair add-u32 (unsigned-byte 32) +)
-(define-pair add-u64 (unsigned-byte 64) +)
-(define-pair add-u16 (unsigned-byte 16) +)
+(define-pair add-u32 (unsigned-byte 32) + :safety-zero t)
+(define-pair add-u64 (unsigned-byte 64) + :safety-zero t)
+(define-pair add-u16 (unsigned-byte 16) + :safety-zero t)
 
 (defun make-random-array (element-type n)
   (let ((v (make-array n :element-type element-type)))
@@ -70,8 +78,7 @@
           (incf elapsed (- now start))
           (setf start now)))
       (let* ((seconds (/ elapsed internal-time-units-per-second))
-             (bytes (* 2 size repetitions
-                       (if (eq element-type 'single-float) 4 8))))
+             (bytes (* 2 size repetitions (element-size element-type))))
         (values seconds (/ bytes seconds 1d9))))))
 
 (dolist (size *sizes*)
