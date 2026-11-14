@@ -1303,6 +1303,15 @@ in a variable is not seen.  Offsets are what a PNG row filter needs:
 @end lisp
 
 @noindent
+The types come from the compiler: a variable the compiler knows to be an array of
+a supported element type takes part, whether that is known from a declaration, an
+@code{ftype}, a @code{the} cast, or a type IR1 has already derived.  A @code{let}
+whose value is a @code{make-array} is a case to be aware of: IR1 derives that
+element type only after it has converted the body, which is later than the point
+where a loop is rewritten, so such a loop stays scalar unless it is written with a
+@code{the} cast or the array is declared.  The pass says so in a note.
+
+@noindent
 The body is a store: @code{(setf (aref destination index) expression)},
 @code{(incf (aref destination index) expression)} or the same with
 @code{decf}.  A reduction rather than an elementwise update also vectorizes when
