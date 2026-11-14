@@ -547,47 +547,47 @@ OPERATION applied to the same numbers, which involves no array loop."
 
 (defun vectorize-u32-add (a b c n)
   (declare (type (simple-array (unsigned-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
 
 (defun vectorize-s32-add (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
 
 (defun vectorize-u64-add (a b c n)
   (declare (type (simple-array (unsigned-byte 64) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
 
 (defun vectorize-s64-add (a b c n)
   (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
 
 (defun vectorize-s32-subtract (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
 
 (defun vectorize-s64-subtract (a b c n)
   (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
 
 (defun vectorize-s32-logand (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (logand (aref a i) (aref b i)))))
 
 (defun vectorize-s32-logior (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (logior (aref a i) (aref b i)))))
 
 (defun vectorize-u64-logxor (a b c n)
   (declare (type (simple-array (unsigned-byte 64) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (logxor (aref a i) (aref b i)))))
 
 ;;; The negative constant is the interesting one: it reaches the backend as a
@@ -595,7 +595,7 @@ OPERATION applied to the same numbers, which involves no array loop."
 ;;; recovered arithmetically, or -3 comes out as a huge positive.
 (defun vectorize-s32-add-negative-constant (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
 
 (defun vectorize-s64-subtract-scalar (a b c n k)
@@ -866,7 +866,7 @@ instruction side."
 ;;; The same loop, checked: it must be left scalar.
 (defun vectorize-u8-subtract-checked (a b c n)
   (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
 
 (defun vectorize-byte-guard (element-type)
@@ -1109,7 +1109,7 @@ a writer with a fixed color type ends up with."
 
 (defun vectorize-negate-integer (a c n)
   (declare (type (simple-array (signed-byte 32) (*)) a c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i))))
   c)
 
@@ -1377,7 +1377,7 @@ a writer with a fixed color type ends up with."
 
 (defun vectorize-s32-decf (b c n)
   (declare (type (simple-array (signed-byte 32) (*)) b c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (decf (aref c i) (aref b i)))
   c)
 
@@ -1546,7 +1546,7 @@ a writer with a fixed color type ends up with."
 (defun vectorize-index-into-integers (c n)
   "An integer element type would need its own index conversion: left scalar."
   (declare (type (simple-array (unsigned-byte 32) (*)) c) (type vectorize-index n)
-           (optimize speed))
+           (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) i))
   c)
 
@@ -1704,9 +1704,10 @@ a writer with a fixed color type ends up with."
   ;; length == n means the read at (+ i 3) leaves the array, so the loop must fall
   ;; back to the scalar one, which reports it, rather than reading past the end
   (loop for n in *vectorize-lengths*
-        do (let ((c (make-array n :element-type 'single-float :initial-element 1.0f0))
-                 (d (make-array n :element-type 'single-float :initial-element 2.0f0)))
-             (assert-error (vectorize-alias-offset c d n) error)))
+        do (when (plusp n)            ; nothing is read from an empty range
+             (let ((c (make-array n :element-type 'single-float :initial-element 1.0f0))
+                   (d (make-array n :element-type 'single-float :initial-element 2.0f0)))
+               (assert-error (vectorize-alias-offset c d n) error))))
   ;; with room for the offsets it is fine, and still packed
   (let* ((n 16)
          (c (make-array (+ n 3) :element-type 'single-float :initial-element 1.0f0))
