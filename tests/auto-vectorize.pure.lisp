@@ -86,8 +86,10 @@
       (loop with start = 0
             for newline = (position #\Newline text :start start)
             do (let ((line (subseq text start (if newline newline (length text)))))
-                 (when (or (search "vectoriz" line :test #'char-equal)
-                           (search "lanes" line :test #'char-equal))
+                 ;; keep the pass's own lines: its notes and the reasons it gives
+                 (when (some (lambda (marker) (search marker line :test #'char-equal))
+                             '("vectoriz" "lanes" "shift the destination" "is read at"
+                               "not known to be an array" "not available" "safety 0"))
                    (push line result)))
                (if newline (setf start (1+ newline)) (return)))
       (nreverse result))))
