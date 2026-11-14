@@ -75,6 +75,26 @@
 ;;; A packed SIMD mnemonic, any one of which is evidence that a loop was
 ;;; vectorized.  Which instruction is used is an implementation detail, so this
 ;;; is a list rather than a single expected mnemonic.
+(defun vectorize-notes-for (form &key (notes t))
+  "The notes compiling FORM produces that are about vectorization."
+  (let ((stream (make-string-output-stream)))
+    (let ((*error-output* stream)
+          (sb-c::*auto-vectorize-notes* notes))
+      (compile nil form))
+    (let ((text (get-output-stream-string stream))
+          (result '()))
+      (loop with start = 0
+            for newline = (position #\Newline text :start start)
+            do (let ((line (subseq text start (if newline newline (length text)))))
+                 (when (or (search "vectoriz" line :test #'char-equal)
+                           (search "lanes" line :test #'char-equal))
+                   (push line result)))
+               (if newline (setf start (1+ newline)) (return)))
+      (nreverse result))))
+
+(defun vectorize-note-mentions (notes string)
+  (some (lambda (line) (search string line :test #'char-equal)) notes))
+
 (defparameter *vectorize-packed-mnemonics*
   '("addps" "addpd" "mulps" "movups" "shufps"))
 
@@ -1089,7 +1109,7 @@ a writer with a fixed color type ends up with."
                            (c (make-array n :element-type 'single-float)))
                        (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
                        c)))))
-      (assert (vectorize-note-mentions notes "not known to be an array"),
+      (assert (vectorize-note-mentions notes "not known to be an array")
               () "no explanation for the MAKE-ARRAY local: ~s" notes))
     (let ((text (disassembly #'vectorize-made-locals-adjustable)))
       (assert (notany (lambda (mnemonic) (search mnemonic text))
@@ -1600,26 +1620,6 @@ a writer with a fixed color type ends up with."
 ;;;; says why, in the same spirit as "unable to open-code X due to type
 ;;;; uncertainty".  The point is that the user can act on it.
 
-(defun vectorize-notes-for (form &key (notes t))
-  "The notes compiling FORM produces that are about vectorization."
-  (let ((stream (make-string-output-stream)))
-    (let ((*error-output* stream)
-          (sb-c::*auto-vectorize-notes* notes))
-      (compile nil form))
-    (let ((text (get-output-stream-string stream))
-          (result '()))
-      (loop with start = 0
-            for newline = (position #\Newline text :start start)
-            do (let ((line (subseq text start (if newline newline (length text)))))
-                 (when (or (search "vectoriz" line :test #'char-equal)
-                           (search "lanes" line :test #'char-equal))
-                   (push line result)))
-               (if newline (setf start (1+ newline)) (return)))
-      (nreverse result))))
-
-(defun vectorize-note-mentions (notes string)
-  (some (lambda (line) (search string line :test #'char-equal)) notes))
-
 (test-util:with-test (:name :vectorize-missed-declaration-note :skipped-on (not :x86-64))
   ;; B is undeclared: the note should name the declaration that would allow it
   (let ((notes (vectorize-notes-for
@@ -1636,7 +1636,7 @@ a writer with a fixed color type ends up with."
                 '(lambda (a c n)
                    (declare (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (aref a i)))))))
-    (assert (vectorize-note-mentions notes "array declaration") () "no note: ~s" notes)))
+    (assert (vectorize-note-mentions notes "not known to be an array") () "no note: ~s" notes)))
 
 (test-util:with-test (:name :vectorize-missed-operator-note :skipped-on (not :x86-64))
   ;; SSE2 has no lane multiply for 32-bit integers; say so rather than nothing
