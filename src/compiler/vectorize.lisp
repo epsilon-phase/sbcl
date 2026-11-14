@@ -303,7 +303,8 @@
 
 ;;; Match (DOTIMES (index count) (setf (aref destination index) expression)).
 (defun vector-match-dotimes (form env)
-  (when (and (consp form) (eq (car form) 'dotimes))
+  (when (and (consp form) (eq (car form) 'dotimes)
+             (consp (cdr form)) (consp (cadr form)))
     (destructuring-bind (spec . body) (cdr form)
       (when (and (consp spec) (null (cddr spec))) ; no result form: returns NIL
         (destructuring-bind (index count) spec
@@ -435,7 +436,8 @@
 ;;; Anything else - several bindings, a different step, result forms, another
 ;;; end test - is left alone.
 (defun vector-match-do (form env)
-  (when (and (consp form) (memq (car form) '(do do*)))
+  (when (and (consp form) (memq (car form) '(do do*))
+             (consp (cdr form)) (consp (cddr form)))
     (destructuring-bind (bindings end-clause . body) (cdr form)
       (when (and (consp bindings) (null (cdr bindings)) (consp (first bindings))
                  (consp end-clause) (null (cdr end-clause)))
@@ -486,7 +488,8 @@
 ;;; accumulating into lanes and adding the lanes up at the end gives the same
 ;;; answer.  Floating point is not like that, so a float accumulator is refused.
 (defun vector-match-reduction (form env)
-  (when (and (consp form) (eq (car form) 'dotimes))
+  (when (and (consp form) (eq (car form) 'dotimes)
+             (consp (cdr form)) (consp (cadr form)))
     (destructuring-bind (spec . body) (cdr form)
       (when (and (consp spec) (null (cddr spec)))
         (destructuring-bind (index count) spec
@@ -969,10 +972,24 @@ guard still covers the reads."
 ;;; LEXENV is the environment it is being converted in, which is what makes the type
 ;;; lookups right for shadowed names, (THE ...) casts and a nested LOCALLY's
 ;;; OPTIMIZE declarations.
+;;; The macro functions of the control forms this pass reads as syntax, captured
+;;; when this file is loaded.  A program that rebinds one of them - by MACROLET, or
+;;; by redefining it globally - means something else by the form, so the pass leaves
+;;; such forms to the compiler.
+(defparameter *vector-loop-macros*
+  (mapcar (lambda (name) (cons name (macro-function name)))
+          '(dotimes do do* loop)))
+
+(defun vector-standard-loop-form-p (form lexenv)
+  (let ((name (car form)))
+    (and (not (nth-value 1 (lexenv-find name funs :lexenv lexenv)))
+         (eq (macro-function name) (cdr (assoc name *vector-loop-macros*))))))
+
 (defun vectorize-loop-form (form lexenv)
   (when (and *auto-vectorize*
              (consp form)
-             (memq (car form) '(dotimes do do* loop)))
+             (memq (car form) '(dotimes do do* loop))
+             (vector-standard-loop-form-p form lexenv))
     (let* ((plan (case (car form)
                    (loop (vector-match-loop form lexenv))
                    ((do do*) (vector-match-do form lexenv))
