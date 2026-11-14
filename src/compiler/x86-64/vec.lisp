@@ -11,16 +11,15 @@
 
 (in-package "SB-VM")
 
-;;;; Function signatures.
+;;;; function signatures
 ;;;
-;;; The arrays are spelled (SIMPLE-ARRAY <float> (*)) because
-;;; SIMPLE-ARRAY-SINGLE-FLOAT and SIMPLE-ARRAY-DOUBLE-FLOAT are
-;;; primitive type names (primtype.lisp), not Lisp type specifiers.
+;;; the arrays are spelled (simple-array <element> (*)) where a Lisp type
+;;; specifier is wanted, and by their primitive type names in :arg-types.
 ;;;
-;;; A load is FLUSHABLE but deliberately neither MOVABLE nor FOLDABLE,
-;;; and a store is neither: 128 bits at a time must not be reordered
-;;; across a store into the same array, which is exactly what a loop
-;;; that reads what it just wrote would do.
+;;; a load is flushable but neither movable nor foldable, and a store is
+;;; neither either: 128 bits at a time must not be reordered across a store
+;;; into the same array, which is what a loop that reads what it just wrote
+;;; would do.
 
 (defknown %vec-load-single ((simple-array single-float (*)) index)
     (simd-pack single-float)
@@ -55,18 +54,13 @@
     (simd-pack double-float)
   (flushable movable))
 
-;;;; Loading and storing 128 bits at a time in a simple float array.
+;;;; loading and storing 128 bits at a time in a simple float array
 ;;;
-;;; The effective address is the one DEFINE-FULL-SETTER+ADDEND uses in
-;;; array.lisp, with the element size in bytes in place of N-WORD-BYTES:
-;;;
-;;;   (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-;;;       vector index (index-scale <element-size> index))
-;;;
-;;; INDEX is restricted to ANY-REG and declared TAGGED-NUM so that
-;;; INDEX-SCALE (macros.lisp) divides the element size by the fixnum
-;;; tag bits; an IMMEDIATE index is not accepted, because the scale
-;;; would then have to be the element size itself.
+;;; the effective address is the one define-full-setter+addend uses in
+;;; array.lisp, with the element size in place of n-word-bytes.  index is
+;;; restricted to any-reg and declared tagged-num so that index-scale
+;;; divides the element size by the tag bits; an immediate index is not
+;;; accepted, since the scale would then have to be the element size.
 
 (macrolet ((define-vec-load (name translate element-type result-type
                                  element-size sc instruction)
@@ -85,7 +79,7 @@
                             (index-scale ,element-size index))))))
            (define-vec-store (name translate result-type element-type
                                    element-size sc instruction)
-             ;; VALUE is first in both the Lisp arglist and :ARGS.
+;;; value is first in both the Lisp arglist and :args.
              `(define-vop (,name)
                 (:translate ,translate)
                 (:args (value :scs (,sc))
@@ -108,16 +102,11 @@
   (define-vec-store %vec-store-double %vec-store-double
     simd-pack-double simple-array-double-float 8 double-sse-reg movupd))
 
-;;;; Packed arithmetic.
+;;;; packed arithmetic
 ;;;
-;;; These are two-operand instructions: the destination is also the
-;;; first source. RESULT is initialized from A with an explicit MOVE,
-;;; modelled on DEF-REAL-COMPLEX-OP in float.lisp, because :TARGET is
-;;; only a packing preference (FIND-OK-TARGET-OFFSET in pack.lisp falls
-;;; back on SELECT-LOCATION when the preference can't be honored, and
-;;; the operand's SC restriction is satisfied by any XMM register), so
-;;; relying on it would compute RESULT from whatever stale value it
-;;; holds. The MOVE emits nothing when the packer does honor it.
+;;; the destination is also the first source, so result is moved from a
+;;; explicitly: :target is only a packing preference, and relying on it
+;;; would compute into whatever stale value the register holds.
 
 (macrolet ((define-vec-arith (name translate type sc instruction)
              `(define-vop (,name)
@@ -149,11 +138,10 @@
   (define-vec-arith %vec-div-double %vec-div-double
     simd-pack-double double-sse-reg divpd))
 
-;;;; Splatting one float across every lane.
+;;;; splatting one float across every lane
 ;;;
-;;; Modelled on %MAKE-SIMD-PACK-SINGLE/-DOUBLE (simd-pack.lisp): the arg
-;;; is a scalar float SC targeted at the result, MOVEd once into it, and
-;;; then the low lane alone is selected by the shuffle.
+;;; the arg is a scalar float sc targeted at the result, moved once into it,
+;;; and then the low lane alone is selected by the shuffle.
 
 (define-vop (%vec-splat-single)
   (:translate %vec-splat-single)
@@ -175,20 +163,11 @@
     (move result x)
     (inst unpcklpd result result)))
 
-;;;; Integer lanes: 32 and 64 bits wide, signed and unsigned.
-;;;;
-;;;; The four shapes of the float sections above, over the packs
-;;;; SIMD-PACK-UB32, SIMD-PACK-SB32, SIMD-PACK-UB64 and SIMD-PACK-SB64,
-;;;; which all live in INT-SSE-REG.  As in the signatures at the top, the
-;;;; array type is spelled (SIMPLE-ARRAY <element> (*)) where a Lisp type
-;;;; specifier is wanted and by its primitive type name (vm-array.lisp) in
-;;;; :ARG-TYPES.
-;;;;
-;;;; There is no integer MUL or DIV here, and that is not an omission to be
-;;;; filled in later: PMULLD is SSE4.1 and PMULUDQ reads only the low half
-;;;; of each 64-bit lane, so neither computes the element type the array
-;;;; holds.  ADD, SUB and the three bitwise operations are baseline SSE2 at
-;;;; both widths.
+;;;; integer lanes: 32 and 64 bits wide, signed and unsigned
+;;;
+;;; no integer mul or div here, and not for want of trying: pmulld is sse4.1
+;;; and pmuludq reads only the low half of each 64-bit lane.  add, sub and
+;;; the three bitwise operations are baseline sse2 at both widths.
 
 (defknown %vec-load-ub32 ((simple-array (unsigned-byte 32) (*)) index)
     (simd-pack (unsigned-byte 32))
@@ -253,16 +232,11 @@
     (simd-pack (signed-byte 64))
   (flushable movable))
 
-;;;; Loading and storing 128 bits at a time in a simple integer array.
+;;;; loading and storing 128 bits at a time in a simple integer array
 ;;;
-;;; The effective address is the one the float section above uses, with the
-;;; element size -- 4 or 8 bytes -- in place of N-WORD-BYTES, and INDEX is
-;;; restricted and declared exactly as there.
-;;;
-;;; DEFINE-VEC-LOAD and DEFINE-VEC-STORE are lexically scoped to the float
-;;; section above, so the same two shapes are spelled out here rather than
-;;; the working float section being rewritten: MOVDQU needs no element type
-;;; of its own, and only the element size and the array type vary.
+;;; the same two shapes as the float section above, which is lexically
+;;; scoped here: movdqu needs no element type, and only the element size and
+;;; the array type vary.
 
 (macrolet ((define-vec-load (name element-type result-type element-size)
              `(define-vop (,name)
@@ -279,7 +253,6 @@
                             vector index
                             (index-scale ,element-size index))))))
            (define-vec-store (name element-type result-type element-size)
-             ;; VALUE is first in both the Lisp arglist and :ARGS.
              `(define-vop (,name)
                 (:translate ,name)
                 (:args (value :scs (int-sse-reg))
@@ -302,15 +275,11 @@
   (define-vec-store %vec-store-ub64 simple-array-unsigned-byte-64 simd-pack-ub64 8)
   (define-vec-store %vec-store-sb64 simple-array-signed-byte-64 simd-pack-sb64 8))
 
-;;;; Packed integer arithmetic and bitwise operations.
+;;;; packed integer arithmetic and bitwise operations
 ;;;
-;;; Same reasoning as the float arithmetic above: the destination is also the
-;;; first source, so RESULT is MOVEd from A first and :TARGET is only a
-;;; packing preference.  The instructions wrap on overflow, which is what
-;;; the (unsigned-byte N) and (signed-byte N) element types mean here, and
-;;; PADDD/PSUBD/PADDQ/PSUBQ/PAND/POR/PXOR all exist at both widths.  The
-;;; operands are packs rather than scalars, so the tagged-versus-untagged
-;;; question of the splats below does not arise.
+;;; as above, result is moved from a explicitly.  the instructions wrap on
+;;; overflow, which is what the (unsigned-byte n) and (signed-byte n)
+;;; element types mean.
 
 (macrolet ((define-vec-arith (name type instruction)
              `(define-vop (,name)
@@ -346,51 +315,21 @@
   (define-vec-arith %vec-or-sb64 simd-pack-sb64 por)
   (define-vec-arith %vec-xor-sb64 simd-pack-sb64 pxor))
 
-;;;; Splatting one integer across every lane.
+;;;; splatting one integer across every lane
 ;;;
-;;; The scalar arrives in a general-purpose register, not in the XMM register
-;;; the result wants, and there is no move VOP between UNSIGNED-REG or
-;;; SIGNED-REG and INT-SSE-REG (simd-pack.lisp moves between them with an
-;;; explicit MOVD/MOVQ inside a generator, as %MAKE-SIMD-PACK-UB64 does), so
-;;; the transfer is an instruction rather than a MOVE: MOVD for 32-bit lanes,
-;;; MOVQ for 64-bit lanes.
+;;; the scalar arrives in a general-purpose register and there is no move vop
+;;; from there into int-sse-reg, so the transfer is an instruction: movd for
+;;; 32-bit lanes, movq for 64-bit.
 ;;;
-;;; UNSIGNED-NUM and SIGNED-NUM are aliases over several primitive types
-;;; (primtype.lisp), and on 64-bit x86-64 two of those members are the tagged
-;;; fixnum types: (UNSIGNED-BYTE 32) is a subtype of POSITIVE-FIXNUM and
-;;; (SIGNED-BYTE 32) of FIXNUM, so a scalar of either type arrives *tagged*,
-;;; its value shifted left by N-FIXNUM-TAG-BITS.  Negative literals are
-;;; splatted the same way, so dividing by two has to be an ARITHMETIC shift:
-;;; SAR in a general-purpose register, before the transfer.  A logical shift
-;;; would serve non-negative values only and looks right for exactly as long
-;;; as one doesn't try it: -3 is tagged -6, whose low 32 bits are #xFFFFFFFA,
-;;; and PSRLD by one gives #x7FFFFFFD (+2147483645) instead of #xFFFFFFFD
-;;; (-3), because the bit shifted in is a zero rather than the sign.
-;;;
-;;; The primitive types are told apart at generation time the way
-;;; MOVE-FROM-WORD/FIXNUM does it, from the operand's Lisp type: a ref whose
-;;; type is a subtype of FIXNUM is tagged, anything else that can match is
-;;; not.  32-bit lane elements are therefore always tagged here, while a
-;;; 64-bit lane takes both -- (UNSIGNED-BYTE 64) and (SIGNED-BYTE 64) are not
-;;; fixnums, but an integer literal in the same loop is -- so the test stays.
-;;;
-;;; MOVD and MOVQ with a general-purpose source zero the rest of the
-;;; destination register (DEST[MAXVL-1:32] := 0, DEST[MAXVL-1:64] := 0), so
-;;; what is left is the value alone in lane 0.  Neither broadcast depends on
-;;; that, since PSHUFD rewrites all four lanes and PUNPCKLQDQ defines both
-;;; halves, but it does mean nothing stale is ever left to be read.
-;;;
-;;; Both GPR classes are allowed for the scalar because the tagged primitive
-;;; types are allocated in ANY-REG, SIGNED-REG or UNSIGNED-REG depending on
-;;; the value's type, and MOVD/MOVQ only look at the bits.
+;;; a (unsigned-byte 32) or (signed-byte 32) scalar arrives *tagged*, so the tag
+;;; is stripped with an arithmetic shift.  a logical shift looks right and is
+;;; not: -3 is tagged -6, whose low 32 bits are #xFFFFFFFA, and shifting that
+;;; logically by one gives 2147483645 rather than -3.
 
-;;; True when TN holds a tagged fixnum rather than an untagged integer.  The
-;;; test is on the *primitive type* the register was allocated for, not on the
-;;; Lisp type of the reference: a constant is materialized in whichever
-;;; primitive type its lvar has, so an integer literal arrives untagged while a
-;;; variable declared (SIGNED-BYTE 32) arrives tagged, even though both have a
-;;; Lisp type that is a subtype of FIXNUM.  Guessing from the Lisp type puts the
-;;; untagging shift in the wrong path and turns -3 into -2.
+;;; true when tn holds a tagged fixnum.  the test is on the primitive type the
+;;; register was allocated for, not on the Lisp type of the reference: an integer
+;;; literal arrives untagged, a variable declared (signed-byte 32) arrives tagged,
+;;; and guessing from the Lisp type splats -3 as -2.
 (defun tagged-fixnum-tn-p (tn)
   (let ((primitive-type (sb-c::tn-primitive-type tn)))
     (or (eq primitive-type (sb-c::primitive-type-or-lose 'fixnum))
@@ -456,23 +395,15 @@
         (inst movq result x))
     (inst punpcklqdq result result)))
 
-;;;; 8-bit lanes: sixteen at a time.
-;;;;
-;;;; PADDB/PSUBB are baseline SSE2, and a byte that wraps around is exactly what
-;;;; a scalar loop does to an (unsigned-byte 8) array once the range check is
-;;;; off.  That is the only case the vectorizer takes these for: the pass only
-;;;; rewrites 8-bit element types when the code is compiled at SAFETY 0, because
-;;;; at any higher safety the scalar store signals a type error where a packed
-;;;; store would quietly truncate.
-;;;;
-;;;; One element is one byte and a tagged index counts two units per element, so
-;;;; the index cannot be scaled: it is untagged into a scratch register and added
-;;;; with a scale of 1.  (INDEX-SCALE 1 INDEX would ask the assembler for a
-;;;; scale of 0, which does not exist.)
-;;;;
-;;;; No MUL, DIV, MIN or MAX here: PMULLW would compute the wrong width, and the
-;;;; byte-wise minimum and maximum are SSE2's PMINUB/PMAXUB for unsigned only,
-;;;; which is a separate feature with its own semantics.
+;;;; 8-bit lanes: sixteen at a time
+;;;
+;;; paddb/psubb are baseline sse2, and a byte that wraps around is what a
+;;; scalar loop does to an (unsigned-byte 8) array once the range check is
+;;; off, which is the only case the vectorizer takes these for.
+;;;
+;;; one element is one byte and a tagged index counts two units per element,
+;;; so the index cannot be scaled: it is untagged and added with the smallest
+;;; scale the assembler has.
 
 (defknown %vec-load-ub8 ((simple-array (unsigned-byte 8) (*)) index)
     (simd-pack (unsigned-byte 8))
@@ -513,12 +444,10 @@
 
 (defknown %vec-splat-ub8 ((unsigned-byte 8)) (simd-pack (unsigned-byte 8)) (flushable movable))
 
-;;; One byte in all sixteen lanes: strip the tag if there is one, mask the word
-;;; down to the byte that is left -- the shift leaves a negative value
-;;; sign-extended, and the multiplication below copies whatever is in the high
-;;; half as well, turning -3 into #x...FCFCFCFD -- then copy the byte into all
-;;; four bytes of a word by multiplying by #x01010101, and PSHUFD the word into
-;;; all four dwords.
+;;; one byte in all sixteen lanes: strip the tag, mask down to the byte -- the
+;;; shift leaves a negative value sign-extended, and the multiplication copies
+;;; the high half as well, turning -3 into #x...FCFCFCFD -- then copy the byte
+;;; into all four bytes of a word with #x01010101 and pshufd the word.
 (define-vop (%vec-splat-ub8)
   (:translate %vec-splat-ub8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -654,12 +583,7 @@
 
 (defknown %vec-splat-sb8 ((signed-byte 8)) (simd-pack (signed-byte 8)) (flushable movable))
 
-;;; One byte in all sixteen lanes: strip the tag if there is one, mask the word
-;;; down to the byte that is left -- the shift leaves a negative value
-;;; sign-extended, and the multiplication below copies whatever is in the high
-;;; half as well, turning -3 into #x...FCFCFCFD -- then copy the byte into all
-;;; four bytes of a word by multiplying by #x01010101, and PSHUFD the word into
-;;; all four dwords.
+;;; as above, for (signed-byte 8).
 (define-vop (%vec-splat-sb8)
   (:translate %vec-splat-sb8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -756,23 +680,13 @@
     (inst pxor arith-tmp b)
     (move result arith-tmp)))
 
-;;;; 16-bit lanes: eight at a time.
-;;;;
-;;;; The four shapes of the integer sections above again, over SIMD-PACK-UB16
-;;;; and SIMD-PACK-SB16, which live in INT-SSE-REG like the 32- and 64-bit
-;;;; packs, with the arrays spelled SIMPLE-ARRAY-UNSIGNED-BYTE-16 and
-;;;; SIMPLE-ARRAY-SIGNED-BYTE-16 (vm-array.lisp).
-;;;;
-;;;; Two bytes per element can be scaled: a tagged fixnum counts two units per
-;;;; element, so (INDEX-SCALE 2 INDEX) is a scale of 1 and the index is used
-;;;; exactly as it arrives.  That is what the 8-bit section above cannot do,
-;;;; where one element is one byte, a scale of 1 is already the smallest the
-;;;; assembler has, and the index therefore has to be untagged by hand.
-;;;;
-;;;; PADDW and PSUBW are baseline SSE2 and wrap at 16 bits, which is what an
-;;;; (UNSIGNED-BYTE 16) or (SIGNED-BYTE 16) element means, and PAND/POR/PXOR do
-;;;; not care about the lane width at all.  No MUL or DIV: the vectorizer asks
-;;;; for those on float lanes only (VECTOR-OPERATOR-BASE in vectorize.lisp).
+;;;; 16-bit lanes: eight at a time
+;;;
+;;; two bytes per element can be scaled: a tagged fixnum counts two units per
+;;; element, so (index-scale 2 index) is a scale of 1 and the index is used
+;;; exactly as it arrives.
+;;;
+;;; paddw and psubw wrap at 16 bits, which is what the element type means.
 
 (defknown %vec-load-ub16 ((simple-array (unsigned-byte 16) (*)) index)
     (simd-pack (unsigned-byte 16))
@@ -807,10 +721,9 @@
     (simd-pack (signed-byte 16))
   (flushable movable))
 
-;;;; Loading and storing 128 bits at a time in a simple 16-bit array.
+;;;; loading and storing 128 bits at a time in a simple 16-bit array
 ;;;
-;;; The effective address is the one the float and 32/64-bit sections use,
-;;; with the element size -- two bytes -- in place of N-WORD-BYTES.
+;;; the same effective address again, with the two-byte element size.
 
 (macrolet ((define-vec-load (name element-type result-type)
              `(define-vop (,name)
@@ -827,7 +740,6 @@
                             vector index
                             (index-scale 2 index))))))
            (define-vec-store (name element-type result-type)
-             ;; VALUE is first in both the Lisp arglist and :ARGS.
              `(define-vop (,name)
                 (:translate ,name)
                 (:args (value :scs (int-sse-reg))
@@ -846,11 +758,9 @@
   (define-vec-store %vec-store-ub16 simple-array-unsigned-byte-16 simd-pack-ub16)
   (define-vec-store %vec-store-sb16 simple-array-signed-byte-16 simd-pack-sb16))
 
-;;;; Packed 16-bit arithmetic and bitwise operations.
+;;;; packed 16-bit arithmetic and bitwise operations
 ;;;
-;;; Same reasoning as the integer arithmetic above: the destination is also the
-;;; first source, so RESULT is MOVEd from A first and :TARGET is only a packing
-;;; preference.
+;;; as above: result is moved from a explicitly, :target is only a preference.
 
 (macrolet ((define-vec-arith (name type instruction)
              `(define-vop (,name)
@@ -876,22 +786,14 @@
   (define-vec-arith %vec-or-sb16 simd-pack-sb16 por)
   (define-vec-arith %vec-xor-sb16 simd-pack-sb16 pxor))
 
-;;;; Splatting one 16-bit integer across every lane.
+;;;; splatting one 16-bit integer across every lane
 ;;;
-;;; The scalar arrives in a general-purpose register, tagged unless the compiler
-;;; materialized an untagged value, and there is no move VOP from there into
-;;; INT-SSE-REG, so the transfer is an instruction rather than a MOVE, as in the
-;;; splats above: strip the tag with an ARITHMETIC shift, mask the word down to
-;;; the 16 bits that are left, copy the value into both halves of a 32-bit word
-;;; by multiplying by #x00010001, MOVD that word into lane 0 -- which zeroes the
-;;; rest of the register -- and PSHUFD the word into all four dwords, which is
-;;; all eight 16-bit lanes.
+;;; strip the tag with an arithmetic shift, mask to the 16 bits that are left,
+;;; multiply by #x00010001 to get the value into both halves of a word, then
+;;; movd and pshufd as for the bytes.
 ;;;
-;;; The AND is not decoration.  The shift leaves a negative value sign-extended
-;;; to the full word, where the multiply copies whatever is in the high half as
-;;; well: -3 in a 16-bit lane times #x00010001 is #x...FFFCFFFD, whose second
-;;; half is -4.  Masking first makes the two halves identical for every value
-;;; in the range, -32768 included.
+;;; the and is not decoration: sign extension leaves the high half of
+;;; -3 * #x00010001 as -4 rather than -3.
 
 (define-vop (%vec-splat-ub16)
   (:translate %vec-splat-ub16)
@@ -925,25 +827,15 @@
     (inst movd result word)
     (inst pshufd result result #b00000000)))
 
-;;;; Negating a packed float.
+;;;; negating a packed float
 ;;;
-;;; A scalar (- x) on a float does not subtract: it flips the sign bit, with
-;;; XORPS/XORPD against a constant mask (%NEGATE/SINGLE-FLOAT and
-;;; %NEGATE/DOUBLE-FLOAT in float.lisp, which use
-;;; (REGISTER-INLINE-CONSTANT :OWORD (ASH 1 31)) and (ASH 1 63) respectively).
-;;; The packed version is that instruction with the mask in every lane, which
-;;; makes it bit-identical to the scalar one on the cases a subtraction gets
-;;; wrong: 0.0 comes out as -0.0 and -0.0 as 0.0, and a NaN keeps its payload
-;;; with only the sign bit flipped.
+;;; a scalar (- x) on a float flips the sign bit rather than subtracting
+;;; (%negate/single-float in float.lisp), and the packed version is the same
+;;; instruction with the mask in every lane: 0.0 becomes -0.0, -0.0 becomes
+;;; 0.0, and a nan keeps its payload.
 ;;;
-;;; The constant is one 128-bit OWORD integer, because
-;;; CANONICALIZE-INLINE-CONSTANT (insts.lisp) destructures the descriptor as
-;;; (TYPE VALUE) and :OWORD takes a single integer.  The lanes are the sign bits
-;;; of the pack: #x80000000 is the bit pattern of the single-float -0.0, which
-;;; is the top bit of a 32-bit lane, so the first mask sets bits 31, 63, 95 and
-;;; 127; and the double-float -0.0 -- (MAKE-DOUBLE-FLOAT #x80000000 0) -- is
-;;; that dword in the high half of a 64-bit lane, so the second mask sets bit
-;;; 63 and bit 127.
+;;; the mask is one 128-bit integer, since canonicalize-inline-constant
+;;; destructures an :oword descriptor as (type value).
 
 (defknown %vec-negate-single ((simd-pack single-float))
     (simd-pack single-float)
@@ -980,9 +872,8 @@
            :oword (logior (ash #x80000000 32)
                           (ash #x80000000 96))))))
 
-;;;; Byte-wise minimum and maximum, unsigned only: PMINUB and PMAXUB are SSE2,
-;;;; while the signed (PMINSB/PMAXSB) and word-width (PMINUW/PMAXUW) forms are
-;;;; SSE4.1 and out of scope for a baseline x86-64 backend.
+;;; byte-wise minimum and maximum, unsigned only: pminub and pmaxub are sse2,
+;;; the signed and word-width forms are sse4.1.
 
 (defknown (%vec-min-ub8 %vec-max-ub8)
     ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8)))
@@ -1013,13 +904,11 @@
     (inst pmaxub arith-tmp b)
     (move result arith-tmp)))
 
-;;;; A lane vector holding the loop index: [i, i+1, ... ].  The scalar index is
-;;;; converted to float and broadcast, and a constant ramp supplies the lane
-;;;; offsets, so a loop whose value is a function of its index can be done a vector
-;;;; at a time.
-;;;;
-;;;; The index arrives tagged, so it is untagged into a general-purpose register
-;;;; before the conversion (CVTSI2SS/CVTSI2SD take a sized integer source).
+;;;; a lane vector holding the loop index: [i, i+1, ... ]
+;;;
+;;; the scalar index is converted to float and broadcast, and a constant ramp
+;;; supplies the lane offsets; the index arrives tagged, so it is untagged
+;;; before the conversion.
 
 (defknown (%vec-splat-index-single) (index) (simd-pack single-float) (flushable movable))
 (defknown (%vec-splat-index-double) (index) (simd-pack double-float) (flushable movable))
@@ -1052,9 +941,9 @@
     (inst cvtsi2sd result word)
     (inst unpcklpd result result)))
 
-;;; The lane offsets: single-floats 0, 1, 2, 3 and doubles 0, 1, as one 128-bit
-;;; constant each (1.0f0 is #x3F800000, 2.0f0 #x40000000, 3.0f0 #x40400000, and
-;;; 1.0d0 is #x3FF0000000000000).
+;;; the lane offsets 0, 1, 2, 3 for single-floats and 0, 1 for doubles, as one
+;;; 128-bit constant each: 1.0f0 is #x3F800000, 2.0f0 #x40000000, 3.0f0 #x40400000,
+;;; 1.0d0 #x3FF0000000000000.
 (define-vop (%vec-ramp-single)
   (:translate %vec-ramp-single)
   (:results (result :scs (single-sse-reg)))
@@ -1072,8 +961,8 @@
     (inst movaps result
           (register-inline-constant :oword (ash #x3FF0000000000000 64)))))
 
-;;; The width of a vector, in every lane: how much the index pack advances per
-;;; iteration.  4.0f0 is #x40800000 and 2.0d0 is #x4000000000000000.
+;;; the width of a vector in every lane, which is how much the index pack advances:
+;;; 4.0f0 is #x40800000 and 2.0d0 is #x4000000000000000.
 (defknown (%vec-stride-single) () (simd-pack single-float) (flushable movable))
 (defknown (%vec-stride-double) () (simd-pack double-float) (flushable movable))
 
@@ -1096,9 +985,8 @@
           (register-inline-constant
            :oword (logior #x4000000000000000 (ash #x4000000000000000 64))))))
 
-;;;; 16-bit multiply: PMULLW is SSE2 and gives the low 16 bits of each product,
-;;;; which is what the scalar loop's value is once it is stored in a 16-bit
-;;;; element.
+;;; pmullw gives the low 16 bits of each product, which is what the scalar loop's
+;;; value is once it is stored in a 16-bit element.
 
 (defknown (%vec-mul-ub16) ((simd-pack (unsigned-byte 16)) (simd-pack (unsigned-byte 16))) (simd-pack (unsigned-byte 16)) (flushable movable))
 
@@ -1128,8 +1016,8 @@
     (inst pmullw arith-tmp b)
     (move result arith-tmp)))
 
-;;;; Hand the primitives to the loop vectorizer in SB-C, which cannot name this
-;;;; package itself.  See the comment on SB-C::*VECTOR-PRIMITIVES*.
+;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
+;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
 
 (macrolet ((publish (base element-type name)
              `(push (cons (list ,base ',element-type) ',name) primitives)))
