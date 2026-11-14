@@ -1808,3 +1808,53 @@ a writer with a fixed color type ends up with."
                                  (disassemble #'vectorize-coerce-index :stream stream)))))
     (assert (some (lambda (mnemonic) (search mnemonic text)) '("addps" "cvtsi2ss"))
             () "the COERCE spelling was not vectorized:~%~A" text)))
+
+
+;;;; Stencils.  A read before the loop variable cannot be vectorized - the scalar
+;;;; loop it stands for would fault at index 0 anyway - so the pass declines it and
+;;;; says what to write instead.  The pattern real code uses, a shifted destination
+;;;; with non-negative reads, is vectorized.
+
+(defun vectorize-stencil-shifted (in out n)
+  "out[i+1] = in[i] + in[i+1] + in[i+2]: a three-tap window written the legal way."
+  (declare (type (simple-array single-float (*)) in out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref out (+ i 1)) (+ (aref in i) (aref in (+ i 1)) (aref in (+ i 2)))))
+  out)
+
+(defun vectorize-stencil-backward (in out n)
+  "Reads in[i-1]: declined, because it is wrong at i = 0 as written."
+  (declare (type (simple-array single-float (*)) in out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (- (aref in i) (aref in (- i 1)))))
+  out)
+
+(test-util:with-test (:name :vectorize-stencils :skipped-on (not :x86-64))
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    ;; the legal three-tap is packed
+    (loop for n in *vectorize-lengths*
+          for in = (vectorize-array 'single-float *vectorize-single-values* (+ n 2))
+          for out = (make-array (+ n 1) :element-type 'single-float :initial-element 0.0f0)
+          do (vectorize-stencil-shifted in out n)
+             (dotimes (i n)
+               (let ((want (+ (aref in i) (aref in (+ i 1)) (aref in (+ i 2)))))
+                 (unless (vectorize-same-value-p (aref out (1+ i)) want)
+                   (error "~@<stencil: element ~D of ~D is ~S, expected ~S.~:@>"
+                          (1+ i) n (aref out (1+ i)) want)))))
+    (assert (some (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-stencil-shifted)))
+                  *vectorize-packed-mnemonics*)
+            () "the shifted three-tap was not vectorized")
+    ;; the backward read is declined, computes what it always computed, and explains
+    (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-stencil-backward)))
+                    '("addps" "subps"))
+            () "a read before the loop variable was vectorized")
+    (let ((notes (vectorize-notes-for
+                  '(lambda (in out n)
+                     (declare (type (simple-array single-float (*)) in out) (type fixnum n)
+                              (optimize speed))
+                     (dotimes (i n) (setf (aref out i) (- (aref in i) (aref in (- i 1)))))))))
+      (assert (vectorize-note-mentions notes "shift the destination")
+              () "no advice for the negative offset: ~s" notes))))
