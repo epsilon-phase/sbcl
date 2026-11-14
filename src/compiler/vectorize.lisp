@@ -651,9 +651,10 @@ guard still covers the reads."
     (cons (cons destination entry)
           (remove destination (vloop-sources loop) :key #'car :test #'eq))))
 
-;;; Whether every array a plan touches has its data inline.
+;;; Whether every array a plan reads has its data inline.  A reduction has no
+;;; destination - its result is a variable - so only the sources matter.
 (defun vector-loop-all-simple-p (loop)
-  (every (lambda (entry) (cddr entry)) (vector-loop-arrays loop)))
+  (every (lambda (entry) (cddr entry)) (vloop-sources loop)))
 
 ;;; The data vector and start index to use for each array that is not known to be
 ;;; simple, so that the loop body can address a plain simple array.
