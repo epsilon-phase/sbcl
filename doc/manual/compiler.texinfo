@@ -1342,11 +1342,16 @@ the pass says so in a note when it declines an integer loop for that reason.  Fl
 lanes are not affected, since any float fits the element type it is stored in.
 
 @noindent
-Integer addition wraps at the declared width and does not care about the order of
-the additions, so summing lanes and folding them into the variable at the end
-gives the same answer.  A @code{single-float} or @code{double-float} accumulator
-is refused: adding floats in a different order gives a different result, and this
-pass promises the same values as the loop it rewrites.
+Integer addition does not care about the order of the additions, so summing lanes
+and folding them into the variable at the end gives the same answer whenever the
+total fits in the accumulator's declared width.  The packed sum is computed modulo
+that width; a loop whose total overflows it is relying on undefined behaviour
+anyway - at @code{(safety 0)} such a loop does not truncate either, it silently
+produces a value outside the declared type - so the two agree only up to
+congruence there, and the note the pass emits for a reduction says so.  Only
+integer accumulators are vectorized: adding @code{single-float} or
+@code{double-float} in a different order gives a different result, and this pass
+promises the same values as the loop it rewrites.
 
 @noindent
 The body must have the shape @code{(setf (aref destination index) expression)},
