@@ -1073,10 +1073,24 @@ a writer with a fixed color type ends up with."
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
+    ;; The pass asks IR1 for a variable's type, and IR1 derives the element type of
+    ;; a LET-bound MAKE-ARRAY only after the body has been converted, so a loop over
+    ;; such a local is not vectorized - it says so, and a THE cast or a declaration
+    ;; makes it vectorizable.  The comment above this test used to describe the old
+    ;; pass, which matched the MAKE-ARRAY form in the source.
     (let ((text (disassembly #'vectorize-made-locals)))
-      (assert (some (lambda (mnemonic) (search mnemonic text))
-                    *vectorize-packed-mnemonics*)
-              () "a loop over local MAKE-ARRAY results was not vectorized:~%~A" text))
+      (assert (notany (lambda (mnemonic) (search mnemonic text)) '("addps" "addpd"))
+              () "a loop over local MAKE-ARRAY results was vectorized after all:~%~A" text))
+    (let ((notes (vectorize-notes-for
+                  '(lambda (n)
+                     (declare (type fixnum n) (optimize speed))
+                     (let ((a (make-array n :element-type 'single-float))
+                           (b (make-array n :element-type 'single-float))
+                           (c (make-array n :element-type 'single-float)))
+                       (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+                       c)))))
+      (assert (vectorize-note-mentions notes "not known to be an array"),
+              () "no explanation for the MAKE-ARRAY local: ~s" notes))
     (let ((text (disassembly #'vectorize-made-locals-adjustable)))
       (assert (notany (lambda (mnemonic) (search mnemonic text))
                       '("addps" "addpd"))

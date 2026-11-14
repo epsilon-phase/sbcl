@@ -967,13 +967,17 @@ guard still covers the reads."
   (when (and *auto-vectorize*
              (consp form)
              (memq (car form) '(dotimes do do* loop)))
-    (let ((plan (case (car form)
-                  (loop (vector-match-loop form lexenv))
-                  ((do do*) (vector-match-do form lexenv))
-                  (t (or (vector-match-dotimes form lexenv)
-                         (vector-match-reduction form lexenv))))))
-      (if plan
-          (vector-expand-loop plan)
+    (let* ((plan (case (car form)
+                   (loop (vector-match-loop form lexenv))
+                   ((do do*) (vector-match-do form lexenv))
+                   (t (or (vector-match-dotimes form lexenv)
+                          (vector-match-reduction form lexenv)))))
+           ;; a plan can still be declined while expanding - lanes that need
+           ;; (safety 0), a primitive the backend does not have - and that is
+           ;; exactly the case worth explaining
+           (replacement (and plan (vector-expand-loop plan))))
+      (if replacement
+          replacement
           (progn (vector-note-missed-optimization form lexenv) nil)))))
 
 ;;; Converting the form this pass returns must not re-enter the pass, or the
