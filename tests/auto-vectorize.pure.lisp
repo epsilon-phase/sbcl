@@ -866,7 +866,7 @@ instruction side."
 ;;; The same loop, checked: it must be left scalar.
 (defun vectorize-u8-subtract-checked (a b c n)
   (declare (type (simple-array (unsigned-byte 8) (*)) a b c) (type vectorize-index n)
-           (optimize speed (safety 0)))
+           (optimize speed))
   (dotimes (i n) (setf (aref c i) (- (aref a i) (aref b i)))))
 
 (defun vectorize-byte-guard (element-type)
