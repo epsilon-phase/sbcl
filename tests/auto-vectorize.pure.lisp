@@ -600,7 +600,7 @@ OPERATION applied to the same numbers, which involves no array loop."
 
 (defun vectorize-s64-subtract-scalar (a b c n k)
   (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
-           (type (signed-byte 64) k) (optimize speed))
+           (type (signed-byte 64) k) (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) k))))
 
 (test-util:with-test (:name :vectorize-integer-add :skipped-on (not :x86-64))
@@ -1470,13 +1470,13 @@ a writer with a fixed color type ends up with."
 
 (defun vectorize-u32-sum (a n total)
   (declare (type (simple-array (unsigned-byte 32) (*)) a) (type vectorize-index n)
-           (type (unsigned-byte 32) total) (optimize speed))
+           (type (unsigned-byte 32) total) (optimize speed (safety 0)))
   (dotimes (i n) (incf total (aref a i)))
   total)
 
 (defun vectorize-s32-sum (a n total)
   (declare (type (simple-array (signed-byte 32) (*)) a) (type vectorize-index n)
-           (type (signed-byte 32) total) (optimize speed))
+           (type (signed-byte 32) total) (optimize speed (safety 0)))
   (dotimes (i n) (incf total (aref a i)))
   total)
 
@@ -1663,3 +1663,119 @@ a writer with a fixed color type ends up with."
                    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i)))))
                 :notes nil)))
     (assert (null notes) () "notes were produced with *auto-vectorize-notes* nil: ~s" notes)))
+
+
+;;;; Regressions for the review of the first six rounds.  Each of these was a real
+;;;; bug: an integer loop that wrapped where the scalar loop signals, a guard that
+;;;; dropped an offset, a subscript that put the loop index into the guard, a
+;;;; reduction over data that is not inline, a shadowed name that kept its type,
+;;;; and a COERCE spelling that never matched.
+
+(defun vectorize-u32-add-unsafe (a b c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
+  c)
+
+(with-test (:name :vectorize-integer-lanes-need-safety-zero)
+  (flet ((packed-p (function)
+           (let ((text (string-downcase (with-output-to-string (stream)
+                                          (disassemble function :stream stream)))))
+             (some (lambda (mnemonic) (search mnemonic text)) '("paddd" "paddq" "paddw")))))
+    ;; at the default safety a checked store signals where a packed lane wraps, so
+    ;; the loop must stay scalar - and say why
+    (let ((notes (vectorize-notes-for
+                  '(lambda (a b c n)
+                     (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
+                              (type fixnum n) (optimize speed))
+                     (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+      (assert (vectorize-note-mentions notes "safety 0") () "no safety note: ~s" notes))
+    ;; and at (safety 0) it is packed
+    (assert (packed-p #'vectorize-u32-add-unsafe) () "u32 lanes were not packed at (safety 0)")))
+
+(defun vectorize-alias-offset (c d n)
+  "The destination is also a source, with an offset: the guard must cover the read."
+  (declare (type (simple-array single-float (*)) c d) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (+ (aref c (+ i 3)) (aref d i))))
+  c)
+
+(with-test (:name :vectorize-alias-offset-guard)
+  ;; length == n means the read at (+ i 3) leaves the array, so the loop must fall
+  ;; back to the scalar one, which reports it, rather than reading past the end
+  (loop for n in *vectorize-lengths*
+        do (let ((c (make-array n :element-type 'single-float :initial-element 1.0f0))
+                 (d (make-array n :element-type 'single-float :initial-element 2.0f0)))
+             (assert-error (vectorize-alias-offset c d n) error)))
+  ;; with room for the offsets it is fine, and still packed
+  (let* ((n 16)
+         (c (make-array (+ n 3) :element-type 'single-float :initial-element 1.0f0))
+         (d (make-array (+ n 3) :element-type 'single-float :initial-element 2.0f0))
+         (before (copy-seq c)))
+    (vectorize-alias-offset c d n)
+    (dotimes (i n)
+      (unless (eql (aref c i) (+ (aref before (+ i 3)) (aref d i)))
+        (error "~@<alias offset: element ~D is ~S.~:@>" i (aref c i))))))
+
+(defun vectorize-doubled-subscript (a c n)
+  "(aref a (+ i i)): the offset mentions the index, so the loop must stay scalar."
+  (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (aref a (+ i i))))
+  c)
+
+(with-test (:name :vectorize-index-referencing-offset)
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-array 'single-float *vectorize-single-values* (* 2 n))
+        for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+        do (vectorize-doubled-subscript a c n)
+           (dotimes (i n)
+             (unless (eql (aref c i) (aref a (* 2 i)))
+               (error "~@<doubled subscript: element ~D of ~D is ~S.~:@>" i n (aref c i))))))
+
+(defun vectorize-u32-sum-any (a n total)
+  "A reduction whose source may not be simple."
+  (declare (type (vector (unsigned-byte 32)) a) (type vectorize-index n)
+           (type (unsigned-byte 32) total) (optimize speed (safety 0)))
+  (dotimes (i n) (incf total (aref a i)))
+  total)
+
+(with-test (:name :vectorize-reduction-needs-inline-data)
+  (let ((adjustable (make-array 8 :element-type '(unsigned-byte 32) :adjustable t))
+        (simple (make-array 8 :element-type '(unsigned-byte 32))))
+    (dotimes (i 8) (setf (aref adjustable i) (1+ i) (aref simple i) (1+ i)))
+    (assert (= (vectorize-u32-sum-any adjustable 8 0) 36))
+    (assert (= (vectorize-u32-sum-any simple 8 0) 36))))
+
+(defun vectorize-shadowed-array (a n)
+  "A rebind of a declared array name to a vector of T: not that array any more."
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (optimize speed))
+  (let ((a (make-array n :element-type t :initial-element nil)))
+    (dotimes (i n) (setf (aref a i) 1.0f0))
+    (values (aref a 0) (type-of (aref a 0)))))
+
+(with-test (:name :vectorize-shadowed-binding)
+  (multiple-value-bind (value type)
+      (vectorize-shadowed-array (make-array 8 :element-type 'single-float :initial-element 0.0f0) 8)
+    (assert (eql value 1.0f0) () "the shadowed vector holds ~S" value)
+    (assert (eq type 'single-float) () "the shadowed vector holds a ~S" type)))
+
+(defun vectorize-coerce-index (c n)
+  (declare (type (simple-array single-float (*)) c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (coerce i 'single-float)))
+  c)
+
+(with-test (:name :vectorize-coerce-index)
+  (loop for n in *vectorize-lengths*
+        for c = (make-array n :element-type 'single-float :initial-element 0.0f0)
+        do (vectorize-coerce-index c n)
+           (dotimes (i n)
+             (unless (eql (aref c i) (coerce i 'single-float))
+               (error "~@<coerce: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
+  ;; the COERCE spelling is a matcher branch, so assert it really takes it
+  (let ((text (string-downcase (with-output-to-string (stream)
+                                 (disassemble #'vectorize-coerce-index :stream stream)))))
+    (assert (some (lambda (mnemonic) (search mnemonic text)) '("addps" "cvtsi2ss"))
+            () "the COERCE spelling was not vectorized:~%~A" text)))

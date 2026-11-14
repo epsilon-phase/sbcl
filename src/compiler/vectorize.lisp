@@ -63,7 +63,11 @@
 ;;; not checking the element type: at any safety above 0, storing a byte that
 ;;; does not fit signals a type error, where a packed store truncates.  Set by
 ;;; VECTORIZE-LAMBDA-BODY from the policy and read when expanding.
-(defvar *vectorize-byte-lanes* nil)
+(defvar *vectorize-unchecked-lanes* nil
+  "True when the code being compiled is at (safety 0).  Storing an integer that does
+not fit the destination's element type signals a type error in a checked loop and
+wraps in a packed one, so integer lanes are only used where the scalar loop would
+wrap too.  Float lanes cannot overflow their element type and are unaffected.")
 
 ;;; The primitive base name for OPERATOR over ELEMENT-TYPE, or NIL when this
 ;;; pair is not something the backend can do a vector at a time.  Multiplication
@@ -200,6 +204,31 @@
             (when (and element (vector-supported-element-type-p element))
               `(simple-array ,element (*)))))))))
 
+;;; The SAFETY quality a declaration list asks for, if any.
+(defun vector-declared-safety (declarations)
+  (let ((safety nil))
+    (dolist (declaration declarations safety)
+      (when (and (consp declaration) (eq (car declaration) 'optimize))
+        (loop for (quality value) on (cdr declaration) by #'cddr
+              when (member quality '(safety)) do (setf safety value))))))
+
+;;; The names this pass reads as CL syntax or functions.  A lexical binding of one
+;;; of them changes what a form means, so a form that does so is left untouched.
+(defparameter *vector-special-names*
+  '(dotimes do do* loop setf let let* lambda locally flet labels macrolet progn the
+    if cond when unless and or not aref + - * / logand logior logxor min max eq eql
+    = >= > < <= float coerce incf decf))
+
+;;; Drop the entries for names a binding form shadows: a declared array rebound to
+;;; something else is not that array inside the binding form, and an outer scalar
+;;; rebound to a loop index is not that scalar.
+(defun vector-unbind (env names)
+  (remove-if (lambda (entry) (member (car entry) names :test #'eq)) env))
+
+;;; The names bound by a LET-like binding list.
+(defun vector-binding-names (bindings)
+  (mapcar (lambda (binding) (if (consp binding) (first binding) binding)) bindings))
+
 ;;; Extend ENV by the bindings of a LET/LET* that are MAKE-ARRAY forms with a
 ;;; literal element type.
 (defun vector-extend-env-from-bindings (bindings env)
@@ -224,9 +253,11 @@
              (let ((other (if (eq (first arguments) index)
                               (second arguments)
                               (first arguments))))
-               (cond ((and (typep other '(integer 0 *)) ) (values other t))
-                     ((symbolp other) (values other nil)))))))
-        (t nil)))
+                ;; the offset ends up in a guard evaluated outside the loop, so it
+                ;; may not mention the loop index
+                (cond ((typep other '(integer 0 *)) (values other t))
+                      ((and (symbolp other) (not (eq other index)))
+                       (values other nil)))))))))
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
 (defun vector-match-expression (form env index element-type)
@@ -251,10 +282,11 @@
         ;; depends on where it is, like a gradient or a ramp table
         ((and (eq (car form) 'float) (null (cddr form))
               (eq (second form) index)
-              (vector-float-element-type-p element-type))
+              (equal element-type 'single-float))
          (list :index))
         ((and (eq (car form) 'coerce) (= (length form) 3) (eq (second form) index)
-              (equal (third form) element-type)
+              (consp (third form)) (eq (car (third form)) 'quote)
+              (equal (second (third form)) element-type)
               (vector-float-element-type-p element-type))
          (list :index))
         ((eq (car form) 'aref)
@@ -297,6 +329,8 @@
       form))
 
 (defun vector-match-element-store (form env index)
+  ;; the loop index shadows anything the enclosing scope declared about that name
+  (setf env (vector-unbind env (list index)))
   (let ((form (vector-normalize-store form)))
     (when (and (consp form) (eq (car form) 'setf) (null (cdddr form)))
     (let ((place (second form)))
@@ -534,17 +568,22 @@
                                     (vector-reduction-increment (third store) place)))
                               (when expression
                                 (setf expression
-                                      (vector-match-expression expression env index type)))
+                                      (vector-match-expression
+                                       expression (vector-unbind env (list index)) index type)))
                               (when expression
-                                (make-vector-loop
-                                 :element-type type
-                                 :index index
-                                 :count count
-                                 :accumulator place
-                                 :sources (vector-collect-arrays expression)
-                                 :expression expression
-                                 :body (first statements)
-                                 :fallback form)))))))))))))))))
+                                (let ((plan (make-vector-loop
+                                             :element-type type
+                                             :index index
+                                             :count count
+                                             :accumulator place
+                                             :sources (vector-collect-arrays expression)
+                                             :expression expression
+                                             :body (first statements)
+                                             :fallback form)))
+                                  ;; the reduction expansion addresses the sources
+                                  ;; directly, so it needs their data inline
+                                  (when (vector-loop-all-simple-p plan)
+                                    plan))))))))))))))))))
 
 ;;;; Generating the vectorized loop
 
@@ -562,9 +601,6 @@
 
 (defun vector-primitive (base element-type)
   (cdr (assoc (list base element-type) *vector-primitives* :test #'equal)))
-
-(defun vector-arithmetic-base (operator)
-  (ecase operator (+ "ADD") (- "SUB") (* "MUL") (/ "DIV")))
 
 ;;; The operators an expression tree uses, in order of first use.
 (defun vector-collect-operators (expression &optional (accumulator '()))
@@ -603,11 +639,21 @@
 ;;; The arrays a loop touches, as an alist of name to (OFFSETS . SIMPLE-P),
 ;;; destination first.
 (defun vector-loop-arrays (loop)
-  (let ((destination (cons (list (vloop-destination-offset loop))
-                           (vloop-destination-simple-p loop))))
-    (cons (cons (vloop-destination loop) destination)
-          (remove (vloop-destination loop) (vloop-sources loop)
-                  :key #'car :test #'eq))))
+  "The arrays a loop touches: the destination first, then the sources.  When the
+destination is also a source - (setf (aref c i) (+ (aref c (+ i 3)) ...)) - its
+offsets are merged into the destination's entry rather than dropped, so the length
+guard still covers the reads."
+  (let* ((destination (vloop-destination loop))
+         (same (find destination (vloop-sources loop) :key #'car :test #'eq))
+         (entry (cons (append (list (vloop-destination-offset loop))
+                              (and same (second same)))
+                      (vloop-destination-simple-p loop))))
+    (cons (cons destination entry)
+          (remove destination (vloop-sources loop) :key #'car :test #'eq))))
+
+;;; Whether every array a plan touches has its data inline.
+(defun vector-loop-all-simple-p (loop)
+  (every (lambda (entry) (cddr entry)) (vector-loop-arrays loop)))
 
 ;;; The data vector and start index to use for each array that is not known to be
 ;;; simple, so that the loop body can address a plain simple array.
@@ -677,8 +723,11 @@
     (when (and load store
                (every #'identity arithmetic)
                (if indexed (and ramp stride) t)
-               (or splat (null scalars))
-               (or (/= width 16) *vectorize-byte-lanes*))
+               (or splat (null (remove-if (lambda (scalar)
+                                            (memq (car scalar) '(:index :stride)))
+                                          scalars)))
+               (or (vector-float-element-type-p element-type)
+                   *vectorize-unchecked-lanes*))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
@@ -764,7 +813,8 @@
                              (vector-collect-operators expression))))
     (when (and load store splat add (every #'identity arithmetic)
                (not (memq :index (vector-collect-operators expression)))
-               (or (/= width 16) *vectorize-byte-lanes*))
+               (or (vector-float-element-type-p element-type)
+                   *vectorize-unchecked-lanes*))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized reduction over ~a, ~a elements at a time"
                          element-type width))
@@ -952,9 +1002,10 @@
         (unless (vector-operator-base operator element-type)
           (push (format nil "~a is not available for ~a lanes" operator element-type)
                 reasons)))
-      (when (and (= (vector-width element-type) 16)
-                 (not *vectorize-byte-lanes*))
-        (push (format nil "lanes of ~a are only used when compiled at (safety 0)"
+      (when (and (not (vector-float-element-type-p element-type))
+                 (not *vectorize-unchecked-lanes*))
+        (push (format nil "~a lanes wrap where a checked loop would signal, so they ~
+                           are only used when compiled at (safety 0)"
                       element-type)
               reasons)))
     (nreverse reasons)))
@@ -992,7 +1043,20 @@
                               (vector-match-reduction form env))))))
             (or (and plan (vector-expand-loop plan))
                 (progn (vector-note-missed-optimization form env) form))))
-        (lambda `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env)))
+        (lambda
+         (let ((env (vector-unbind env (mapcar (lambda (parameter)
+                                                 (if (consp parameter) (first parameter) parameter))
+                                               (second form)))))
+           `(lambda ,(second form) ,@(vector-vectorize-body (cddr form) env))))
+        ((destructuring-bind symbol-macrolet macrolet)
+         ;; DESTRUCTURING-BIND binds names this pass cannot enumerate cheaply, and a
+         ;; local macro or symbol macro may redefine anything this pass reads
+         (if (and (eq (car form) 'macrolet)
+                  (notany (lambda (name) (memq name *vector-special-names*))
+                          (mapcar #'first (second form))))
+             (cons 'macrolet
+                   (cons (second form) (vector-vectorize-body (cddr form) env)))
+             form))
         ((let let*)
          (multiple-value-bind (declarations statements) (vector-split-declarations (cddr form))
            `(,(car form)
@@ -1006,14 +1070,24 @@
                 statements
                 (vector-extend-env
                  declarations
-                 (vector-extend-env-from-bindings (second form) env))))))
+                 (vector-extend-env-from-bindings
+                  (second form) (vector-unbind env (vector-binding-names (second form)))))))))
         (locally
          (multiple-value-bind (declarations statements) (vector-split-declarations (cdr form))
-           `(locally ,@declarations
-                     ,@(vector-vectorize-body statements (vector-extend-env declarations env)))))
+           (let ((safety (vector-declared-safety declarations)))
+             `(locally ,@declarations
+                       ,@(if safety
+                             (let ((*vectorize-unchecked-lanes* (= safety 0)))
+                               (vector-vectorize-body
+                                statements (vector-extend-env declarations env)))
+                             (vector-vectorize-body
+                              statements (vector-extend-env declarations env)))))))
         (progn (cons 'progn (vector-vectorize-body (cdr form) env)))
         (the `(the ,(second form) ,(vector-vectorize-form (third form) env)))
         ((flet labels)
+         (when (some (lambda (name) (memq name *vector-special-names*))
+                     (mapcar #'first (second form)))
+           (return-from vector-vectorize-form form))
          `(,(car form)
            ,(mapcar (lambda (definition)
                       `(,(car definition) ,(second definition)
@@ -1022,8 +1096,9 @@
            ,@(vector-vectorize-body (cddr form) env)))
         (multiple-value-bind
             (destructuring-bind (variables value-form . body) (cdr form)
-              `(multiple-value-bind ,variables ,(vector-vectorize-form value-form env)
-                 ,@(vector-vectorize-body body env))))
+              (let ((env (vector-unbind env (remove-if-not #'symbolp variables))))
+                `(multiple-value-bind ,variables ,(vector-vectorize-form value-form env)
+                   ,@(vector-vectorize-body body env)))))
         ((when unless and or prog1 prog2) (cons (car form) (vector-vectorize-body (cdr form) env)))
         (if (destructuring-bind (test then &optional else) (cdr form)
               `(if ,(vector-vectorize-form test env)
@@ -1072,6 +1147,6 @@
   (if (and *auto-vectorize*
            (member :x86-64 *features*)
            (policy (or local-policy lexenv) (>= speed 2)))
-      (let ((*vectorize-byte-lanes* (policy (or local-policy lexenv) (= safety 0))))
+      (let ((*vectorize-unchecked-lanes* (policy (or local-policy lexenv) (= safety 0))))
         (vector-vectorize-body body (vector-parameter-environment vars)))
       body))

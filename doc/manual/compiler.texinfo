@@ -1264,8 +1264,7 @@ The supported element types and the operations on them are
 and @code{(signed-byte 64)} and @code{(unsigned-byte 64)}, two at a time, with
 @code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor};
 @item @code{(unsigned-byte 8)} and @code{(signed-byte 8)}, sixteen at a time,
-with the same operations plus @code{min} and @code{max}, but only when the code
-is compiled at @code{(safety 0)}.  The byte-wise minimum and maximum are
+with the same operations plus @code{min} and @code{max}.  The byte-wise minimum and maximum are
 @code{PMINUB} and @code{PMAXUB}, which SSE2 has for unsigned lanes only, so
 @code{min} and @code{max} on signed bytes stay scalar rather than use an
 instruction that would give the wrong answer.  A packed byte store truncates where the scalar store signals a type error,
@@ -1325,6 +1324,13 @@ This pays only while the loop is limited by arithmetic rather than memory: on a
 buffer large enough to stream, a loop writing one four-byte element at a time is
 bound by memory bandwidth either way, and vectorizing it changes nothing.  Where
 the data stays in cache it is worth 2.7 to 4 times.
+
+@noindent
+Integer lanes wrap, where a checked scalar loop signals a type error on a value
+that does not fit the destination's element type.  They are therefore only used
+when the code is compiled at @code{(safety 0)}, the same rule as the byte lanes;
+the pass says so in a note when it declines an integer loop for that reason.  Float
+lanes are not affected, since any float fits the element type it is stored in.
 
 @noindent
 Integer addition wraps at the declared width and does not care about the order of
