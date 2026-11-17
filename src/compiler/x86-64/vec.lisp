@@ -16,10 +16,10 @@
 ;;; the arrays are spelled (simple-array <element> (*)) where a Lisp type
 ;;; specifier is wanted, and by their primitive type names in :arg-types.
 ;;;
-;;; a load is flushable but neither movable nor foldable, and a store is
-;;; neither either: 128 bits at a time must not be reordered across a store
-;;; into the same array, which is what a loop that reads what it just wrote
-;;; would do.
+;;; a load is flushable but neither movable nor foldable, and a store is neither
+;;; of those either: 128 bits at a time must not be reordered across a store into
+;;; the same array, because a loop that reads what it just wrote depends on that
+;;; order.
 
 (defknown %vec-load-single ((simple-array single-float (*)) index)
     (simd-pack single-float)
@@ -140,8 +140,8 @@
 
 ;;;; splatting one float across every lane
 ;;;
-;;; the arg is a scalar float sc targeted at the result, moved once into it,
-;;; and then the low lane alone is selected by the shuffle.
+;;; the arg is a scalar float sc targeted at the result and moved into it once,
+;;; and the shuffle then selects the low lane alone.
 
 (define-vop (%vec-splat-single)
   (:translate %vec-splat-single)
@@ -165,9 +165,9 @@
 
 ;;;; integer lanes: 32 and 64 bits wide, signed and unsigned
 ;;;
-;;; no integer mul or div here, and not for want of trying: pmulld is sse4.1
-;;; and pmuludq reads only the low half of each 64-bit lane.  add, sub and
-;;; the three bitwise operations are baseline sse2 at both widths.
+;;; no integer mul or div here: pmulld is sse4.1 and pmuludq reads only the low
+;;; half of each 64-bit lane.  add, sub and the three bitwise operations are
+;;; baseline sse2 at both widths.
 
 (defknown %vec-load-ub32 ((simple-array (unsigned-byte 32) (*)) index)
     (simd-pack (unsigned-byte 32))
@@ -234,9 +234,9 @@
 
 ;;;; loading and storing 128 bits at a time in a simple integer array
 ;;;
-;;; the same two shapes as the float section above, which is lexically
-;;; scoped here: movdqu needs no element type, and only the element size and
-;;; the array type vary.
+;;; the same two shapes as the float section above, in a macrolet scoped to this
+;;; section: movdqu needs no element type, and only the element size and the
+;;; array type vary.
 
 (macrolet ((define-vec-load (name element-type result-type element-size)
              `(define-vop (,name)
@@ -444,10 +444,10 @@
 
 (defknown %vec-splat-ub8 ((unsigned-byte 8)) (simd-pack (unsigned-byte 8)) (flushable movable))
 
-;;; one byte in all sixteen lanes: strip the tag, mask down to the byte -- the
-;;; shift leaves a negative value sign-extended, and the multiplication copies
-;;; the high half as well, turning -3 into #x...FCFCFCFD -- then copy the byte
-;;; into all four bytes of a word with #x01010101 and pshufd the word.
+;;; one byte in all sixteen lanes: strip the tag, then mask down to the byte,
+;;; since the shift leaves a negative value sign-extended and the multiplication
+;;; copies the high half as well, turning -3 into #x...FCFCFCFD.  Then copy the
+;;; byte into all four bytes of a word with #x01010101 and pshufd the word.
 (define-vop (%vec-splat-ub8)
   (:translate %vec-splat-ub8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -792,7 +792,7 @@
 ;;; multiply by #x00010001 to get the value into both halves of a word, then
 ;;; movd and pshufd as for the bytes.
 ;;;
-;;; the and is not decoration: sign extension leaves the high half of
+;;; the and is required: sign extension leaves the high half of
 ;;; -3 * #x00010001 as -4 rather than -3.
 
 (define-vop (%vec-splat-ub16)

@@ -3,9 +3,9 @@
 ;;;;
 ;;;;   src/runtime/sbcl --core output/sbcl.core --load benchmarks/auto-vectorize.lisp
 ;;;;
-;;;; Sizes are chosen so that one is small enough to stay in a core's cache (the
-;;;; vector loop is then limited by instruction throughput) and one is large
-;;;; enough to stream from memory (both loops are then limited by bandwidth).
+;;;; Sizes are chosen so that one is small enough to stay in a core's cache, where
+;;;; the vector loop is limited by instruction throughput, and one is large enough
+;;;; to stream from memory, where both loops are limited by bandwidth.
 ;;;;
 ;;;; This software is in the public domain and is provided with absolutely no
 ;;;; warranty. See the COPYING and CREDITS files for more information.

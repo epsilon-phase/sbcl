@@ -13,7 +13,7 @@
 
 ;;; These tests assert that a loop became instructions of a particular
 ;;; instruction set, so they mean something only on a backend that has the vops
-;;; for it.  The pass itself declines everywhere else, so the loops are merely
+;;; for it.  The pass itself declines everywhere else, so the loops are still
 ;;; scalar there and still compute the right values.
 
 ;;; A loop such as
@@ -26,27 +26,27 @@
 ;;; scalar loop when N is larger than an array.  The tests below pin down the
 ;;; observable behaviour of that rewrite: the same values as the scalar loop,
 ;;; aliased arguments, an index past the end still signalling, no writes past
-;;; N, and - on x86-64 - the packed loop really being there.
+;;; N, and the packed loop being there on x86-64.
 
 ;;; The vectorizer targets x86-64 and is part of the simd-pack support.
 #-x86-64 (invoke-restart 'run-tests::skip-file)
 
 ;;; INDEX, the type of a bound into a vector: (INTEGER 0 (ARRAY-DIMENSION-LIMIT)).
 ;;; It is spelled out rather than named because the name and the package that
-;;; owns it - SB-INT:INDEX or SB-EXT:INDEX depending on the build - are not
+;;; owns it, SB-INT:INDEX or SB-EXT:INDEX depending on the build, are not
 ;;; something a test should depend on.
 (deftype vectorize-index () `(integer 0 (,array-dimension-limit)))
 
 ;;;; Inputs shared by every test.
 
 ;;; The lengths every correctness test runs over.  0 runs no iterations at
-;;; all, 1 through 9 cross the hand-off from the packed loop to the scalar tail
-;;; (4 is a whole vector of single-floats, 8 of double-floats), 16 and 17
+;;; all, 1 through 9 cross the hand-off from the packed loop to the scalar tail,
+;;; 4 being a whole vector of single-floats and 8 of double-floats, 16 and 17
 ;;; straddle a second pair of vectors, and 1000 is long enough that a lane
 ;;; shift cannot hide in a short loop.
 (defparameter *vectorize-lengths* '(0 1 2 3 4 5 7 8 9 16 17 1000))
 
-;;; The input values deliberately are not all equal: positives, negatives,
+;;; The input values are not all equal: positives, negatives,
 ;;; zeros and fractions, so that a lane read from the wrong offset shows up as
 ;;; a mismatch instead of an accidental match.
 (defparameter *vectorize-single-values*
@@ -450,7 +450,7 @@ does not involve any array loop and so cannot itself be vectorized."
 
 ;;;; N larger than the arrays: the fallback scalar loop signals an index error
 ;;;; rather than reading or writing out of bounds.  SPEED alone does not turn
-;;;; bounds checks off - SAFETY is still 1 - which is what makes the error
+;;;; bounds checks off, because SAFETY is still 1, and that is what makes the error
 ;;;; observable.
 
 (test-util:with-test (:name :vectorize-single-n-exceeds-length :skipped-on (not :x86-64))
@@ -526,9 +526,9 @@ does not involve any array loop and so cannot itself be vectorized."
 ;;;;
 ;;;; The same elementwise contract as the float tests, over the four integer
 ;;;; element types the vectorizer handles.  The values are chosen so that no
-;;;; result leaves the element type's range: a packed lane wraps around, and what
-;;;; the scalar path does with an out-of-range store is not something this suite
-;;;; is here to pin down.
+;;;; result leaves the element type's range: a packed lane wraps around, and the
+;;;; scalar path's behaviour with an out-of-range store is outside what this suite
+;;;; pins down.
 
 (defparameter *vectorize-u32-values* '(0 1 2 3 7 11 100 255 1000 65535))
 (defparameter *vectorize-s32-values* '(0 1 -2 3 -7 11 -100 255 -1000 65535 -65535))
@@ -612,9 +612,9 @@ OPERATION applied to the same numbers, which involves no array loop."
            (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (logxor (aref a i) (aref b i)))))
 
-;;; The negative constant is the interesting one: it reaches the backend as a
-;;; tagged fixnum, and a lane that is broadcast from a tagged value has to be
-;;; recovered arithmetically, or -3 comes out as a huge positive.
+;;; A negative constant reaches the backend as a tagged fixnum, and a lane that
+;;; is broadcast from a tagged value has to be recovered arithmetically, or -3
+;;; comes out as a huge positive.
 (defun vectorize-s32-add-negative-constant (a b c n)
   (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
            (optimize speed (safety 0)))
@@ -680,7 +680,7 @@ OPERATION applied to the same numbers, which involves no array loop."
                (unless (= (aref c i) want)
                  (error "~@<element ~D of ~D is ~S, expected ~S.~:@>"
                         i n (aref c i) want)))))
-  ;; a scalar operand is broadcast, so the loop must really be packed
+  ;; a scalar operand is broadcast, so the loop must be packed
   (let ((text (string-downcase (with-output-to-string (stream)
                                  (disassemble #'vectorize-s64-subtract-scalar
                                               :stream stream)))))
@@ -768,7 +768,7 @@ OPERATION applied to the same numbers, which involves no array loop."
                    (unless (eql (aref c i) (aref reference i))
                      (error "~@<~S, length ~D: element ~D is ~S, expected ~S.~:@>"
                             function n i (aref c i) (aref reference i)))))))
-    ;; and each of them really is the packed loop
+    ;; and each of them is the packed loop
     (dolist (function (list #'vectorize-single-add-loop-below
                             #'vectorize-single-add-loop-from-0
                             #'vectorize-single-add-loop-of-type
@@ -1097,9 +1097,9 @@ a writer with a fixed color type ends up with."
                               (disassemble function :stream stream)))))
     ;; The pass asks IR1 for a variable's type, and IR1 derives the element type of
     ;; a LET-bound MAKE-ARRAY only after the body has been converted, so a loop over
-    ;; such a local is not vectorized - it says so, and a THE cast or a declaration
-    ;; makes it vectorizable.  The comment above this test used to describe the old
-    ;; pass, which matched the MAKE-ARRAY form in the source.
+    ;; such a local is not vectorized, and the note says so; a THE cast or a
+    ;; declaration makes it vectorizable.  The comment above this test used to
+    ;; describe the old pass, which matched the MAKE-ARRAY form in the source.
     (let ((text (disassembly #'vectorize-made-locals)))
       (assert (notany (lambda (mnemonic) (search mnemonic text)) '("addps" "addpd"))
               () "a loop over local MAKE-ARRAY results was vectorized after all:~%~A" text))
@@ -1548,10 +1548,10 @@ a writer with a fixed color type ends up with."
     (assert (search "paddd" (disassembly #'vectorize-u32-sum))
             () "an integer reduction was not vectorized")
     ;; A total that overflows the accumulator's declared width is undefined
-    ;; behaviour in the scalar loop at (safety 0) - it does not truncate, it just
-    ;; produces a value outside the declared type - so the packed sum, which is
+    ;; behaviour in the scalar loop at (safety 0): it does not truncate, it just
+    ;; produces a value outside the declared type.  So the packed sum, which is
     ;; computed modulo that width, agrees with the scalar one only up to
-    ;; congruence.  Record that boundary rather than pretending it is not there.
+    ;; congruence, and this test records that boundary.
     (let* ((n 4000)
            (a (make-array n :element-type '(unsigned-byte 32) :initial-element #xFFFFFFFF))
            (total (vectorize-u32-sum a n 0))
@@ -1572,7 +1572,7 @@ a writer with a fixed color type ends up with."
                (unless (eql (vectorize-single-sum a n 0.5f0) expected)
                  (error "~@<scalar float sum of ~D elements changed.~:@>" n))))))
 
-;;;; A value that depends on where it is: the loop index converted to the element
+;;;; A value that depends on the index: the loop index converted to the element
 ;;;; type becomes a lane vector, and a constant ramp supplies the lane offsets.
 
 (defun vectorize-gradient (c n)
@@ -1633,8 +1633,8 @@ a writer with a fixed color type ends up with."
 
 
 ;;;; Missed-optimization notes: a loop in the pass's shape that was not rewritten
-;;;; says why, in the same spirit as "unable to open-code X due to type
-;;;; uncertainty".  The point is that the user can act on it.
+;;;; says why, the way "unable to open-code X due to type uncertainty" does, so
+;;;; the user can act on it.
 
 (test-util:with-test (:name :vectorize-missed-declaration-note :skipped-on (not :x86-64))
   ;; B is undeclared: the note should name the declaration that would allow it
@@ -1713,7 +1713,7 @@ a writer with a fixed color type ends up with."
                                           (disassemble function :stream stream)))))
              (some (lambda (mnemonic) (search mnemonic text)) '("paddd" "paddq" "paddw")))))
     ;; at the default safety a checked store signals where a packed lane wraps, so
-    ;; the loop must stay scalar - and say why
+    ;; the loop must stay scalar and say why
     (let ((notes (vectorize-notes-for
                   '(lambda (a b c n)
                      (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
@@ -1805,17 +1805,17 @@ a writer with a fixed color type ends up with."
            (dotimes (i n)
              (unless (eql (aref c i) (coerce i 'single-float))
                (error "~@<coerce: element ~D of ~D is ~S.~:@>" i n (aref c i)))))
-  ;; the COERCE spelling is a matcher branch, so assert it really takes it
+  ;; the COERCE spelling is a matcher branch, so assert it takes it
   (let ((text (string-downcase (with-output-to-string (stream)
                                  (disassemble #'vectorize-coerce-index :stream stream)))))
     (assert (some (lambda (mnemonic) (search mnemonic text)) '("addps" "cvtsi2ss"))
             () "the COERCE spelling was not vectorized:~%~A" text)))
 
 
-;;;; Stencils.  A read before the loop variable cannot be vectorized - the scalar
-;;;; loop it stands for would fault at index 0 anyway - so the pass declines it and
-;;;; says what to write instead.  The pattern real code uses, a shifted destination
-;;;; with non-negative reads, is vectorized.
+;;;; Stencils.  A read before the loop variable cannot be vectorized, because the
+;;;; scalar loop it replaces would fault at index 0 anyway, so the pass declines it
+;;;; and says what to write instead.  The pattern real code uses, a shifted
+;;;; destination with non-negative reads, is vectorized.
 
 (defun vectorize-stencil-shifted (in out n)
   "out[i+1] = in[i] + in[i+1] + in[i+2]: a three-tap window written the legal way."
@@ -1890,7 +1890,7 @@ a writer with a fixed color type ends up with."
 
 ;;; 1. UPTO includes its bound.  It is a synonym for BELOW in LOOP only in the
 ;;; sense that both take a bound; the last iteration differs, and the packed loop
-;;; covering a shorter range is not something a runtime guard can notice.
+;;; covering a shorter range is something a runtime guard cannot notice.
 (defun vectorize-loop-upto-count (a c n)
   (declare (type (simple-array single-float (*)) a c) (type vectorize-index n)
            (optimize speed))

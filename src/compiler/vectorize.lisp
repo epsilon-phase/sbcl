@@ -1,6 +1,6 @@
 ;;;; automatic vectorization of elementwise array loops
 ;;;;
-;;;; This file contains code which rewrites the classic elementwise array loop
+;;;; This file rewrites the classic elementwise array loop
 ;;;;
 ;;;;   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
 ;;;;
@@ -44,10 +44,10 @@
         (t 2)))
 
 ;;; integer lanes are only equivalent to the scalar loop at (safety 0), where the
-;;; scalar store wraps too; read from the lexenv when a loop is matched and carried
-;;; on the plan, so a nested locally is honoured.
+;;; scalar store wraps too; the pass reads it from the lexenv when it matches a loop
+;;; and carries it on the plan, so a nested locally is honoured.
 ;;; the primitive base name for operator over element-type, or nil where the backend
-;;; has no such vector: mul and div are float only, the bitwise ones integer only.
+;;; has no such vector.  mul and div are float only, the bitwise ones integer only.
 (defun vector-operator-base (operator element-type)
   (let ((floats (vector-float-element-type-p element-type)))
     (case operator
@@ -113,8 +113,8 @@
           do (setf type (second form) form (third form)))
     (values form type)))
 
-;;; (values name element-type simple-p) for an array reference: a the cast is
-;;; answered from the cast, anything else from the variable's own ctype.
+;;; (values name element-type simple-p) for an array reference.  a the cast supplies
+;;; the type itself, anything else takes it from the variable's own ctype.
 (defun vector-array-type (form lexenv)
   (multiple-value-bind (inner spec) (vector-unwrap-the form)
     (let* ((ctype (if spec
@@ -199,7 +199,7 @@ the loop, so it may not mention the index."
          (when (equal (second form) element-type)
            (vector-match-expression (third form) env index element-type)))
         ;; the loop index itself, converted to the element type: a value that
-        ;; depends on where it is, like a gradient or a ramp table
+        ;; depends on the index, like a gradient or a ramp table
         ((and (eq (car form) 'float) (null (cddr form))
               (eq (second form) index)
               (equal element-type 'single-float))
@@ -338,7 +338,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
     (t accumulator)))
 
 ;;; the number of elements a loop clause covers: below b is b, upto b is b+1, and
-;;; (1+ (1- n)) is n, so that upto (1- n) is written as the count n - the count
+;;; (1+ (1- n)) is n, so that upto (1- n) is written as the count n.  The count
 ;;; reaches the generated guard and both loops.
 (defun vector-loop-count (bound upto)
   (cond ((not upto) bound)
@@ -359,8 +359,8 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;;
 ;;;   (loop for index [of-type type] [from 0] below|upto count do body)
 ;;;
-;;; anything else - a nonzero start, a to bound, several body forms, other clauses -
-;;; is left alone.
+;;; anything else is left alone: a nonzero start, a to bound, several body forms,
+;;; another clause.
 (defun vector-match-loop (form env)
   (when (and (consp form) (eq (car form) 'loop))
     (let ((clauses (cdr form)))
@@ -417,8 +417,8 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;;
 ;;;   (do ((index 0 (1+ index))) ((>= index count)) body)
 ;;;
-;;; Anything else - several bindings, a different step, result forms, another
-;;; end test - is left alone.
+;;; Anything else is left alone: several bindings, a different step, result forms,
+;;; another end test.
 (defun vector-match-do (form env)
   (when (and (consp form) (memq (car form) '(do do*))
              (consp (cdr form)) (consp (cddr form)))
@@ -469,7 +469,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;;
 ;;; integer addition wraps at the declared width whatever the order of the adds, so
 ;;; accumulating into lanes and adding them at the end gives the same answer.
-;;; floating point is not like that, so a float accumulator is refused.
+;;; floating point addition does not wrap, so a float accumulator is refused.
 (defun vector-match-reduction (form env)
   (when (and (consp form) (eq (car form) 'dotimes)
              (consp (cdr form)) (consp (cadr form)))
@@ -516,10 +516,10 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; the backend primitives that move and combine one vector: an alist of
 ;;; ((base element-type) . name), where base is "LOAD", "STORE", "SPLAT", "ADD",
 ;;; "SUB", "MUL" or "DIV", filled in by the backend file that defines them so that
-;;; this pass is inert on a build without them.  the names are handed over rather
-;;; than written here because this file cannot name the backend's package: a string
-;;; in the heap that is STRING= to a package name defeats string coalescing in
-;;; SAVE-LISP-AND-DIE, which tests/hide-packages.test.sh enforces.
+;;; this pass is inert on a build without them.  the backend file hands the names over
+;;; rather than this one writing them, because this file cannot name the backend's
+;;; package.  a string in the heap that is STRING= to a package name defeats string
+;;; coalescing in SAVE-LISP-AND-DIE, which tests/hide-packages.test.sh enforces.
 (defvar *vector-primitives* nil)
 
 (defun vector-primitive (base element-type)
@@ -559,10 +559,10 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
      ;; splats are computed once, before the loop, and live in an SSE register
      (cdr (assoc expression scalars :test #'equal)))))
 
-;;; an iteration reads everything it touches before writing anything, which is only
-;;; the same as the scalar loop when the destination is written at or behind
-;;; everywhere it is read: a destination written ahead of a read is read back by the
-;;; scalar loop and not by this one.
+;;; an iteration reads everything it touches before writing anything, which matches
+;;; the scalar loop only when the destination is written at or behind every place it
+;;; is read: a destination written ahead of a read is read back by the scalar loop
+;;; and not by this one.
 (defun vector-alias-safe-p (destination-offset source-offsets)
   (every (lambda (source-offset)
            (or (eql destination-offset source-offset)
@@ -587,7 +587,7 @@ guard still covers the reads."
           (remove destination (vloop-sources loop) :key #'car :test #'eq))))
 
 ;;; Whether every array a plan reads has its data inline.  A reduction has no
-;;; destination - its result is a variable - so only the sources matter.
+;;; destination, since its result is a variable, so only the sources matter.
 (defun vector-loop-all-simple-p (loop)
   (every (lambda (entry) (cddr entry)) (vloop-sources loop)))
 
@@ -712,9 +712,9 @@ guard still covers the reads."
                         ((>= ,index ,count-var))
                       (declare (type index ,index))
                       ,(vloop-body loop))))))
-;;; the guard chooses END instead of branching between two copies of the loop: when
-;;; it fails, END is 0, the packed loop does not run, and the tail - the original
-;;; loop, written once - does all the work.
+;;; the guard chooses END instead of branching between two copies of the loop.  When
+;;; it fails, END is 0, the packed loop does not run, and the tail does all the
+;;; work: it is the original loop, written once.
           `(let ((,count-var ,count))
              (let* (,@(mapcar (lambda (scalar)
                                 (case (car scalar)
@@ -820,8 +820,8 @@ guard still covers the reads."
 ;;;; missed-optimization notes
 ;;;
 ;;; the pass declines silently and the most common reason is a type declaration the
-;;; user did not write, which is the one thing they can fix, so a loop whose shape is
-;;; the one this pass rewrites is explained.
+;;; user did not write, which is the one thing they can fix, so the pass explains a
+;;; loop with a shape it would otherwise rewrite.
 
 ;;; The index, count and body of a loop in one of the shapes the pass takes, with
 ;;; no regard for types.
@@ -931,7 +931,7 @@ guard still covers the reads."
       '()))
 
 ;;; A subscript that reads before the loop variable cannot be vectorized, and the
-;;; scalar loop it stands for would fault at index 0 anyway.  Say so, because the
+;;; scalar loop it replaces would fault at index 0 anyway.  Say so, because the
 ;;; fix is a rewrite the user can do.
 (defun vector-negative-offset-reason (form index)
   (labels ((walk (form)
@@ -951,8 +951,8 @@ guard still covers the reads."
 
 ;;; What stops ARRAYS and EXPRESSION from being vectorized, in the voice of a
 ;;; compiler note?  Two things can: an array with no usable declaration, or lanes
-;;; the element type does not have - an operator without a primitive, or byte lanes
-;;; outside (safety 0).
+;;; the element type does not have, either an operator without a primitive or byte
+;;; lanes outside (safety 0).
 (defun vector-diagnose-types (arrays lexenv expression unchecked-p index)
   (let ((element-type nil)
         (unregistered '())
@@ -1012,13 +1012,13 @@ guard still covers the reads."
                    ((do do*) (vector-match-do form lexenv))
                    (t (or (vector-match-dotimes form lexenv)
                           (vector-match-reduction form lexenv)))))
-;;; a plan can still be declined while expanding - lanes that need (safety 0), a
-;;; primitive the backend does not have - which is the case worth explaining.
+;;; a plan can still be declined while expanding, over lanes that need (safety 0) or
+;;; a primitive the backend does not have, and that is the case worth explaining.
            (replacement (and plan (vector-expand-loop plan))))
       (if replacement
           replacement
           (progn (vector-note-missed-optimization form lexenv) nil)))))
 
-;;; converting the form this pass returns must not re-enter the pass, or the fallback
-;;; branch - the original loop - would be rewritten too.
+;;; converting the form this pass returns must not re-enter the pass, or the pass
+;;; would rewrite its own fallback branch, the original loop.
 (defvar *vectorize-inhibited* nil)

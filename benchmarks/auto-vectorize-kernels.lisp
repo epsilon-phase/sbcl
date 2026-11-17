@@ -2,10 +2,10 @@
 ;;;;
 ;;;; Realistic SIMD-friendly workloads for SBCL's automatic vectorizer.
 ;;;;
-;;;; Every kernel here is compiled TWICE from one body of loop text: once
-;;;; normally (the pass decides), and once with SB-C::*AUTO-VECTORIZE* bound
-;;;; to NIL.  The scalar twin is therefore the same loop text, not a
-;;;; hand-written scalar version - any measured difference is the pass.
+;;;; Every kernel here is compiled TWICE from one body of loop text, once
+;;;; normally, with the pass deciding, and once with SB-C::*AUTO-VECTORIZE*
+;;;; bound to NIL.  The scalar twin is therefore the same loop text, not a
+;;;; hand-written scalar version, so any measured difference is the pass.
 ;;;;
 ;;;; Reproduce with, from the sbcl checkout:
 ;;;;
@@ -14,10 +14,10 @@
 ;;;;
 ;;;; TIMING: best-of-N.  N = 7 samples per measurement; each sample runs the
 ;;;; kernel repeatedly until at least 120 ms of CPU time has passed, and the
-;;;; reported number is the fastest sample's per-call time.  CPU time
-;;;; (GET-INTERNAL-RUN-TIME), not wall time, because another process competes
-;;;; for the machine while these numbers are taken - even so the 8192-element
-;;;; (cache-resident) rows are small enough that interference shows in them.
+;;;; reported number is the fastest sample's per-call time.  It is CPU time
+;;;; from GET-INTERNAL-RUN-TIME, not wall time, because another process competes
+;;;; for the machine while these numbers are taken.  Even so the 8192-element
+;;;; cache-resident rows are small enough that interference shows in them.
 
 (defpackage #:auto-vectorize-kernels
   (:use #:cl)
@@ -124,8 +124,8 @@
 
 ;;;; ------------------------- the kernels ---------------------------- ;
 ;;;;
-;;;; 1. particle integration: pos += vel*dt, the canonical SIMD win in
-;;;;    games/physics.  single-float, 4-wide.
+;;;; 1. particle integration: pos += vel*dt, the standard SIMD case in
+;;;;    games and physics.  single-float, 4-wide.
 
 (define-kernel integrate-f32
     (pos vel dt n)
@@ -172,9 +172,9 @@
     (setf (aref out i) (min (aref in i) 200)))
   :packed ("pminub" "movdqu" "movdqa"))
 
-;;;; 5. PNG Sub filter.  The textbook form (aref out (- i 3)) is NOT
-;;;;    vectorizable (negative offset); what the pass takes is either an
-;;;;    offset-0 read from an already-written line...
+;;;; 5. PNG Sub filter.  The textbook form (aref out (- i 3)) is not
+;;;;    vectorizable, because the offset is negative; what the pass takes is
+;;;;    either an offset-0 read from an already-written line,
 
 (define-kernel png-sub-prev-u8
     (out in prev n)
@@ -185,7 +185,7 @@
     (setf (aref out i) (+ (aref in i) (aref prev i))))
   :packed ("paddb" "movdqu" "movdqa"))
 
-;;;; ...or a literal positive offset into the input.
+;;;; or a literal positive offset into the input.
 
 (define-kernel png-sub-offset-u8
     (out in n)
@@ -198,7 +198,7 @@
 
 ;;;; 6. integer reduction: a checksum-style exact u32 sum.
 ;;;;    Float reductions change the result, so the pass refuses them;
-;;;;    integer addition is exact, so this is fair game.
+;;;;    integer addition is exact, so the pass takes this one.
 
 (define-kernel checksum-u32
     (a n)
