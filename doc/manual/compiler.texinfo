@@ -1267,12 +1267,24 @@ The supported element types and the operations on them are
 and @code{(signed-byte 64)} and @code{(unsigned-byte 64)}, two at a time, with
 @code{+}, @code{-}, @code{logand}, @code{logior} and @code{logxor};
 @item @code{(unsigned-byte 8)} and @code{(signed-byte 8)}, sixteen at a time,
-with the same operations plus @code{min} and @code{max}.  The byte-wise minimum and maximum are
-@code{PMINUB} and @code{PMAXUB}, which SSE2 has for unsigned lanes only, so
-@code{min} and @code{max} on signed bytes stay scalar rather than use an
-instruction that would give the wrong answer.  A packed byte store truncates where the scalar store signals a type error,
-so at the default safety the two do not mean the same thing and the loop is left
-scalar.  Image processing code usually declares @code{(safety 0)} already.
+with the same operations plus @code{min} and @code{max};
+@item @code{(unsigned-byte 16)} and @code{(signed-byte 16)}, eight at a time,
+with @code{+}, @code{-}, @code{logand}, @code{logior}, @code{logxor},
+@code{min}, @code{max} and multiplication.
+@end itemize
+
+@noindent
+SSE2 has byte-wise minimum and maximum for unsigned lanes only, so the pass
+reaches the others another way rather than using an instruction that would give
+the wrong answer.  Signed words use @code{PMINSW} and @code{PMAXSW}.
+@code{min} and @code{max} on signed bytes bias both operands with
+@code{PXOR} and then use the unsigned instruction, and unsigned words use the
+saturating subtract, since @code{min(a, b)} is @code{a - max(a - b, 0)}.
+
+A packed byte store truncates where the scalar store signals a type error, so
+unless a loop is exact (below) the two do not mean the same thing at the default
+safety, and the loop is left scalar.  Image processing code usually declares
+@code{(safety 0)} already.
 @end itemize
 
 @noindent
@@ -1385,16 +1397,26 @@ turned off for a compilation with
 @end lisp
 
 @noindent
-The pass uses integer lanes only at @code{(safety 0)}: a packed lane wraps around
-where a checked store signals an error, so it leaves the loop alone when the store
-is checked.  It also leaves alone a loop whose body carries its own policy
-declaration, since that policy is not the one the loop form is compiled under.
+The pass uses integer lanes only where the packed store cannot disagree with a
+checked one.  Arithmetic wraps around where a checked store signals an error, so a
+loop that contains any is vectorized only at @code{(safety 0)}.  A loop whose value
+is a load, a broadcast or a @code{min} or @code{max} is exact: every value it can
+store fits the element type, so it is vectorized at any safety.  Clamping code
+therefore does not need a policy declaration:
+
+@lisp
+(dotimes (i n)                          ; vectorized at the default policy
+  (setf (aref out i) (max -1000 (min 1000 (aref in i)))))
+@end lisp
+
+@noindent
+The pass also leaves alone a loop whose body carries its own policy declaration,
+since that policy is not the one the loop form is compiled under.
 
 Not handled, and compiled exactly as before: float reductions, where summing the
-lanes would reorder the additions; signed-byte @code{min} and @code{max}, which need
-SSE4.1; integer division; a destination that is also written ahead of where it is
-read; loops whose bound is a computed form, and element types other than the ones
-listed above.
+lanes would reorder the additions; integer division; a destination that is also
+written ahead of where it is read; loops whose bound is a computed form, and
+element types other than the ones listed above.
 
 @node interpreter
 @cindex interpreter

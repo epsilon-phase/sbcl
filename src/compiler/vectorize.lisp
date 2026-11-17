@@ -62,9 +62,11 @@
       (logxor (and (not floats) "XOR"))
       (:negate (and floats "NEG"))
       (:index (and floats "INDEX"))
-      ;; SSE2 has byte-wise minimum and maximum for unsigned lanes only
-      (min (and (equal element-type '(unsigned-byte 8)) "MIN"))
-      (max (and (equal element-type '(unsigned-byte 8)) "MAX")))))
+      ;; minimum and maximum exist for the narrower integer lanes only, which the
+      ;; primitive table decides: pminsw is sse2, the byte and unsigned-word forms
+      ;; are reached with a bias or a saturating subtract
+      (min (and (not floats) "MIN"))
+      (max (and (not floats) "MAX")))))
 
 ;;; the element types the backend can move and compute a vector at a time, in the
 ;;; order the classifier below tries them.
@@ -148,6 +150,17 @@
         ((and (consp count) (memq (car count) '(1- 1+)))
          (and (= (length count) 2) (symbolp (second count))))
         (t nil)))
+
+;;; an integer expression whose value fits the element type whatever the inputs:
+;;; loads, broadcasts and min/max, with no arithmetic that can wrap.  Narrowing
+;;; one of these into the array cannot signal at any safety, so it does not need
+;;; (safety 0) the way integer addition and multiplication do.
+(defun vector-exact-expression-p (expression)
+  (case (car expression)
+    ((:array :scalar :const) t)
+    (:op (and (memq (second expression) '(min max))
+              (every #'vector-exact-expression-p (cddr expression))))
+    ((:negate :index) nil)))
 
 ;;; the offset of a subscript from the loop variable: (aref a i) is 0,
 ;;; (aref a (+ i 3)) and (aref a (+ 3 i)) are 3.  a variable offset can be negative
@@ -670,7 +683,8 @@ guard still covers the reads."
                                             (memq (car scalar) '(:index :stride)))
                                           scalars)))
                (or (vector-float-element-type-p element-type)
-                   (vloop-unchecked-p loop))
+                   (vloop-unchecked-p loop)
+                   (vector-exact-expression-p expression))
                (not negative-literals)
                (vector-alias-safe-p destination-offset
                                     (rest (second (first arrays)))))
@@ -979,9 +993,11 @@ guard still covers the reads."
         (unless (vector-operator-base operator element-type)
           (push (format nil "~a is not available for ~a lanes" operator element-type)
                 reasons)))
-      (unless (or (vector-float-element-type-p element-type) unchecked-p)
-        (push (format nil "~a lanes wrap where a checked loop would signal, so they are ~
-                           only used when compiled at (safety 0)"
+      (unless (or (vector-float-element-type-p element-type) unchecked-p
+                  (vector-exact-expression-p expression))
+        (push (format nil "~a lanes wrap where a checked loop would signal, so they are only ~
+                           used at (safety 0) or in a loop whose value is a load, a broadcast ~
+                           or MIN and MAX"
                       element-type)
               reasons)))
     (nreverse reasons)))

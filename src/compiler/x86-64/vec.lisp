@@ -1016,6 +1016,89 @@
     (inst pmullw arith-tmp b)
     (move result arith-tmp)))
 
+;;; minimum and maximum beyond the unsigned bytes above.  pminsw and pmaxsw are
+;;; sse2, so signed words take one instruction each.  unsigned words have no sse2
+;;; form: min(a,b) is a - max(a-b,0) and max(a,b) is a + max(b-a,0), and psubusw
+;;; is that saturating difference.  signed bytes have no sse2 form either, but
+;;; xor with #x80 maps them onto unsigned order, so the unbiased pminub does it.
+
+(defknown (%vec-min-ub16 %vec-max-ub16)
+    ((simd-pack (unsigned-byte 16)) (simd-pack (unsigned-byte 16)))
+    (simd-pack (unsigned-byte 16))
+  (flushable movable))
+
+(defknown (%vec-min-sb16 %vec-max-sb16)
+    ((simd-pack (signed-byte 16)) (simd-pack (signed-byte 16)))
+    (simd-pack (signed-byte 16))
+  (flushable movable))
+
+(defknown (%vec-min-sb8 %vec-max-sb8)
+    ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8)))
+    (simd-pack (signed-byte 8))
+  (flushable movable))
+
+(define-vop (%vec-min-ub16)
+  (:translate %vec-min-ub16)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub16 simd-pack-ub16)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub16)
+  (:generator 3
+    (inst psubusw arith-tmp b)
+    (move result a)
+    (inst psubw result arith-tmp)))
+
+(define-vop (%vec-max-ub16)
+  (:translate %vec-max-ub16)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub16 simd-pack-ub16)
+  (:temporary (:sc int-sse-reg) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub16)
+  (:generator 3
+    ;; the temp is live across result's write, so it cannot share a register with
+    ;; it, and it is written before a is read into result, so it cannot share a's
+    (move arith-tmp b)
+    (inst psubusw arith-tmp a)
+    (move result a)
+    (inst paddw result arith-tmp)))
+
+(macrolet ((signed-word-min-max (operation instruction)
+             `(define-vop (,(intern (format nil "%VEC-~a-SB16" operation)))
+                (:translate ,(intern (format nil "%VEC-~a-SB16" operation)))
+                (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+                (:arg-types simd-pack-sb16 simd-pack-sb16)
+                (:temporary (:sc int-sse-reg) arith-tmp)
+                (:results (result :scs (int-sse-reg)))
+                (:result-types simd-pack-sb16)
+                ;; b may be allocated to result's register, so it is read before
+                ;; result is written: compute into the temp and move to result last
+                (:generator 2
+                  (move arith-tmp a)
+                  (inst ,instruction arith-tmp b)
+                  (move result arith-tmp)))))
+  (signed-word-min-max "MIN" pminsw)
+  (signed-word-min-max "MAX" pmaxsw))
+
+(macrolet ((signed-byte-min-max (operation instruction)
+             `(define-vop (,(intern (format nil "%VEC-~a-SB8" operation)))
+                (:translate ,(intern (format nil "%VEC-~a-SB8" operation)))
+                (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+                (:arg-types simd-pack-sb8 simd-pack-sb8)
+                (:temporary (:sc int-sse-reg) biased-b)
+                (:results (result :scs (int-sse-reg)))
+                (:result-types simd-pack-sb8)
+                (:generator 4
+                  (move biased-b b)
+                  (inst pxor biased-b (register-inline-constant :oword #x80808080808080808080808080808080))
+                  (move result a)
+                  (inst pxor result (register-inline-constant :oword #x80808080808080808080808080808080))
+                  (inst ,instruction result biased-b)
+                  (inst pxor result (register-inline-constant :oword #x80808080808080808080808080808080))))))
+  (signed-byte-min-max "MIN" pminub)
+  (signed-byte-min-max "MAX" pmaxub))
+
 ;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1062,6 +1145,12 @@
     (publish "OR" (signed-byte 8) %vec-or-sb8)
     (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
     (publish "MIN" (unsigned-byte 8) %vec-min-ub8)
+    (publish "MIN" (unsigned-byte 16) %vec-min-ub16)
+    (publish "MAX" (unsigned-byte 16) %vec-max-ub16)
+    (publish "MIN" (signed-byte 16) %vec-min-sb16)
+    (publish "MAX" (signed-byte 16) %vec-max-sb16)
+    (publish "MIN" (signed-byte 8) %vec-min-sb8)
+    (publish "MAX" (signed-byte 8) %vec-max-sb8)
     (publish "MAX" (unsigned-byte 8) %vec-max-ub8)
     (publish "XOR" (signed-byte 8) %vec-xor-sb8)
     (publish "LOAD" (unsigned-byte 16) %vec-load-ub16)
