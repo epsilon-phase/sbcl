@@ -1392,10 +1392,21 @@ a writer with a fixed color type ends up with."
             () "byte minimum is not packed")
     (assert (search "pmaxub" (disassembly #'vectorize-u8-max-pair))
             () "byte maximum is not packed")
-    ;; signed bytes have no SSE2 instruction for this, so they stay scalar
-    (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-s8-min-pair)))
-                    '("pminub" "pmaxub"))
-            () "signed byte minimum was packed with an unsigned instruction")))
+    ;; signed bytes have no pminsb in SSE2, but they are packed all the same: the
+    ;; lanes are biased onto unsigned order, min'd with pminub, and biased back, so
+    ;; the result has to hold for negatives, where unsigned order says otherwise
+    (assert (search "pminub" (disassembly #'vectorize-s8-min-pair))
+            () "signed byte minimum is not packed")
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(signed-byte 8) '(-128 -5 -1 0 3 127) n)
+          for b = (vectorize-integer-array '(signed-byte 8) '(3 -6 1 -1 -128 0) n 2)
+          for c = (make-array n :element-type '(signed-byte 8) :initial-element 0)
+          do (vectorize-s8-min-pair a b c n)
+             (dotimes (i n)
+               (let ((want (min (aref a i) (aref b i))))
+                 (unless (= (aref c i) want)
+                   (error "~@<s8 min: element ~D of ~D is ~S, expected ~S~:@>"
+                          i n (aref c i) want)))))))
 
 ;;;; (INCF place delta) and (DECF place delta) are stores too.
 
@@ -2016,3 +2027,84 @@ a writer with a fixed color type ends up with."
                        *vectorize-count-calls* n)
                (loop for i below n
                      do (assert (= (aref c i) 2.0) () "element ~D of ~D is ~S" i n (aref c i)))))))
+
+;;;; Minimum and maximum on the narrower integer lanes, and the rule that lets an
+;;;; exact integer expression vectorize without (safety 0).
+
+(defun vectorize-s16-clamp (a c n)
+  "Clamping 16-bit audio, at the default safety: min and max keep every value in
+the lane, so nothing here can signal and the loop needs no (safety 0)."
+  (declare (type (simple-array (signed-byte 16) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (max -1000 (min 1000 (aref a i)))))
+  c)
+
+(defun vectorize-u16-clamp (a c n)
+  (declare (type (simple-array (unsigned-byte 16) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (max 1000 (aref a i))))
+  c)
+
+(defun vectorize-s8-clamp (a c n)
+  (declare (type (simple-array (signed-byte 8) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (min 100 (aref a i))))
+  c)
+
+(with-test (:name :vectorize-narrow-integer-clamp :skipped-on (not :x86-64))
+  ;; signed words, clamped by literal bounds on both sides
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 16) '(-32768 -1001 -3 0 1001 32767) n)
+        for c = (make-array n :element-type '(signed-byte 16) :initial-element 0)
+        do (vectorize-s16-clamp a c n)
+           (dotimes (i n)
+             (let ((want (max -1000 (min 1000 (aref a i)))))
+               (unless (= (aref c i) want)
+                 (error "~@<s16 clamp: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref c i) want)))))
+  ;; unsigned words, clamped only from below
+  (loop for n in *vectorize-lengths*
+        for b = (vectorize-integer-array '(unsigned-byte 16) '(0 1 1000 65535 42) n)
+        for d = (make-array n :element-type '(unsigned-byte 16) :initial-element 0)
+        do (vectorize-u16-clamp b d n)
+           (dotimes (i n)
+             (let ((want (max 1000 (aref b i))))
+               (unless (= (aref d i) want)
+                 (error "~@<u16 clamp: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref d i) want)))))
+  ;; signed bytes, clamped from above
+  (loop for n in *vectorize-lengths*
+        for e = (vectorize-integer-array '(signed-byte 8) '(-128 -1 0 1 100 127) n)
+        for f = (make-array n :element-type '(signed-byte 8) :initial-element 0)
+        do (vectorize-s8-clamp e f n)
+           (dotimes (i n)
+             (let ((want (min 100 (aref e i))))
+               (unless (= (aref f i) want)
+                 (error "~@<s8 clamp: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref f i) want)))))
+  ;; and the loops are packed, without any (safety 0) in sight
+  (flet ((mnemonics (function)
+           (let ((text (string-downcase (with-output-to-string (stream)
+                                          (disassemble function :stream stream)))))
+             (loop for mnemonic in '("pminsw" "pmaxsw" "psubusw" "pminub" "pmaxub" "paddw" "psubw")
+                   when (search mnemonic text) collect mnemonic))))
+    (assert (member "pminsw" (mnemonics #'vectorize-s16-clamp) :test #'string=) ()
+            "s16 clamp is not packed: ~a" (mnemonics #'vectorize-s16-clamp))
+    (assert (some (lambda (m) (member m '("psubusw" "paddw" "psubw") :test #'string=))
+                  (mnemonics #'vectorize-u16-clamp)) ()
+            "u16 clamp is not packed: ~a" (mnemonics #'vectorize-u16-clamp))
+    (assert (member "pminub" (mnemonics #'vectorize-s8-clamp) :test #'string=) ()
+            "s8 clamp is not packed: ~a" (mnemonics #'vectorize-s8-clamp))))
+
+(with-test (:name :vectorize-inexact-integer-declined :skipped-on (not :x86-64))
+  ;; arithmetic can wrap, so at the default safety this loop still declines, and
+  ;; the note names the rule that would allow it
+  (let ((notes (vectorize-notes-for
+                '(lambda (a b c n)
+                   (declare (type (simple-array (unsigned-byte 16) (*)) a b c)
+                            (type vectorize-index n) (optimize speed))
+                   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+    (assert (notany (lambda (line) (search "vectorized loop" line :test #'char-equal)) notes)
+            () "an inexact u16 loop was vectorized at default safety: ~A" notes)
+    (assert (some (lambda (line) (search "safety" line :test #'char-equal)) notes)
+            () "the note does not name the (safety 0) rule: ~A" notes)))
