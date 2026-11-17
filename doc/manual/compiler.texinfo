@@ -1244,12 +1244,12 @@ instructions instead of scalar ones, so the loop
 becomes one @code{movups}-@code{addps}-@code{movups} sequence per four elements
 followed by a scalar loop over the remaining ones.
 
-Vectorization is driven by declarations rather than by type inference: an array
-takes part only when the code declares it to be a simple array of a supported
-element type, either in the declarations of the enclosing function or by
-wrapping the reference in a @code{the}.  That is deliberate, because the rewrite
-loads and stores several elements without a per-element bounds check, and it is
-the declaration which authorizes that.
+The pass takes its types from declarations rather than from type inference: an
+array takes part only when the code declares it to be a simple array of a
+supported element type, either in the declarations of the enclosing function or
+by wrapping the reference in a @code{the}.  That is deliberate, because the
+rewrite loads and stores several elements without a per-element bounds check,
+and the declaration is what allows that.
 
 @lisp
 (dotimes (i n)                          ; vectorized, no declarations needed
@@ -1325,8 +1325,9 @@ the accumulator is a fixed-width integer:
 @end lisp
 
 @noindent
-A value that depends on where it is — a gradient, a ramp table, gamma correction —
-is vectorized too, when the loop index is converted to the element type:
+A value that depends on the index, such as a gradient, a ramp table or gamma
+correction, is vectorized too, when the loop index is converted to the element
+type:
 
 @lisp
 (dotimes (i n) (setf (aref c i) (* (float i) 0.01)))
@@ -1342,20 +1343,21 @@ the data stays in cache it is worth 2.7 to 4 times.
 
 @noindent
 Integer lanes wrap, where a checked scalar loop signals a type error on a value
-that does not fit the destination's element type.  They are therefore only used
-when the code is compiled at @code{(safety 0)}, the same rule as the byte lanes;
-the pass says so in a note when it declines an integer loop for that reason.  Float
-lanes are not affected, since any float fits the element type it is stored in.
+that does not fit the destination's element type.  The pass therefore uses them
+only when the code is compiled at @code{(safety 0)}, the same rule as the byte
+lanes, and it says so in a note when it declines an integer loop for that
+reason.  Float lanes are not affected, since any float fits the element type it
+is stored in.
 
 @noindent
-Integer addition does not care about the order of the additions, so summing lanes
+Adding integers does not depend on the order of the additions, so summing lanes
 and folding them into the variable at the end gives the same answer whenever the
 total fits in the accumulator's declared width.  The packed sum is computed modulo
-that width; a loop whose total overflows it is relying on undefined behaviour
-anyway - at @code{(safety 0)} such a loop does not truncate either, it silently
-produces a value outside the declared type - so the two agree only up to
-congruence there, and the note the pass emits for a reduction says so.  Only
-integer accumulators are vectorized: adding @code{single-float} or
+that width.  A loop whose total overflows it is relying on undefined behaviour
+anyway: at @code{(safety 0)} such a loop does not truncate either, it produces a
+value outside the declared type without signalling anything.  So the two agree
+only up to congruence there, and the note the pass emits for a reduction says so.
+Only integer accumulators are vectorized: adding @code{single-float} or
 @code{double-float} in a different order gives a different result, and this pass
 promises the same values as the loop it rewrites.
 
@@ -1383,10 +1385,10 @@ turned off for a compilation with
 @end lisp
 
 @noindent
-Integer lanes are used only at @code{(safety 0)}: a packed lane wraps around where
-a checked store signals an error, so the loop is left alone when the store is
-checked.  A loop whose body carries its own policy declaration is also left alone,
-since that policy is not the one the loop form is compiled under.
+The pass uses integer lanes only at @code{(safety 0)}: a packed lane wraps around
+where a checked store signals an error, so it leaves the loop alone when the store
+is checked.  It also leaves alone a loop whose body carries its own policy
+declaration, since that policy is not the one the loop form is compiled under.
 
 Not handled, and compiled exactly as before: float reductions, where summing the
 lanes would reorder the additions; signed-byte @code{min} and @code{max}, which need
