@@ -29,19 +29,25 @@
 ;;; when true, a vectorized loop notes the element type and the number of lanes
 (defvar *auto-vectorize-notes* t)
 
+;;; the width the expansion in progress is emitting for, 16 or 32 bytes
+(defvar *vector-lane-bytes* 16)
+
 ;;;; decoding types
 
 (defun vector-float-element-type-p (element-type)
   (memq element-type '(single-float double-float)))
 
-;;; how many elements the backend handles at a time: 128 bits worth
-(defun vector-width (element-type)
+;;; how many bytes one element takes
+(defun vector-element-size (element-type)
   (cond ((eq element-type 'single-float) 4)
-        ((eq element-type 'double-float) 2)
-        ((eql (second element-type) 8) 16)
-        ((eql (second element-type) 16) 8)
-        ((eql (second element-type) 32) 4)
-        (t 2)))
+        ((eq element-type 'double-float) 8)
+        (t (ceiling (second element-type) 8))))
+
+;;; how many elements the backend handles at a time.  a backend that published
+;;; 256-bit primitives is asked for those first, so the width is what the
+;;; primitives the loop needs came to, not a property of the element type.
+(defun vector-width (element-type &optional (bytes *vector-lane-bytes*))
+  (/ bytes (vector-element-size element-type)))
 
 ;;; integer lanes are only equivalent to the scalar loop at (safety 0), where the
 ;;; scalar store wraps too; the pass reads it from the lexenv when it matches a loop
@@ -336,6 +342,11 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; the primitive base that widens SOURCE-TYPE into TARGET-TYPE, or NIL when the
 ;;; backend has no such widen.  A byte or 16-bit array read by a float loop is the
 ;;; common case: an image buffer or 16-bit audio consumed as floats.
+(defun vector-pack-type (element-type)
+  (if (eql *vector-lane-bytes* 32)
+      `(simd-pack-256 ,element-type)
+      `(simd-pack ,element-type)))
+
 (defun vector-widen-base (source-type target-type)
   ;; a single-float source read into double lanes is a precision increase with no
   ;; rounding and no range to prove, so it needs nothing but the convert
@@ -563,8 +574,43 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; coalescing in SAVE-LISP-AND-DIE, which tests/hide-packages.test.sh enforces.
 (defvar *vector-primitives* nil)
 
-(defun vector-primitive (base element-type)
-  (cdr (assoc (list base element-type) *vector-primitives* :test #'equal)))
+;;; the 256-bit primitives, published separately and only by a backend whose
+;;; build enables them.  a 256-bit pack is its own Lisp type, so the functions
+;;; cannot be the same names as the 128-bit ones and are indexed by width.
+(defvar *vector-primitives-256* nil)
+
+(defun vector-primitive (base element-type &optional (bytes *vector-lane-bytes*))
+  (cdr (assoc (list base element-type)
+              (if (eql bytes 32) *vector-primitives-256* *vector-primitives*)
+              :test #'equal)))
+
+;;; true when this element type has both a 256-bit load and store, which is what
+;;; makes a wider loop worth attempting at all.
+(defun vector-wide-available-p (element-type)
+  (and *vector-primitives-256*
+       (vector-primitive "LOAD" element-type 32)
+       (vector-primitive "STORE" element-type 32)
+       t))
+
+;;; every primitive the expression needs at the current width, so that the wider
+;;; attempt declines before emitting rather than halfway through.  the inner
+;;; read of a widen is not a load: the widen vop reads it itself.
+(defun vector-expression-primitives (expression element-type &optional (accumulator '()))
+  (flet ((add (base) (adjoin base accumulator :test #'string=)))
+    (case (car expression)
+      (:array (add "LOAD"))
+      (:negate (vector-expression-primitives (second expression) element-type (add "NEG")))
+      (:widen (let ((base (vector-widen-base (third expression) element-type)))
+                (if base (add base) (add "UNEXPRESSIBLE"))))
+      (:op (let ((base (vector-operator-base (second expression) element-type)))
+             (if base
+                 (dolist (subexpression (cddr expression) (add base))
+                   (setf accumulator
+                         (vector-expression-primitives subexpression element-type
+                                                       accumulator)))
+                 (add "UNEXPRESSIBLE"))))
+      (:index (add "STRIDE"))
+      (t accumulator))))
 
 ;;; The operators an expression tree uses, in order of first use.
 (defun vector-collect-operators (expression &optional (accumulator '()))
@@ -668,9 +714,14 @@ guard still covers the reads."
 ;;; express it (which is the normal answer on a build whose backend has not
 ;;; published its primitives, and for byte lanes outside SAFETY 0).
 (defun vector-expand-loop (loop)
-  (if (vloop-accumulator loop)
-      (vector-expand-reduction loop)
-      (vector-expand-elementwise-loop loop)))
+  (let ((expander (if (vloop-accumulator loop)
+                      #'vector-expand-reduction
+                      #'vector-expand-elementwise-loop)))
+    (flet ((attempt (bytes)
+             (let ((*vector-lane-bytes* bytes))
+               (funcall expander loop))))
+      (or (and (vector-wide-available-p (vloop-element-type loop)) (attempt 32))
+          (attempt 16)))))
 
 (defun vector-expand-elementwise-loop (loop)
   (let* ((element-type (vloop-element-type loop))
@@ -692,7 +743,7 @@ guard still covers the reads."
           (loop for entry in arrays
                 thereis (some (lambda (offset) (and (typep offset 'integer) (minusp offset)))
                               (second entry))))
-         (pack-type `(simd-pack ,element-type))
+         (pack-type (vector-pack-type element-type))
          (load (vector-primitive "LOAD" element-type))
          (store (vector-primitive "STORE" element-type))
          (splat (and scalars (vector-primitive "SPLAT" element-type)))
@@ -711,6 +762,10 @@ guard still covers the reads."
       (setf scalars (acons :stride (make-symbol "STRIDE") scalars)))
     (when (and load store
                (every #'identity arithmetic)
+;;; a widen or an operator the wider width has no instruction for has to be
+;;; refused here, before anything is emitted, so that the 128-bit attempt runs
+               (every (lambda (base) (vector-primitive base element-type))
+                      (vector-expression-primitives expression element-type))
                (if indexed (and ramp stride) t)
                (or splat (null (remove-if (lambda (scalar)
                                             (memq (car scalar) '(:index :stride)))
@@ -793,7 +848,7 @@ guard still covers the reads."
          (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
                           (vector-collect-scalars expression)))
          (arrays (vloop-sources loop))
-         (pack-type `(simd-pack ,element-type))
+         (pack-type (vector-pack-type element-type))
          (accumulating (make-symbol "ACCUM"))
          (lanes (make-symbol "LANES"))
          (end (make-symbol "VECTOR-END"))
@@ -807,6 +862,8 @@ guard still covers the reads."
                                                  element-type))
                              (vector-collect-operators expression))))
     (when (and load store splat add (every #'identity arithmetic)
+               (every (lambda (base) (vector-primitive base element-type))
+                      (vector-expression-primitives expression element-type))
                (not (memq :index (vector-collect-operators expression)))
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop))

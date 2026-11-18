@@ -1445,6 +1445,49 @@ therefore does not need a policy declaration:
 The pass also leaves alone a loop whose body carries its own policy declaration,
 since that policy is not the one the loop form is compiled under.
 
+@subsection 256-bit lanes
+
+A build whose backend enables @code{:AVX2} publishes 256-bit primitives as well
+as 128-bit ones, and the pass then takes twice as many elements per iteration for
+every element type whose operations it has: eight @code{single-float}, four
+@code{double-float}, and so on.  Which width a loop gets is decided per loop, from
+the primitives the loop actually needs.  A loop that needs one the wider width
+does not have, such as the narrowing reads described above, stays at 128 bits
+rather than mixing the two, because a 256-bit pack is a different type from a
+128-bit one and the emitted form has to be one or the other.
+
+The subfeature is not part of the default build, so no code is generated for it
+unless the backend is configured with it:
+
+@lisp
+;; customize-backend-subfeatures.lisp, read by the build
+(lambda (features) (declare (ignore features)) '(:avx2))
+@end lisp
+
+@noindent
+Code built that way requires a processor with AVX2, which every x86-64 processor
+since 2013 has.
+
+Twice the lanes is worth less than twice the speed, because an elementwise loop
+over three arrays is limited by how fast it can read and write them.  Measured on
+three arrays of 8192 elements, small enough to stay in cache, against the same
+loops compiled to 128-bit loops:
+
+@itemize
+@item @code{single-float} addition 55.6 to 64.0 GB/s, multiplication 58.8 to 64.0;
+@item @code{double-float} addition 58.2 to 67.0 GB/s, multiplication 58.4 to 67.2;
+@item @code{(unsigned-byte 32)} addition 58.4 to 66.7 GB/s;
+@item @code{(unsigned-byte 64)} addition 59.0 to 70.2 GB/s.
+@end itemize
+
+@noindent
+Streaming from memory the two widths are within noise of each other, as the
+bandwidth limit says they must be, and the results are noisier than the
+cache-resident ones: the same loop measured three times can differ by a factor of
+two, which is the cost of a 256-bit access that crosses a cache line.  The wider
+lanes are therefore worth having for loops that fit in cache and not otherwise,
+and they are off unless the build asks for them.
+
 Not handled, and compiled exactly as before: float reductions, where summing the
 lanes would reorder the additions; integer division; a destination that is also
 written ahead of where it is read; loops whose bound is a computed form, and
