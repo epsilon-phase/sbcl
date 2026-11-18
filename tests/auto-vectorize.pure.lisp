@@ -736,7 +736,10 @@ OPERATION applied to the same numbers, which involves no array loop."
     (dolist (case cases)
       (let ((text (string-downcase (with-output-to-string (stream)
                                      (disassemble (first case) :stream stream)))))
-        (assert (search "pshufd" text)
+        ;; the 128-bit splats shuffle a single lane into place; the 256-bit
+        ;; ones broadcast it with one instruction
+        (assert (some (lambda (mnemonic) (search mnemonic text))
+                      '("pshufd" "pbroadcast" "punpcklqdq"))
                 () "~A was not vectorized:~%~A" (first case) text)))))
 
 ;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
@@ -2326,6 +2329,74 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
 
 ;;; With SSE4.1 the four-lane widens are one narrowing load each; without it they
 ;;; are the unpack sequence.  Both must be present in the code that ran.
+;;;; 256-bit lanes.
+;;;;
+;;;; Which width a loop takes is a property of the build, not of the program:
+;;;; a build that enables :AVX2 publishes 256-bit primitives, the pass asks for
+;;;; those first, and the same source then runs twice as many lanes.  Both
+;;;; builds have to compute the same answer, so the value tests above run on
+;;;; both; what these assert is the width that was actually chosen.
+
+(defun vectorize-avx2-p ()
+  (and (member :avx2 sb-c:*backend-subfeatures*) t))
+
+(defun vectorize-disassembly-text (function)
+  (string-downcase
+   (with-output-to-string (stream) (disassemble function :stream stream))))
+
+(defun vectorize-wide-p (function)
+  "True when FUNCTION's disassembly uses a 256-bit register."
+  (search "ymm" (vectorize-disassembly-text function)))
+
+(defun vectorize-avx2-add-loop (element-type)
+  (compile nil `(lambda (a b c n)
+                  (declare (type (simple-array ,element-type (*)) a b c)
+                           (type vectorize-index n)
+                           (optimize speed))
+                  (dotimes (i n)
+                    (setf (aref c i) (+ (aref a i) (aref b i)))))))
+
+(test-util:with-test (:name :vectorize-256-bit-lanes :skipped-on (not :x86-64))
+  ;; float arithmetic and integer bitwise operations are exact at any safety, so
+  ;; these loops vectorize whatever the policy is, and the only question left is
+  ;; which width the build gives them.
+  (flet ((add-loop (element-type)
+           (compile nil `(lambda (a b c n)
+                           (declare (type (simple-array ,element-type (*)) a b c)
+                                    (type vectorize-index n)
+                                    (optimize speed))
+                           (dotimes (i n)
+                             (setf (aref c i) (+ (aref a i) (aref b i)))))))
+         (and-loop (element-type)
+           (compile nil `(lambda (a b c n)
+                           (declare (type (simple-array ,element-type (*)) a b c)
+                                    (type vectorize-index n)
+                                    (optimize speed))
+                           (dotimes (i n)
+                             (setf (aref c i) (logand (aref a i) (aref b i))))))))
+    (dolist (function (list (add-loop 'single-float) (add-loop 'double-float)
+                            (and-loop '(unsigned-byte 8)) (and-loop '(unsigned-byte 64))))
+      (let ((text (vectorize-disassembly-text function))
+            (wide (vectorize-wide-p function)))
+        (if (vectorize-avx2-p)
+            (assert wide () "loop did not take 256-bit lanes on an AVX2 build: ~A" text)
+            (assert (not wide) () "loop took 256-bit lanes without AVX2: ~A" text))))))
+
+;;; A widen has no 256-bit sequence yet, so a loop that reads narrow elements
+;;; into float lanes has to fall back to 128 bits rather than mix the two
+;;; widths, which would be a type error in the emitted form.  The fallback is
+;;; what makes it worth asserting that the values are still right.
+(test-util:with-test (:name :vectorize-256-bit-widen-falls-back :skipped-on (not :x86-64))
+  (assert (not (vectorize-wide-p #'vectorize-u8-to-single)) ()
+          "a widening loop took 256-bit lanes: ~A"
+          (vectorize-disassembly-text #'vectorize-u8-to-single))
+  (let ((values '(10 20 30 40 50 60 70 80 90 100)))
+    (let ((a (make-array 10 :element-type '(unsigned-byte 8) :initial-contents values))
+          (c (make-array 10 :element-type 'single-float :initial-element -1.0f0)))
+      (vectorize-u8-to-single a c 10)
+      (assert (equalp c (coerce (mapcar (lambda (x) (* 2.0 x)) values) 'vector))
+              () "widened values: ~A" c))))
+
 (test-util:with-test (:name :vectorize-widen-instruction-set :skipped-on (not :x86-64))
   (flet ((mnemonics (function)
            (let ((text (string-downcase (with-output-to-string (stream)

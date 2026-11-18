@@ -411,6 +411,7 @@
  #+sb-simd-pack-256 ("src/compiler/{arch}/simd-pack-256")
  #+sb-simd-pack-512 ("src/compiler/{arch}/simd-pack-512")
 #+(and x86-64 sb-simd-pack) ("src/compiler/{arch}/vec")
+#+(and x86-64 sb-simd-pack-256) ("src/compiler/{arch}/vec-256")
  ("src/compiler/{arch}/char")
  ("src/compiler/{arch}/system")
  ("src/compiler/{arch}/memory")
