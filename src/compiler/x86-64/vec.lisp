@@ -1084,6 +1084,72 @@
   (signed-byte-min-max "MIN" pminub)
   (signed-byte-min-max "MAX" pmaxub))
 
+;;;; reading narrow integers into float lanes: a byte image or 16-bit audio widened
+;;;; to the floats a float loop works in.
+;;;
+;;; each of these reads exactly the number of source elements one float iteration
+;;; consumes (four for singles, two for doubles), so the length guard the pass
+;;; already emits for the float loop covers the read.
+;;;
+;;; the widen is movd, then unpacks that spread each element over a dword, a shift
+;;; that keeps the element and drops the copies (logical for an unsigned source,
+;;; arithmetic for a signed one), then the integer to float convert.  a byte source
+;;; needs both unpacks, a 16-bit source only the word one: interleaving its bytes
+;;; first would scramble the value before the shift.
+;;;
+;;; the DEFKNOWN is what makes the translate name known, and it takes Lisp type
+;;; specifiers where the vop takes primitive type names, so the element type is
+;;; passed twice.
+
+(macrolet ((widen-vop (name array-ptype array-specifier byte-p element-size result-sc
+                       result-ptype result-specifier depth shift convert)
+             `(progn
+                (defknown ,name (,array-specifier index) ,result-specifier
+                  (flushable movable))
+                (define-vop (,name)
+                  (:translate ,name)
+                  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+                  (:arg-types ,array-ptype tagged-num)
+                  (:temporary (:sc any-reg) byte-index)
+                  (:results (result :scs (,result-sc)))
+                  (:result-types ,result-ptype)
+                  (:generator 6
+                    (move byte-index index)
+                    (inst shr byte-index n-fixnum-tag-bits)
+                    ;; byte-index has been untagged, so the scale is the source
+                    ;; element size in bytes, not the fixnum tag size
+                    (inst movd result
+                          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                              vector byte-index ,element-size))
+                    ,@(when byte-p `((inst punpcklbw result result)))
+                    (inst punpcklwd result result)
+                    (inst ,shift result ,depth)
+                    (inst ,convert result result))))))
+  (widen-vop %vec-widen-ub8-single simple-array-unsigned-byte-8
+    (simple-array (unsigned-byte 8) (*)) t 1 single-sse-reg
+        simd-pack-single (simd-pack single-float) 24 psrld cvtdq2ps)
+  (widen-vop %vec-widen-ub8-double simple-array-unsigned-byte-8
+    (simple-array (unsigned-byte 8) (*)) t 1 double-sse-reg
+        simd-pack-double (simd-pack double-float) 24 psrld cvtdq2pd)
+  (widen-vop %vec-widen-sb8-single simple-array-signed-byte-8
+    (simple-array (signed-byte 8) (*)) t 1 single-sse-reg
+        simd-pack-single (simd-pack single-float) 24 psrad cvtdq2ps)
+  (widen-vop %vec-widen-sb8-double simple-array-signed-byte-8
+    (simple-array (signed-byte 8) (*)) t 1 double-sse-reg
+        simd-pack-double (simd-pack double-float) 24 psrad cvtdq2pd)
+  (widen-vop %vec-widen-ub16-single simple-array-unsigned-byte-16
+    (simple-array (unsigned-byte 16) (*)) nil 2 single-sse-reg
+        simd-pack-single (simd-pack single-float) 16 psrld cvtdq2ps)
+  (widen-vop %vec-widen-ub16-double simple-array-unsigned-byte-16
+    (simple-array (unsigned-byte 16) (*)) nil 2 double-sse-reg
+        simd-pack-double (simd-pack double-float) 16 psrld cvtdq2pd)
+  (widen-vop %vec-widen-sb16-single simple-array-signed-byte-16
+    (simple-array (signed-byte 16) (*)) nil 2 single-sse-reg
+        simd-pack-single (simd-pack single-float) 16 psrad cvtdq2ps)
+  (widen-vop %vec-widen-sb16-double simple-array-signed-byte-16
+    (simple-array (signed-byte 16) (*)) nil 2 double-sse-reg
+        simd-pack-double (simd-pack double-float) 16 psrad cvtdq2pd))
+
 ;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1129,6 +1195,14 @@
     (publish "OR" (unsigned-byte 8) %vec-or-ub8)
     (publish "OR" (signed-byte 8) %vec-or-sb8)
     (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
+    (publish "WIDEN-UB8" single-float %vec-widen-ub8-single)
+    (publish "WIDEN-UB8" double-float %vec-widen-ub8-double)
+    (publish "WIDEN-SB8" single-float %vec-widen-sb8-single)
+    (publish "WIDEN-SB8" double-float %vec-widen-sb8-double)
+    (publish "WIDEN-UB16" single-float %vec-widen-ub16-single)
+    (publish "WIDEN-UB16" double-float %vec-widen-ub16-double)
+    (publish "WIDEN-SB16" single-float %vec-widen-sb16-single)
+    (publish "WIDEN-SB16" double-float %vec-widen-sb16-double)
     (publish "MIN" (unsigned-byte 8) %vec-min-ub8)
     (publish "MIN" (unsigned-byte 16) %vec-min-ub16)
     (publish "MAX" (unsigned-byte 16) %vec-max-ub16)

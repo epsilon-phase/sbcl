@@ -226,12 +226,20 @@ the loop, so it may not mention the index."
         ((eq (car form) 'aref)
          (destructuring-bind (array . subscripts) (cdr form)
            (when (null (cdr subscripts))
-              (multiple-value-bind (offset literal-p)
+             (multiple-value-bind (offset literal-p)
                  (vector-subscript-offset (car subscripts) index)
                (when offset
                  (multiple-value-bind (name type simple-p) (vector-array-type array env)
-                   (when (equal type element-type)
-                     (list :array name offset simple-p literal-p))))))))
+                   (cond ((equal type element-type)
+                          (list :array name offset simple-p literal-p))
+                         ;; a narrower integer source read into a float lane, which
+                         ;; only the simple-array widen vops handle
+                         ((and simple-p
+                               (vector-widen-base type element-type)
+                               (vector-primitive (vector-widen-base type element-type)
+                                                 element-type))
+                          (list :widen (list :array name offset simple-p literal-p)
+                                type)))))))))
 ;;; (- x) on a float flips the sign bit, which is not (- 0 x): the two disagree on
 ;;; zeroes, so floats get their own packed negation and integers subtract from zero.
         ((and (eq (car form) '-) (null (cdr (cdr form))))
@@ -325,6 +333,19 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 
 ;;; the arrays read by an expression tree, as an alist of name to (offsets . simple-p)
 ;;; in order of first use: the guard has to cover every offset an array is read at.
+;;; the primitive base that widens SOURCE-TYPE into TARGET-TYPE, or NIL when the
+;;; backend has no such widen.  A byte or 16-bit array read by a float loop is the
+;;; common case: an image buffer or 16-bit audio consumed as floats.
+(defun vector-widen-base (source-type target-type)
+  (when (and (vector-float-element-type-p target-type)
+             (member source-type
+                     '((unsigned-byte 8) (signed-byte 8)
+                       (unsigned-byte 16) (signed-byte 16))
+                     :test #'equal))
+    (format nil "WIDEN-~a~a"
+            (if (eq (car source-type) 'signed-byte) "SB" "UB")
+            (second source-type))))
+
 (defun vector-collect-arrays (expression &optional (accumulator '()))
   (ecase (car expression)
     (:array (let* ((name (second expression))
@@ -337,6 +358,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
                                       (cons (list offset) (fourth expression))))))))
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-arrays subexpression accumulator))))
+    (:widen (vector-collect-arrays (second expression) accumulator))
     (:negate (vector-collect-arrays (second expression) accumulator))
     ((:scalar :const :index) accumulator)))
 
@@ -346,6 +368,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
     (:array accumulator)
     (:op (dolist (subexpression (cddr expression) accumulator)
            (setf accumulator (vector-collect-scalars subexpression accumulator))))
+    (:widen (vector-collect-scalars (second expression) accumulator))
     (:negate (vector-collect-scalars (second expression) accumulator))
     (:index accumulator)
     ((:scalar :const) (adjoin expression accumulator :test #'equal))
@@ -562,6 +585,11 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
                    (reference (or (cadr (assoc name data-references)) name)))
               `(,(vector-primitive "LOAD" element-type) ,reference
                 ,(vector-subscript name offset index data-references))))
+    (:widen (let ((inner (second expression))
+                  (source-type (third expression)))
+              `(,(vector-primitive (vector-widen-base source-type element-type) element-type)
+                ,(or (cadr (assoc (second inner) data-references)) (second inner))
+                ,(vector-subscript (second inner) (third inner) index data-references))))
     (:op (let ((operator (second expression)))
            (let ((name (vector-primitive (vector-operator-base operator element-type) element-type)))
              (reduce (lambda (left right) `(,name ,left ,right))
