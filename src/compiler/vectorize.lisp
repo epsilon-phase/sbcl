@@ -337,14 +337,18 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; backend has no such widen.  A byte or 16-bit array read by a float loop is the
 ;;; common case: an image buffer or 16-bit audio consumed as floats.
 (defun vector-widen-base (source-type target-type)
-  (when (and (vector-float-element-type-p target-type)
-             (member source-type
-                     '((unsigned-byte 8) (signed-byte 8)
-                       (unsigned-byte 16) (signed-byte 16))
-                     :test #'equal))
-    (format nil "WIDEN-~a~a"
-            (if (eq (car source-type) 'signed-byte) "SB" "UB")
-            (second source-type))))
+  ;; a single-float source read into double lanes is a precision increase with no
+  ;; rounding and no range to prove, so it needs nothing but the convert
+  (cond ((and (eq source-type 'single-float) (eq target-type 'double-float))
+         "WIDEN-SINGLE")
+        ((and (vector-float-element-type-p target-type)
+              (member source-type
+                      '((unsigned-byte 8) (signed-byte 8)
+                        (unsigned-byte 16) (signed-byte 16))
+                      :test #'equal))
+         (format nil "WIDEN-~a~a"
+                 (if (eq (car source-type) 'signed-byte) "SB" "UB")
+                 (second source-type)))))
 
 (defun vector-collect-arrays (expression &optional (accumulator '()))
   (ecase (car expression)

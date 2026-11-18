@@ -2259,14 +2259,92 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
            (let ((text (string-downcase (with-output-to-string (stream)
                                           (disassemble function :stream stream)))))
              (remove-if-not (lambda (m) (search m text))
-                            '("punpcklbw" "psrld" "psrad" "cvtdq2ps" "cvtdq2pd" "movd ")))))
-    (assert (and (member "psrld" (mnemonics #'vectorize-u8-to-single) :test #'string=)
-                 (member "cvtdq2ps" (mnemonics #'vectorize-u8-to-single) :test #'string=))
+                            '("punpcklbw" "punpcklwd" "psrld" "psrad" "cvtdq2ps"
+                              "cvtdq2pd" "movd " "movq "
+                              "pmovzxbd" "pmovsxbd" "pmovzxwd" "pmovsxwd")))))
+    ;; the widen is the unpack sequence or, with SSE4.1, one narrowing load
+    (assert (and (member "cvtdq2ps" (mnemonics #'vectorize-u8-to-single) :test #'string=)
+                 (or (member "psrld" (mnemonics #'vectorize-u8-to-single) :test #'string=)
+                     (member "pmovzxbd" (mnemonics #'vectorize-u8-to-single) :test #'string=)))
             () "u8 to single is not packed: ~a" (mnemonics #'vectorize-u8-to-single))
-    (assert (member "psrad" (mnemonics #'vectorize-s8-to-single) :test #'string=) ()
-            "s8 to single is not packed: ~a" (mnemonics #'vectorize-s8-to-single))
+    (assert (and (member "cvtdq2ps" (mnemonics #'vectorize-s8-to-single) :test #'string=)
+                 (or (member "psrad" (mnemonics #'vectorize-s8-to-single) :test #'string=)
+                     (member "pmovsxbd" (mnemonics #'vectorize-s8-to-single) :test #'string=)))
+            () "s8 to single is not packed: ~a" (mnemonics #'vectorize-s8-to-single))
     (assert (member "cvtdq2pd" (mnemonics #'vectorize-s16-to-double) :test #'string=) ()
             "s16 to double is not packed: ~a" (mnemonics #'vectorize-s16-to-double))))
+
+;;; A 16-bit source is four words per packed iteration, so the read has to reach
+;;; eight bytes; reading four left the upper two lanes reading whatever the movd
+;;; left there, which is a zero.
+(defun vectorize-u16-to-single (in out n)
+  (declare (type (simple-array (unsigned-byte 16) (*)) in)
+           (type (simple-array single-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 1.0 (aref in i))))
+  out)
+
+(defun vectorize-s16-to-single (in out n)
+  (declare (type (simple-array (signed-byte 16) (*)) in)
+           (type (simple-array single-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 1.0 (aref in i))))
+  out)
+
+(defun vectorize-u8-to-double (in out n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) in)
+           (type (simple-array double-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 1.0d0 (aref in i))))
+  out)
+
+(test-util:with-test (:name :vectorize-widen-wide-source :skipped-on (not :x86-64))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(unsigned-byte 16) '(0 1 999 65535 12345) n)
+        for out = (make-array n :element-type 'single-float :initial-element 0.0)
+        do (vectorize-u16-to-single in out n)
+           (dotimes (i n)
+             (unless (= (aref out i) (coerce (aref in i) 'single-float))
+               (error "~@<u16 to single: element ~D of ~D is ~S, expected ~S~:@>"
+                      i n (aref out i) (coerce (aref in i) 'single-float)))))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(signed-byte 16) '(-32768 -1 0 1 32767) n)
+        for out = (make-array n :element-type 'single-float :initial-element 0.0)
+        do (vectorize-s16-to-single in out n)
+           (dotimes (i n)
+             (unless (= (aref out i) (coerce (aref in i) 'single-float))
+               (error "~@<s16 to single: element ~D of ~D is ~S, expected ~S~:@>"
+                      i n (aref out i) (coerce (aref in i) 'single-float)))))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(unsigned-byte 8) '(0 7 255 128 3) n)
+        for out = (make-array n :element-type 'double-float :initial-element 0.0d0)
+        do (vectorize-u8-to-double in out n)
+           (dotimes (i n)
+             (unless (= (aref out i) (coerce (aref in i) 'double-float))
+               (error "~@<u8 to double: element ~D of ~D is ~S, expected ~S~:@>"
+                      i n (aref out i) (coerce (aref in i) 'double-float))))))
+
+;;; With SSE4.1 the four-lane widens are one narrowing load each; without it they
+;;; are the unpack sequence.  Both must be present in the code that ran.
+(test-util:with-test (:name :vectorize-widen-instruction-set :skipped-on (not :x86-64))
+  (flet ((mnemonics (function)
+           (let ((text (string-downcase (with-output-to-string (stream)
+                                          (disassemble function :stream stream)))))
+             (remove-if-not (lambda (m) (search m text))
+                            '("pmovzxbd" "pmovsxbd" "pmovzxwd" "pmovsxwd"
+                              "punpcklbw" "punpcklwd" "movq")))))
+    (if (member :sse4 sb-c:*backend-subfeatures*)
+        (progn
+          (assert (member "pmovzxbd" (mnemonics #'vectorize-u8-to-single) :test #'string=) ()
+                  "u8 to single is not the SSE4.1 load: ~a" (mnemonics #'vectorize-u8-to-single))
+          (assert (member "pmovsxbd" (mnemonics #'vectorize-s8-to-single) :test #'string=) ()
+                  "s8 to single is not the SSE4.1 load: ~a" (mnemonics #'vectorize-s8-to-single))
+          (assert (member "pmovzxwd" (mnemonics #'vectorize-u16-to-single) :test #'string=) ()
+                  "u16 to single is not the SSE4.1 load: ~a" (mnemonics #'vectorize-u16-to-single))
+          (assert (member "pmovsxwd" (mnemonics #'vectorize-s16-to-single) :test #'string=) ()
+                  "s16 to single is not the SSE4.1 load: ~a" (mnemonics #'vectorize-s16-to-single)))
+        (assert (member "punpcklbw" (mnemonics #'vectorize-u8-to-single) :test #'string=) ()
+                "u8 to single is not the unpack sequence: ~a" (mnemonics #'vectorize-u8-to-single)))))
 
 
 ;;; A loop over an array bound by LET does not see the array's type, because the
