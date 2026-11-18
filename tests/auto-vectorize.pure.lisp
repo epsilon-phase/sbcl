@@ -625,6 +625,30 @@ OPERATION applied to the same numbers, which involves no array loop."
            (type (signed-byte 64) k) (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (- (aref a i) k))))
 
+;;; A variable broadcast into lanes narrower than a word: the splat vop cannot
+;;; tell a tagged operand from an untagged one, and shifted a value that had
+;;; already arrived untagged, storing half of it.
+
+(defun vectorize-u8-add-variable (a c k n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a c) (type (unsigned-byte 8) k)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) k))))
+
+(defun vectorize-u16-add-variable (a c k n)
+  (declare (type (simple-array (unsigned-byte 16) (*)) a c) (type (unsigned-byte 16) k)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) k))))
+
+(defun vectorize-u32-add-variable (a c k n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a c) (type (unsigned-byte 32) k)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) k))))
+
+(defun vectorize-s32-add-variable (a c k n)
+  (declare (type (simple-array (signed-byte 32) (*)) a c) (type (signed-byte 32) k)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) k))))
+
 (test-util:with-test (:name :vectorize-integer-add :skipped-on (not :x86-64))
   (vectorize-check-integer-elementwise #'vectorize-u32-add #'+ '(unsigned-byte 32)
                                        *vectorize-u32-values* *vectorize-u32-values*
@@ -685,6 +709,35 @@ OPERATION applied to the same numbers, which involves no array loop."
                                  (disassemble #'vectorize-s64-subtract-scalar
                                               :stream stream)))))
     (assert (search "psubq" text) () "a loop with a scalar variable was not packed:~%~A" text)))
+
+;;; The values are large enough that storing half of one cannot pass, for the
+;;; unsigned types and for a negative value of a signed one.
+(test-util:with-test (:name :vectorize-broadcast-variable :skipped-on (not :x86-64))
+  (let ((cases '((vectorize-u8-add-variable (unsigned-byte 8) 200)
+                 (vectorize-u16-add-variable (unsigned-byte 16) 60000)
+                 (vectorize-u32-add-variable (unsigned-byte 32) 123456789)
+                 (vectorize-s32-add-variable (signed-byte 32) -123456789))))
+    (loop for (name element-type value) in cases
+          do (loop for n in *vectorize-lengths*
+                   for a = (vectorize-integer-array element-type '(0) n)
+                   ;; a stored value is never 0, so a write past N shows up here
+                   for c = (make-array (+ n 8) :element-type element-type
+                                         :initial-element 0)
+                   do (funcall name a c value n)
+                      (dotimes (i n)
+                        (unless (= (aref c i) value)
+                          (error "~@<~A: element ~D of ~D is ~S, expected a broadcast of ~S.~:@>"
+                                 name i n (aref c i) value)))
+                      (loop for i from n below (+ n 8)
+                            do (unless (zerop (aref c i))
+                                 (error "~@<~A: element ~D is past the loop bound but was written: ~S.~:@>"
+                                        name i (aref c i))))))
+    ;; each loop broadcasts a variable, so each must have a splat in it
+    (dolist (case cases)
+      (let ((text (string-downcase (with-output-to-string (stream)
+                                     (disassemble (first case) :stream stream)))))
+        (assert (search "pshufd" text)
+                () "~A was not vectorized:~%~A" (first case) text)))))
 
 ;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
 ;;; not rejected by the backend, and must compute what it always computed.
