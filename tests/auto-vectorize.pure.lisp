@@ -2202,3 +2202,70 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
                                              (disassemble function :stream stream))))))
     (assert (packed-p #'vectorize-u8-mask) () "u8 mask is not packed")
     (assert (packed-p #'vectorize-u32-mask) () "u32 mask is not packed")))
+
+;;;; Reading a narrow integer array into float lanes: an image buffer or 16-bit
+;;;; audio consumed as floats.  The widen vop reads exactly the four (or two)
+;;;; elements one float iteration consumes, so the float loop's guard covers it.
+
+(defun vectorize-u8-to-single (in out n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) in)
+           (type (simple-array single-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i))))
+  out)
+
+(defun vectorize-s8-to-single (in out n)
+  (declare (type (simple-array (signed-byte 8) (*)) in)
+           (type (simple-array single-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 0.5 (aref in i))))
+  out)
+
+(defun vectorize-s16-to-double (in out n)
+  (declare (type (simple-array (signed-byte 16) (*)) in)
+           (type (simple-array double-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 1.0d0 (aref in i))))
+  out)
+
+(test-util:with-test (:name :vectorize-narrow-source-widened :skipped-on (not :x86-64))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(unsigned-byte 8) '(0 1 127 128 255 66) n)
+        for out = (make-array n :element-type 'single-float :initial-element 0.0)
+        do (vectorize-u8-to-single in out n)
+           (dotimes (i n)
+             (let ((want (* 2.0 (aref in i))))
+               (unless (= (aref out i) want)
+                 (error "~@<u8 to single: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref out i) want)))))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(signed-byte 8) '(-128 -5 0 5 127 66) n)
+        for out = (make-array n :element-type 'single-float :initial-element 0.0)
+        do (vectorize-s8-to-single in out n)
+           (dotimes (i n)
+             (let ((want (* 0.5 (aref in i))))
+               (unless (= (aref out i) want)
+                 (error "~@<s8 to single: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref out i) want)))))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array '(signed-byte 16) '(-32768 -3 0 3 32767) n)
+        for out = (make-array n :element-type 'double-float :initial-element 0.0d0)
+        do (vectorize-s16-to-double in out n)
+           (dotimes (i n)
+             (let ((want (* 1.0d0 (aref in i))))
+               (unless (= (aref out i) want)
+                 (error "~@<s16 to double: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref out i) want)))))
+  ;; and each is packed, with the widen instructions present
+  (flet ((mnemonics (function)
+           (let ((text (string-downcase (with-output-to-string (stream)
+                                          (disassemble function :stream stream)))))
+             (remove-if-not (lambda (m) (search m text))
+                            '("punpcklbw" "psrld" "psrad" "cvtdq2ps" "cvtdq2pd" "movd ")))))
+    (assert (and (member "psrld" (mnemonics #'vectorize-u8-to-single) :test #'string=)
+                 (member "cvtdq2ps" (mnemonics #'vectorize-u8-to-single) :test #'string=))
+            () "u8 to single is not packed: ~a" (mnemonics #'vectorize-u8-to-single))
+    (assert (member "psrad" (mnemonics #'vectorize-s8-to-single) :test #'string=) ()
+            "s8 to single is not packed: ~a" (mnemonics #'vectorize-s8-to-single))
+    (assert (member "cvtdq2pd" (mnemonics #'vectorize-s16-to-double) :test #'string=) ()
+            "s16 to double is not packed: ~a" (mnemonics #'vectorize-s16-to-double))))
