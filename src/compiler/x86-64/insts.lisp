@@ -2836,6 +2836,26 @@
   (define-mov-sse-inst movupd #x66 #x10 #x11)
   (define-mov-sse-inst movups nil  #x10 #x11))
 
+
+;;; PMOVSX and PMOVZX: the SSE4.1 sign and zero extending loads.  A byte source
+;;; widens four of them to four dwords and a word source four of them, reading
+;;; exactly four and eight bytes, which is what a four-lane loop needs.
+(define-instruction pmovsxbd (segment dst src)
+  (:emitter (emit-regular-2byte-sse-inst segment dst src #x66 #x38 #x21))
+  . #.(2byte-sse-inst-printer '2byte-xmm-xmm/mem #x66 #x38 #x21))
+
+(define-instruction pmovsxwd (segment dst src)
+  (:emitter (emit-regular-2byte-sse-inst segment dst src #x66 #x38 #x23))
+  . #.(2byte-sse-inst-printer '2byte-xmm-xmm/mem #x66 #x38 #x23))
+
+(define-instruction pmovzxbd (segment dst src)
+  (:emitter (emit-regular-2byte-sse-inst segment dst src #x66 #x38 #x31))
+  . #.(2byte-sse-inst-printer '2byte-xmm-xmm/mem #x66 #x38 #x31))
+
+(define-instruction pmovzxwd (segment dst src)
+  (:emitter (emit-regular-2byte-sse-inst segment dst src #x66 #x38 #x33))
+  . #.(2byte-sse-inst-printer '2byte-xmm-xmm/mem #x66 #x38 #x33))
+
 ;;; MOVNTDQA
 (define-instruction movntdqa (segment dst src)
   (:emitter

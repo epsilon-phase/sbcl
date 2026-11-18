@@ -47,6 +47,10 @@
     (simd-pack double-float)
   (flushable movable))
 
+(defknown %vec-widen-single-double ((simple-array single-float (*)) index)
+    (simd-pack double-float)
+  (flushable movable))
+
 (defknown %vec-splat-single (single-float)
     (simd-pack single-float)
   (flushable movable))
@@ -1087,68 +1091,246 @@
 ;;;; reading narrow integers into float lanes: a byte image or 16-bit audio widened
 ;;;; to the floats a float loop works in.
 ;;;
-;;; each of these reads exactly the number of source elements one float iteration
-;;; consumes (four for singles, two for doubles), so the length guard the pass
-;;; already emits for the float loop covers the read.
+;;;; each reads exactly the elements one float iteration consumes (four for singles,
+;;;; two for doubles), so the length guard the pass already emits for the float loop
+;;;; covers the read.  Reading less would leave lanes unset, and reading more would
+;;;; read past the end of the array on the last iteration.
 ;;;
-;;; the widen is movd, then unpacks that spread each element over a dword, a shift
-;;; that keeps the element and drops the copies (logical for an unsigned source,
-;;; arithmetic for a signed one), then the integer to float convert.  a byte source
-;;; needs both unpacks, a 16-bit source only the word one: interleaving its bytes
-;;; first would scramble the value before the shift.
+;;;; the SSE2 sequence spreads each element over a dword with unpacks, keeps it and
+;;;; drops the copies with a shift, then converts.  A byte source needs both unpacks;
+;;;; a 16-bit source needs only the word one, since interleaving its bytes first
+;;;; would scramble the value before the shift.
 ;;;
-;;; the DEFKNOWN is what makes the translate name known, and it takes Lisp type
-;;; specifiers where the vop takes primitive type names, so the element type is
-;;; passed twice.
+;;;; SSE4.1 has a narrowing load that does it in one instruction, so a backend with
+;;;; it uses PMOVZXBD, PMOVSXBD, PMOVZXWD or PMOVSXWD for the four-lane loops, and
+;;;; the template without a guard is the fallback; a template carries its own name
+;;;; but translates the same function, which is how a guard selects between them.  The two-lane loops keep the SSE2
+;;;; sequence, because no packed read reaches fewer than four bytes and the two bytes
+;;;; of a byte source have to come through a register.
 
-(macrolet ((widen-vop (name array-ptype array-specifier byte-p element-size result-sc
-                       result-ptype result-specifier depth shift convert)
-             `(progn
-                (defknown ,name (,array-specifier index) ,result-specifier
-                  (flushable movable))
-                (define-vop (,name)
-                  (:translate ,name)
-                  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
-                  (:arg-types ,array-ptype tagged-num)
-                  (:temporary (:sc any-reg) byte-index)
-                  (:results (result :scs (,result-sc)))
-                  (:result-types ,result-ptype)
-                  (:generator 6
-                    (move byte-index index)
-                    (inst shr byte-index n-fixnum-tag-bits)
-                    ;; byte-index has been untagged, so the scale is the source
-                    ;; element size in bytes, not the fixnum tag size
-                    (inst movd result
-                          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
-                              vector byte-index ,element-size))
-                    ,@(when byte-p `((inst punpcklbw result result)))
-                    (inst punpcklwd result result)
-                    (inst ,shift result ,depth)
-                    (inst ,convert result result))))))
-  (widen-vop %vec-widen-ub8-single simple-array-unsigned-byte-8
-    (simple-array (unsigned-byte 8) (*)) t 1 single-sse-reg
-        simd-pack-single (simd-pack single-float) 24 psrld cvtdq2ps)
-  (widen-vop %vec-widen-ub8-double simple-array-unsigned-byte-8
-    (simple-array (unsigned-byte 8) (*)) t 1 double-sse-reg
-        simd-pack-double (simd-pack double-float) 24 psrld cvtdq2pd)
-  (widen-vop %vec-widen-sb8-single simple-array-signed-byte-8
-    (simple-array (signed-byte 8) (*)) t 1 single-sse-reg
-        simd-pack-single (simd-pack single-float) 24 psrad cvtdq2ps)
-  (widen-vop %vec-widen-sb8-double simple-array-signed-byte-8
-    (simple-array (signed-byte 8) (*)) t 1 double-sse-reg
-        simd-pack-double (simd-pack double-float) 24 psrad cvtdq2pd)
-  (widen-vop %vec-widen-ub16-single simple-array-unsigned-byte-16
-    (simple-array (unsigned-byte 16) (*)) nil 2 single-sse-reg
-        simd-pack-single (simd-pack single-float) 16 psrld cvtdq2ps)
-  (widen-vop %vec-widen-ub16-double simple-array-unsigned-byte-16
-    (simple-array (unsigned-byte 16) (*)) nil 2 double-sse-reg
-        simd-pack-double (simd-pack double-float) 16 psrld cvtdq2pd)
-  (widen-vop %vec-widen-sb16-single simple-array-signed-byte-16
-    (simple-array (signed-byte 16) (*)) nil 2 single-sse-reg
-        simd-pack-single (simd-pack single-float) 16 psrad cvtdq2ps)
-  (widen-vop %vec-widen-sb16-double simple-array-signed-byte-16
-    (simple-array (signed-byte 16) (*)) nil 2 double-sse-reg
-        simd-pack-double (simd-pack double-float) 16 psrad cvtdq2pd))
+(progn
+  (defknown %vec-widen-ub8-single ((simple-array (unsigned-byte 8) (*)) index) (simd-pack single-float)
+    (flushable movable))
+  (define-vop (%vec-widen-ub8-single-sse4)
+    (:translate %vec-widen-ub8-single)
+    (:guard (member :sse4 *backend-subfeatures*))
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst pmovzxbd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst cvtdq2ps result result)))
+  (define-vop (%vec-widen-ub8-single)
+    (:translate %vec-widen-ub8-single)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst punpcklbw result result)
+      (inst punpcklwd result result)
+      (inst psrld result 24)
+      (inst cvtdq2ps result result)))
+)
+
+(progn
+  (defknown %vec-widen-sb8-single ((simple-array (signed-byte 8) (*)) index) (simd-pack single-float)
+    (flushable movable))
+  (define-vop (%vec-widen-sb8-single-sse4)
+    (:translate %vec-widen-sb8-single)
+    (:guard (member :sse4 *backend-subfeatures*))
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst pmovsxbd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst cvtdq2ps result result)))
+  (define-vop (%vec-widen-sb8-single)
+    (:translate %vec-widen-sb8-single)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst punpcklbw result result)
+      (inst punpcklwd result result)
+      (inst psrad result 24)
+      (inst cvtdq2ps result result)))
+)
+
+(progn
+  (defknown %vec-widen-ub16-single ((simple-array (unsigned-byte 16) (*)) index) (simd-pack single-float)
+    (flushable movable))
+  (define-vop (%vec-widen-ub16-single-sse4)
+    (:translate %vec-widen-ub16-single)
+    (:guard (member :sse4 *backend-subfeatures*))
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst pmovzxwd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst cvtdq2ps result result)))
+  (define-vop (%vec-widen-ub16-single)
+    (:translate %vec-widen-ub16-single)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movq result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst punpcklwd result result)
+      (inst psrld result 16)
+      (inst cvtdq2ps result result)))
+)
+
+(progn
+  (defknown %vec-widen-sb16-single ((simple-array (signed-byte 16) (*)) index) (simd-pack single-float)
+    (flushable movable))
+  (define-vop (%vec-widen-sb16-single-sse4)
+    (:translate %vec-widen-sb16-single)
+    (:guard (member :sse4 *backend-subfeatures*))
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst pmovsxwd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst cvtdq2ps result result)))
+  (define-vop (%vec-widen-sb16-single)
+    (:translate %vec-widen-sb16-single)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (single-sse-reg)))
+    (:result-types simd-pack-single)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movq result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst punpcklwd result result)
+      (inst psrad result 16)
+      (inst cvtdq2ps result result)))
+)
+
+(progn
+  (defknown %vec-widen-ub8-double ((simple-array (unsigned-byte 8) (*)) index) (simd-pack double-float)
+    (flushable movable))
+  (define-vop (%vec-widen-ub8-double)
+    (:translate %vec-widen-ub8-double)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:temporary (:sc any-reg) word-tmp)
+    (:results (result :scs (double-sse-reg)))
+    (:result-types simd-pack-double)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movzx '(:word :dword) word-tmp (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst movd result word-tmp)
+      (inst punpcklbw result result)
+      (inst punpcklwd result result)
+      (inst psrld result 24)
+      (inst cvtdq2pd result result)))
+)
+
+(progn
+  (defknown %vec-widen-sb8-double ((simple-array (signed-byte 8) (*)) index) (simd-pack double-float)
+    (flushable movable))
+  (define-vop (%vec-widen-sb8-double)
+    (:translate %vec-widen-sb8-double)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-8 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:temporary (:sc any-reg) word-tmp)
+    (:results (result :scs (double-sse-reg)))
+    (:result-types simd-pack-double)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movzx '(:word :dword) word-tmp (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 1))
+      (inst movd result word-tmp)
+      (inst punpcklbw result result)
+      (inst punpcklwd result result)
+      (inst psrad result 24)
+      (inst cvtdq2pd result result)))
+)
+
+(progn
+  (defknown %vec-widen-ub16-double ((simple-array (unsigned-byte 16) (*)) index) (simd-pack double-float)
+    (flushable movable))
+  (define-vop (%vec-widen-ub16-double)
+    (:translate %vec-widen-ub16-double)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-unsigned-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (double-sse-reg)))
+    (:result-types simd-pack-double)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst punpcklwd result result)
+      (inst psrld result 16)
+      (inst cvtdq2pd result result)))
+)
+
+(progn
+  (defknown %vec-widen-sb16-double ((simple-array (signed-byte 16) (*)) index) (simd-pack double-float)
+    (flushable movable))
+  (define-vop (%vec-widen-sb16-double)
+    (:translate %vec-widen-sb16-double)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-signed-byte-16 tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (double-sse-reg)))
+    (:result-types simd-pack-double)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst movd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                      vector byte-index 2))
+      (inst punpcklwd result result)
+      (inst psrad result 16)
+      (inst cvtdq2pd result result)))
+)
 
 ;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
@@ -1195,6 +1377,7 @@
     (publish "OR" (unsigned-byte 8) %vec-or-ub8)
     (publish "OR" (signed-byte 8) %vec-or-sb8)
     (publish "XOR" (unsigned-byte 8) %vec-xor-ub8)
+    (publish "WIDEN-SINGLE" double-float %vec-widen-single-double)
     (publish "WIDEN-UB8" single-float %vec-widen-ub8-single)
     (publish "WIDEN-UB8" double-float %vec-widen-ub8-double)
     (publish "WIDEN-SB8" single-float %vec-widen-sb8-single)
