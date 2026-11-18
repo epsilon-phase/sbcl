@@ -2161,3 +2161,44 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
             () "an inexact u16 loop was vectorized at default safety: ~A" notes)
     (assert (some (lambda (line) (search "safety" line :test #'char-equal)) notes)
             () "the note does not name the (safety 0) rule: ~A" notes)))
+
+;;;; Bitwise operations are exact too: an n-bit result always fits the lane, so a
+;;;; masking loop vectorizes without (safety 0).
+
+(defun vectorize-u8-mask (a c n)
+  (declare (type (simple-array (unsigned-byte 8) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (logand (aref a i) #x7F)))
+  c)
+
+(defun vectorize-u32-mask (a c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (logior (logand (aref a i) #xFF) #x80)))
+  c)
+
+(test-util:with-test (:name :vectorize-mask-at-any-safety :skipped-on (not :x86-64))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 8) '(0 1 127 128 255 66) n)
+        for c = (make-array n :element-type '(unsigned-byte 8) :initial-element 0)
+        do (vectorize-u8-mask a c n)
+           (dotimes (i n)
+             (let ((want (logand (aref a i) #x7F)))
+               (unless (= (aref c i) want)
+                 (error "~@<u8 mask: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref c i) want)))))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 32) '(0 1 255 256 4294967295) n)
+        for c = (make-array n :element-type '(unsigned-byte 32) :initial-element 0)
+        do (vectorize-u32-mask a c n)
+           (dotimes (i n)
+             (let ((want (logior (logand (aref a i) #xFF) #x80)))
+               (unless (= (aref c i) want)
+                 (error "~@<u32 mask: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref c i) want)))))
+  ;; and packed, at the default policy
+  (flet ((packed-p (function)
+           (search "pand" (string-downcase (with-output-to-string (stream)
+                                             (disassemble function :stream stream))))))
+    (assert (packed-p #'vectorize-u8-mask) () "u8 mask is not packed")
+    (assert (packed-p #'vectorize-u32-mask) () "u32 mask is not packed")))
