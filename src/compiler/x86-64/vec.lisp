@@ -321,15 +321,18 @@
 ;;; from there into int-sse-reg, so the transfer is an instruction: movd for
 ;;; 32-bit lanes, movq for 64-bit.
 ;;;
-;;; a (unsigned-byte 32) or (signed-byte 32) scalar arrives *tagged*, so the tag
-;;; is stripped with an arithmetic shift.  a logical shift looks right and is
-;;; not: -3 is tagged -6, whose low 32 bits are #xFFFFFFFA, and shifting that
-;;; logically by one gives 2147483645 rather than -3.
+;;; the splat vops take an unsigned-num or signed-num operand, so when the
+;;; operand's Lisp type is a subtype of fixnum the backend strips the tag where the
+;;; value is defined and the register holds an untagged word: the six vops for
+;;; lanes narrower than a word take the operand as it arrives.  a 64-bit lane may
+;;; be declared (unsigned-byte 64), which no fixnum subtype covers, so nothing
+;;; strips the tag there and the two 64-bit vops do it themselves.
 
 ;;; true when tn holds a tagged fixnum.  the test is on the primitive type the
 ;;; register was allocated for, not on the Lisp type of the reference: an integer
-;;; literal arrives untagged, a variable declared (signed-byte 32) arrives tagged,
-;;; and guessing from the Lisp type splats -3 as -2.
+;;; literal arrives untagged, a variable declared (unsigned-byte 64) arrives
+;;; tagged.  a logical shift looks right and is not: -3 is tagged -6, whose low 32
+;;; bits are #xFFFFFFFA, and shifting that logically by one gives 2147483645.
 (defun tagged-fixnum-tn-p (tn)
   (let ((primitive-type (sb-c::tn-primitive-type tn)))
     (or (eq primitive-type (sb-c::primitive-type-or-lose 'fixnum))
@@ -339,30 +342,20 @@
   (:translate %vec-splat-ub32)
   (:args (x :scs (unsigned-reg signed-reg) :target result))
   (:arg-types unsigned-num)
-  (:temporary (:sc unsigned-reg) word)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub32)
   (:generator 2
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x)
-               (inst sar word n-fixnum-tag-bits)
-               (inst movd result word))
-        (inst movd result x))
+    (inst movd result x)
     (inst pshufd result result #b00000000)))
 
 (define-vop (%vec-splat-sb32)
   (:translate %vec-splat-sb32)
   (:args (x :scs (unsigned-reg signed-reg) :target result))
   (:arg-types signed-num)
-  (:temporary (:sc unsigned-reg) word)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb32)
   (:generator 2
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x)
-               (inst sar word n-fixnum-tag-bits)
-               (inst movd result word))
-        (inst movd result x))
+    (inst movd result x)
     (inst pshufd result result #b00000000)))
 
 (define-vop (%vec-splat-ub64)
@@ -444,10 +437,10 @@
 
 (defknown %vec-splat-ub8 ((unsigned-byte 8)) (simd-pack (unsigned-byte 8)) (flushable movable))
 
-;;; one byte in all sixteen lanes: strip the tag, then mask down to the byte,
-;;; since the shift leaves a negative value sign-extended and the multiplication
-;;; copies the high half as well, turning -3 into #x...FCFCFCFD.  Then copy the
-;;; byte into all four bytes of a word with #x01010101 and pshufd the word.
+;;; one byte in all sixteen lanes: mask down to the byte, copy it into all four
+;;; bytes of a word with #x01010101, and pshufd the word.  the mask is required
+;;; whatever the value's sign, since the multiplication copies the whole word and
+;;; -3 would otherwise duplicate the sign extension, #x...FCFCFCFD.
 (define-vop (%vec-splat-ub8)
   (:translate %vec-splat-ub8)
   (:args (x :scs (unsigned-reg signed-reg)))
@@ -456,9 +449,7 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 3
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x) (inst sar word n-fixnum-tag-bits))
-        (move word x))
+    (move word x)
     (inst and word #xFF)
     (inst imul word word #x01010101)
     (inst movd result word)
@@ -592,9 +583,7 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 3
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x) (inst sar word n-fixnum-tag-bits))
-        (move word x))
+    (move word x)
     (inst and word #xFF)
     (inst imul word word #x01010101)
     (inst movd result word)
@@ -788,11 +777,11 @@
 
 ;;;; splatting one 16-bit integer across every lane
 ;;;
-;;; strip the tag with an arithmetic shift, mask to the 16 bits that are left,
-;;; multiply by #x00010001 to get the value into both halves of a word, then
-;;; movd and pshufd as for the bytes.
+;;; mask to the 16 bits that are left, multiply by #x00010001 to get the value
+;;; into both halves of a word, then movd and pshufd as for the bytes.
 ;;;
-;;; the and is required: sign extension leaves the high half of
+;;; the and is required: the multiplication copies the whole word, so without it
+;;; a negative value's sign extension would leave the high half of
 ;;; -3 * #x00010001 as -4 rather than -3.
 
 (define-vop (%vec-splat-ub16)
@@ -803,9 +792,7 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub16)
   (:generator 4
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x) (inst sar word n-fixnum-tag-bits))
-        (move word x))
+    (move word x)
     (inst and word #xFFFF)
     (inst imul word word #x00010001)
     (inst movd result word)
@@ -819,9 +806,7 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb16)
   (:generator 4
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x) (inst sar word n-fixnum-tag-bits))
-        (move word x))
+    (move word x)
     (inst and word #xFFFF)
     (inst imul word word #x00010001)
     (inst movd result word)
