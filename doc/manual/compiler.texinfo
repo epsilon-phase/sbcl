@@ -1285,6 +1285,21 @@ A packed byte store truncates where the scalar store signals a type error, so
 unless a loop is exact (below) the two do not mean the same thing at the default
 safety, and the loop is left scalar.  Image processing code usually declares
 @code{(safety 0)} already.
+
+A float loop may read a narrow integer array, which is how a byte image or
+16-bit audio is consumed as floats:
+
+@lisp
+(dotimes (i n)                          ; pixels declared (unsigned-byte 8)
+  (setf (aref out i) (* 0.003921569 (aref pixels i))))
+@end lisp
+
+@noindent
+@code{(unsigned-byte 8)}, @code{(signed-byte 8)}, @code{(unsigned-byte 16)} and
+@code{(signed-byte 16)} sources are read into @code{single-float} or
+@code{double-float} lanes.  Four bytes at a time this is worth 2.6 times on a
+cache-resident image and 3.6 times streaming; the read is exact, so the loop does
+not need @code{(safety 0)}.
 @end itemize
 
 @noindent
@@ -1320,11 +1335,28 @@ scalar loop would read before the start of the array at @code{i} equal to zero. 
 @noindent
 The types come from the compiler: a variable the compiler knows to be an array of
 a supported element type takes part, whether that is known from a declaration, an
-@code{ftype}, a @code{the} cast, or a type IR1 has already derived.  A @code{let}
-whose value is a @code{make-array} is a case to be aware of: IR1 derives that
-element type only after it has converted the body, which is later than the point
-where a loop is rewritten, so such a loop stays scalar unless it is written with a
-@code{the} cast or the array is declared.  The pass says so in a note.
+@code{ftype}, a @code{the} cast, or a type IR1 has already derived.
+
+A @code{let} binding is special, because the compiler derives its type only after
+converting the body, which is later than the point where a loop is rewritten.  The
+pass reads the types two initializers prove and declares the binding with them, so
+no annotation is needed:
+
+@lisp
+(let ((a (make-array n :element-type 'single-float)))     ; simple array, so declared
+  (dotimes (i n) (setf (aref a i) (* 2.0 (aref b i)))))
+
+(let ((a (the (simple-array single-float (*)) (make-array n))))
+  (dotimes (i n) (setf (aref a i) (* 2.0 (aref b i)))))
+@end lisp
+
+@noindent
+A @code{make-array} with @code{:adjustable}, @code{:fill-pointer} or
+@code{:displaced-to} is not a simple array, so it proves nothing and its loop
+stays scalar.  A binding whose type would only come from propagation, such as one
+initialized by @code{copy-seq} or by a function's result, is still out of reach:
+declare it, or write the reference with a @code{the} cast, and the loop is
+vectorized.  The pass says which case it hit in a note.
 
 @noindent
 The body is a store: @code{(setf (aref destination index) expression)},
