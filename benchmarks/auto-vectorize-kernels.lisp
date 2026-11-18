@@ -45,6 +45,8 @@
 (defun make-f64 (n) (make-array n :element-type 'double-float))
 (defun make-u8 (n)  (make-array n :element-type '(unsigned-byte 8)))
 (defun make-u32 (n) (make-array n :element-type '(unsigned-byte 32)))
+(defun make-s16 (n) (make-array n :element-type '(signed-byte 16)))
+(defun make-s8  (n) (make-array n :element-type '(signed-byte 8)))
 
 (defun fill-f32 (a)
   (dotimes (i (length a) a)
@@ -58,6 +60,15 @@
 (defun fill-u8 (a)
   (dotimes (i (length a) a)
     (setf (aref a i) (logand #xff (rng-u32)))))
+
+(defun fill-s16 (a)
+  "16-bit audio samples: full range, so a clamp has something to clamp."
+  (dotimes (i (length a) a)
+    (setf (aref a i) (- (logand #xffff (rng-u32)) #x8000))))
+
+(defun fill-s8 (a)
+  (dotimes (i (length a) a)
+    (setf (aref a i) (- (logand #xff (rng-u32)) #x80))))
 
 (defun fill-u32 (a)
   (dotimes (i (length a) a)
@@ -235,6 +246,42 @@
     (setf (aref y i) (+ (aref y i) (* a (aref x i)))))
   :packed ("addpd" "mulpd" "movupd"))
 
+;;;; 10. 16-bit audio clamp: the loop the pass takes at the DEFAULT policy,
+;;;;     because min and max cannot store a value the lane cannot hold.
+
+(define-kernel clamp-s16
+    (out in n)
+  ((declare (type (simple-array (signed-byte 16) (*)) out in)
+            (type fixnum n)
+            (optimize (speed 3))))
+  (dotimes (i n)
+    (setf (aref out i) (max -1000 (min 1000 (aref in i)))))
+  :packed ("pminsw" "pmaxsw"))
+
+;;;; 11. signed-byte image clamp, same story with the biased unsigned
+;;;;     instructions, since SSE2 has no signed byte minimum.
+
+(define-kernel clamp-s8
+    (out in n)
+  ((declare (type (simple-array (signed-byte 8) (*)) out in)
+            (type fixnum n)
+            (optimize (speed 3))))
+  (dotimes (i n)
+    (setf (aref out i) (min 100 (aref in i))))
+  :packed ("pminub" "pxor"))
+
+;;;; 12. masking: a bitwise operation on n-bit values has an n-bit result, so
+;;;;     this is exact too, and it vectorizes at the default policy.
+
+(define-kernel mask-u32
+    (out in n)
+  ((declare (type (simple-array (unsigned-byte 32) (*)) out in)
+            (type fixnum n)
+            (optimize (speed 3))))
+  (dotimes (i n)
+    (setf (aref out i) (logior (logand (aref in i) #xff00) #x80)))
+  :packed ("pand" "por"))
+
 ;;;; ---------------------- timing: best of N ------------------------- ;
 
 (defparameter *timing-sizes* '(8192 1048576))
@@ -358,6 +405,33 @@
      (lambda () (daxpy-f64-scalar y-s x a n))
      (lambda (v s) (declare (ignore v s)) (arrays-eql y-v y-s)))))
 
+(defun make-clamp-s16-runs (n)
+  (let* ((out-v (make-s16 n))
+         (out-s (make-s16 n))
+         (in    (fill-s16 (make-s16 n))))
+    (values
+     (lambda () (clamp-s16 out-v in n))
+     (lambda () (clamp-s16-scalar out-s in n))
+     (lambda (v s) (declare (ignore v s)) (arrays-eql out-v out-s)))))
+
+(defun make-clamp-s8-runs (n)
+  (let* ((out-v (make-s8 n))
+         (out-s (make-s8 n))
+         (in    (fill-s8 (make-s8 n))))
+    (values
+     (lambda () (clamp-s8 out-v in n))
+     (lambda () (clamp-s8-scalar out-s in n))
+     (lambda (v s) (declare (ignore v s)) (arrays-eql out-v out-s)))))
+
+(defun make-mask-u32-runs (n)
+  (let* ((out-v (make-u32 n))
+         (out-s (make-u32 n))
+         (in    (fill-u32 (make-u32 n))))
+    (values
+     (lambda () (mask-u32 out-v in n))
+     (lambda () (mask-u32-scalar out-s in n))
+     (lambda (v s) (declare (ignore v s)) (arrays-eql out-v out-s)))))
+
 (defstruct bench label spec traffic make-runs)
 
 (defparameter *benches*
@@ -374,6 +448,15 @@
    (make-bench :label "u8 brightness clamp  out = min(in,200)"
                :spec 'clamp-u8 :traffic 2
                :make-runs 'make-clamp-runs)
+   (make-bench :label "s16 audio clamp  out = clamp(in,-1000,1000)"
+               :spec 'clamp-s16 :traffic 4
+               :make-runs 'make-clamp-s16-runs)
+   (make-bench :label "s8 image clamp  out = min(in,100)"
+               :spec 'clamp-s8 :traffic 2
+               :make-runs 'make-clamp-s8-runs)
+   (make-bench :label "u32 mask  out = (in & #xff00) | #x80"
+               :spec 'mask-u32 :traffic 8
+               :make-runs 'make-mask-u32-runs)
    (make-bench :label "PNG Sub filter  out = in + prev"
                :spec 'png-sub-prev-u8 :traffic 3
                :make-runs 'make-sub-prev-runs)

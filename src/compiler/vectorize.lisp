@@ -151,14 +151,15 @@
          (and (= (length count) 2) (symbolp (second count))))
         (t nil)))
 
-;;; an integer expression whose value fits the element type whatever the inputs:
-;;; loads, broadcasts and min/max, with no arithmetic that can wrap.  Narrowing
-;;; one of these into the array cannot signal at any safety, so it does not need
-;;; (safety 0) the way integer addition and multiplication do.
+;;; an integer expression whose value fits the element type whatever the inputs, so
+;;; that narrowing it into the array cannot signal at any safety and the loop does
+;;; not need (safety 0) the way integer addition and multiplication do.  Loads,
+;;; broadcasts and constants are exact; so is min and max; and so is every bitwise
+;;; operation, since a bitwise operation on n-bit values has an n-bit result.
 (defun vector-exact-expression-p (expression)
   (case (car expression)
     ((:array :scalar :const) t)
-    (:op (and (memq (second expression) '(min max))
+    (:op (and (memq (second expression) '(min max logand logior logxor))
               (every #'vector-exact-expression-p (cddr expression))))
     ((:negate :index) nil)))
 
@@ -996,8 +997,8 @@ guard still covers the reads."
       (unless (or (vector-float-element-type-p element-type) unchecked-p
                   (vector-exact-expression-p expression))
         (push (format nil "~a lanes wrap where a checked loop would signal, so they are only ~
-                           used at (safety 0) or in a loop whose value is a load, a broadcast ~
-                           or MIN and MAX"
+                           used at (safety 0) or in a loop whose value is built from loads, ~
+                           broadcasts, MIN, MAX and the bitwise operations"
                       element-type)
               reasons)))
     (nreverse reasons)))
