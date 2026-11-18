@@ -1036,7 +1036,89 @@ guard still covers the reads."
     (dolist (reason (vector-missed-diagnosis form env))
       (compiler-notify "~@<unable to vectorize this loop: ~2I~_~A~:>" reason))))
 
+;;;; Bindings that prove their own type
+;;;;
+;;;; A loop over an array bound by LET does not see the array's type: the leaf's
+;;;; ctype is the universal type until IR1 propagates the initializer's type to it,
+;;;; and the pass runs before that.  Two initializers say what they are without any
+;;;; propagation, though, so the pass declares them where IR1 can see it: a
+;;;; MAKE-ARRAY with an :ELEMENT-TYPE and no adjustment, fill pointer or
+;;;; displacement is a simple array of that element type, and a THE cast says what
+;;;; it says.  Adding the declaration is a source rewrite like any other here, and
+;;;; the declaration is what the initializer already guarantees.
+
+;;; the element type a MAKE-ARRAY call pins, or NIL.  Anything that would make the
+;;; result non-simple or adjustable disqualifies it, since only the declaration of a
+;;; simple array is what the loop then relies on.
+(defun vector-make-array-element-type (form)
+  (when (and (consp form) (eq (car form) 'make-array) (cddr form))
+    (let ((element-type nil)
+          (simple-p t)
+          (arguments (cddr form)))
+      (loop while arguments
+            for key = (pop arguments)
+            do (let ((value (and arguments (pop arguments))))
+                 (case key
+                   (:element-type
+                    (when (and (consp value) (eq (car value) 'quote) (= 2 (length value)))
+                      (setf element-type (second value))))
+                   ((:adjustable :fill-pointer :displaced-to :displaced-index-offset)
+                    (when value (setf simple-p nil))))))
+      (when (and simple-p element-type
+                 (member element-type +vector-element-types+ :test #'equal))
+        element-type))))
+
+;;; the type a binding's initializer proves, as a specifier to declare, or NIL.
+(defun vector-binding-type (form)
+  (cond ((vector-make-array-element-type form)
+         `(simple-array ,(vector-make-array-element-type form) (*)))
+        ((and (consp form) (eq (car form) 'the) (= 3 (length form)))
+         ;; the cast is what the user asserted, and declaring the binding with it is
+         ;; the same assertion applied to the variable
+         (let ((info (ignore-errors (vector-ctype-info (specifier-type (second form))))))
+           (when (and info (eq (car info) :array))
+             (second form))))))
+
+;;; whether any form in SOURCE is a loop the pass would consider, so that
+;;; declarations are only added to code where they can matter
+(defun vector-source-has-loop-p (source)
+  ;; the walk has to survive dotted lists: a declare specifier such as
+  ;; (flags symbols values ignore . binding-decls) is one, and SOME would reject it
+  (labels ((walk (form)
+             (cond ((atom form) nil)
+                   ((memq (car form) '(dotimes do do* loop)) t)
+                   ((eq (car form) 'quote) nil)
+                   (t (or (walk (car form)) (walk (cdr form)))))))
+    (walk source)))
+
 ;;;; Entry point
+
+;;; a LET or LET* whose bindings prove array types, and whose body has a loop: the
+;;; same form with those types declared, so that the loop is vectorized.  Adding the
+;;; declarations is all this does.
+(defun vector-let-form (form lexenv)
+  (when (and (consp form)
+             (memq (car form) '(let let*))
+             (listp (second form))
+             (vector-standard-loop-form-p form lexenv)
+             (vector-source-has-loop-p `(progn ,@(cddr form))))
+    (let ((declarations '()))
+      (dolist (binding (second form))
+        (when (and (consp binding) (symbolp (car binding))
+                   (cdr binding) (null (cddr binding)))
+          (let ((type (vector-binding-type (second binding))))
+            (when type
+              (push `(type ,type ,(car binding)) declarations)))))
+      (when declarations
+        (let ((body (copy-list (cddr form)))
+              (head '()))
+          ;; declarations keep their place at the head of the body
+          (loop while (and body (consp (car body)) (eq (caar body) 'declare))
+                do (push (pop body) head))
+          `(,(car form) ,(second form)
+            ,@(nreverse head)
+            (declare ,@(nreverse declarations))
+            ,@body))))))
 
 ;;; the replacement for form, a loop this pass understands, or nil.  called from
 ;;; IR1-CONVERT for each form as it is converted, which is before macroexpansion: it
@@ -1046,6 +1128,18 @@ guard still covers the reads."
 
 ;;; the manual documents this pass as a speed 2 optimization: the code is emitted
 ;;; twice, so do not spend it on code compiled for space.
+;;; the replacement for FORM, or NIL, and whether converting it should turn the pass
+;;; off entirely.  A loop becomes the vectorized loop, whose expansion is opaque; a
+;;; LET whose bindings prove array types becomes itself with those types declared,
+;;; and only that rewrite lets its body reach the pass.
+(defun vectorize-form (form lexenv)
+  (when (and *auto-vectorize*
+             (policy lexenv (>= speed 2))
+             (consp form))
+    (if (memq (car form) '(let let*))
+        (values (vector-let-form form lexenv) nil)
+        (values (vectorize-loop-form form lexenv) t))))
+
 (defun vectorize-loop-form (form lexenv)
   (when (and *auto-vectorize*
              (policy lexenv (>= speed 2))
@@ -1067,3 +1161,4 @@ guard still covers the reads."
 ;;; converting the form this pass returns must not re-enter the pass, or the pass
 ;;; would rewrite its own fallback branch, the original loop.
 (defvar *vectorize-inhibited* nil)
+(defvar *vectorize-inhibited-forms* nil)

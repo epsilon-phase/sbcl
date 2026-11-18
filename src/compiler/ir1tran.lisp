@@ -633,13 +633,21 @@
            (type (or lvar null) result))
   ;; The automatic vectorizer gets every form as it is converted, which is after
   ;; macroexpansion: a loop the user wrote and a loop a macro produced are the same
-  ;; form by the time it arrives here.  A replacement is converted under
-  ;; *VECTORIZE-INHIBITED* so that its own fallback branch, the original loop, is
-  ;; not rewritten again.
-  (unless *vectorize-inhibited*
-    (let ((replacement (vectorize-loop-form form *lexenv*)))
+  ;; form by the time it arrives here.  The form a replacement was built from is
+  ;; bound in *VECTORIZE-INHIBITED-FORM* while it is converted, so the replacement's
+  ;; own fallback branch, the original loop, is not rewritten again; the forms
+  ;; inside it still are, which is what lets a rewrite that only adds declarations
+  ;; hand its body to the pass.
+  (unless (or *vectorize-inhibited* (memq form *vectorize-inhibited-forms*))
+    ;; a loop expansion is opaque: everything inside it is converted with the pass
+    ;; off, because its fallback is the loop again and machine-generated bindings in
+    ;; it would otherwise be rewritten too.  A rewrite that only adds declarations
+    ;; hands its body back instead, inhibiting just the forms it produced.
+    (multiple-value-bind (replacement opaque) (vectorize-form form *lexenv*)
       (when replacement
-        (let ((*vectorize-inhibited* t))
+        (let ((*vectorize-inhibited* (or opaque *vectorize-inhibited*))
+              (*vectorize-inhibited-forms* (list* form replacement
+                                                  *vectorize-inhibited-forms*)))
           (return-from ir1-convert
             (ir1-convert start next result replacement))))))
   (let* ((*current-path* (ensure-source-path form))

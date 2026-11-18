@@ -1125,8 +1125,8 @@ a writer with a fixed color type ends up with."
       (assert (= (aref c i) (- (aref a i) (aref b i)))))))
 
 ;;;; A local (MAKE-ARRAY ... :ELEMENT-TYPE 'TYPE) is a declaration the source
-;;;; already wrote, so the bindings are read as one.  An adjustable or displaced
-;;;; array is not a simple array, so it must stay out.
+;;;; already wrote, so the binding is declared with it.  An adjustable or displaced
+;;;; array is not a simple array, so it proves nothing and must stay out.
 
 (defun vectorize-made-locals (n)
   (declare (optimize speed))
@@ -1148,28 +1148,26 @@ a writer with a fixed color type ends up with."
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
                               (disassemble function :stream stream)))))
-    ;; The pass asks IR1 for a variable's type, and IR1 derives the element type of
-    ;; a LET-bound MAKE-ARRAY only after the body has been converted, so a loop over
-    ;; such a local is not vectorized, and the note says so; a THE cast or a
-    ;; declaration makes it vectorizable.  The comment above this test used to
-    ;; describe the old pass, which matched the MAKE-ARRAY form in the source.
+    ;; the initializer proves (SIMPLE-ARRAY SINGLE-FLOAT (*)), so the binding is
+    ;; declared with it and the loop is the packed one
     (let ((text (disassembly #'vectorize-made-locals)))
+      (assert (search "addps" text)
+              () "a loop over local MAKE-ARRAY results was not vectorized:~%~A" text))
+    ;; an adjustable array is not simple, so nothing is proven and the loop stays
+    ;; scalar, with a note that says why
+    (let ((text (disassembly #'vectorize-made-locals-adjustable)))
       (assert (notany (lambda (mnemonic) (search mnemonic text)) '("addps" "addpd"))
-              () "a loop over local MAKE-ARRAY results was vectorized after all:~%~A" text))
+              () "a loop over adjustable arrays was vectorized:~%~A" text))
     (let ((notes (vectorize-notes-for
                   '(lambda (n)
                      (declare (type fixnum n) (optimize speed))
-                     (let ((a (make-array n :element-type 'single-float))
-                           (b (make-array n :element-type 'single-float))
-                           (c (make-array n :element-type 'single-float)))
+                     (let ((a (make-array n :element-type 'single-float :adjustable t))
+                           (b (make-array n :element-type 'single-float :adjustable t))
+                           (c (make-array n :element-type 'single-float :adjustable t)))
                        (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
                        c)))))
       (assert (vectorize-note-mentions notes "not known to be an array")
-              () "no explanation for the MAKE-ARRAY local: ~s" notes))
-    (let ((text (disassembly #'vectorize-made-locals-adjustable)))
-      (assert (notany (lambda (mnemonic) (search mnemonic text))
-                      '("addps" "addpd"))
-              () "a loop over adjustable arrays was vectorized:~%~A" text)))
+              () "no explanation for the adjustable local: ~s" notes)))
   (dolist (n '(0 1 2 3 4 7 16 17))
     (let ((result (vectorize-made-locals n)))
       (dotimes (i n)
@@ -2269,3 +2267,78 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
             "s8 to single is not packed: ~a" (mnemonics #'vectorize-s8-to-single))
     (assert (member "cvtdq2pd" (mnemonics #'vectorize-s16-to-double) :test #'string=) ()
             "s16 to double is not packed: ~a" (mnemonics #'vectorize-s16-to-double))))
+
+
+;;; A loop over an array bound by LET does not see the array's type, because the
+;;; leaf's type is only propagated to it after the pass has run.  A binding whose
+;;; initializer proves the type gets a declaration added instead, which is a source
+;;; rewrite like the loop expansion, so these tests pin down that the loops now
+;;; vectorize and that the declaration is what the initializer already guaranteed.
+
+(defun vectorize-let-destination (b n)
+  (declare (type (simple-array single-float (*)) b) (type vectorize-index n)
+           (optimize speed))
+  (let ((a (make-array n :element-type 'single-float :initial-element 0.0)))
+    (dotimes (i n) (setf (aref a i) (* 2.0 (aref b i))))
+    a))
+
+(defun vectorize-let-source (out n)
+  (declare (type (simple-array single-float (*)) out) (type vectorize-index n)
+           (optimize speed))
+  (let ((a (make-array n :element-type 'single-float :initial-element 1.5)))
+    (dotimes (i n) (setf (aref out i) (+ 1.0 (aref a i))))
+    out))
+
+(defun vectorize-let-the-binding (b out n)
+  (declare (type (simple-array single-float (*)) b out) (type vectorize-index n)
+           (optimize speed))
+  (let ((a (the (simple-array single-float (*)) (copy-seq b))))
+    (dotimes (i n) (setf (aref out i) (* 3.0 (aref a i))))
+    out))
+
+;;; an adjustable array is not simple, so its initializer proves nothing and the
+;;; loop must stay scalar and still be right
+(defun vectorize-let-adjustable (b n)
+  (declare (type (simple-array single-float (*)) b) (type vectorize-index n)
+           (optimize speed))
+  (let ((a (make-array n :element-type 'single-float :adjustable t
+                         :initial-element 0.0)))
+    (dotimes (i n) (setf (aref a i) (* 2.0 (aref b i))))
+    a))
+
+(test-util:with-test (:name :vectorize-let-bound-arrays :skipped-on (not :x86-64))
+  (let ((b (make-array 37 :element-type 'single-float)))
+    (dotimes (i 37) (setf (aref b i) (coerce i 'single-float)))
+    (let ((destination (vectorize-let-destination b 37)))
+      (dotimes (i 37)
+        (unless (= (aref destination i) (coerce (* 2 i) 'single-float))
+          (error "~@<let-bound destination: element ~D is ~S, expected ~S~:@>"
+                 i (aref destination i) (coerce (* 2 i) 'single-float)))))
+    (let ((source (vectorize-let-source (make-array 37 :element-type 'single-float) 37)))
+      (dotimes (i 37)
+        (unless (= (aref source i) 2.5)
+          (error "~@<let-bound source: element ~D is ~S, expected 2.5~:@>"
+                 i (aref source i)))))
+    (let ((out (make-array 37 :element-type 'single-float)))
+      (vectorize-let-the-binding b out 37)
+      (dotimes (i 37)
+        (unless (= (aref out i) (coerce (* 3 i) 'single-float))
+          (error "~@<let-bound the cast: element ~D is ~S, expected ~S~:@>"
+                 i (aref out i) (coerce (* 3 i) 'single-float)))))
+    (let ((adjustable (vectorize-let-adjustable b 37)))
+      (dotimes (i 37)
+        (unless (= (aref adjustable i) (coerce (* 2 i) 'single-float))
+          (error "~@<let-bound adjustable: element ~D is ~S, expected ~S~:@>"
+                 i (aref adjustable i) (coerce (* 2 i) 'single-float))))))
+  (flet ((text (name)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble name :stream stream)))))
+    (dolist (name '(vectorize-let-destination vectorize-let-source
+                    vectorize-let-the-binding))
+      (assert (some (lambda (mnemonic) (search mnemonic (text name)))
+                    *vectorize-packed-mnemonics*)
+              () "~A was not vectorized:~%~A" name (text name)))
+    (assert (notany (lambda (mnemonic) (search mnemonic (text 'vectorize-let-adjustable)))
+                    *vectorize-packed-mnemonics*)
+            () "~A should have stayed scalar:~%~A"
+            'vectorize-let-adjustable (text 'vectorize-let-adjustable))))
