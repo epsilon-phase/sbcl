@@ -28,7 +28,8 @@
 ;;; aliased arguments, an index past the end still signalling, no writes past
 ;;; N, and the packed loop being there on x86-64.
 
-;;; The vectorizer targets x86-64 and is part of the simd-pack support.
+;;; This file asserts the x86-64 instruction set; tests/auto-vectorize-arm64.pure.lisp
+;;; covers the same contract on NEON, where the packed instructions are different.
 #-x86-64 (invoke-restart 'run-tests::skip-file)
 
 ;;; INDEX, the type of a bound into a vector: (INTEGER 0 (ARRAY-DIMENSION-LIMIT)).
