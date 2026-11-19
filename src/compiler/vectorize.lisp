@@ -569,7 +569,10 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; the backend primitives that move and combine one vector: an alist of
 ;;; ((base element-type) . name), where base is "LOAD", "STORE", "SPLAT", "ADD",
 ;;; "SUB", "MUL" or "DIV", filled in by the backend file that defines them so that
-;;; this pass is inert on a build without them.  the backend file hands the names over
+;;; this pass is inert on a build without them.  "OFFSET" is the one base that is
+;;; optional within a backend that publishes the rest: a backend whose loads and
+;;; stores address by the byte offset it computes publishes it, and one whose
+;;; addressing mode takes the index, as x86-64's does, does not.  the backend file hands the names over
 ;;; rather than this one writing them, because this file cannot name the backend's
 ;;; package.  a string in the heap that is STRING= to a package name defeats string
 ;;; coalescing in SAVE-LISP-AND-DIE, which tests/hide-packages.test.sh enforces.
@@ -625,19 +628,25 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 
 ;;; Emit an expression tree over SIMD packs. SCALARS maps each loop invariant
 ;;; leaf to the variable holding its broadcast pack.
-(defun vector-emit (expression element-type index scalars data-references)
+(defun vector-emit (expression element-type index scalars data-references
+                    &optional offset)
   (ecase (car expression)
     (:index (cdr (assoc :index scalars)))
     (:negate `(,(vector-primitive "NEG" element-type)
                ,(vector-emit (second expression) element-type index scalars
-                             data-references)))
+                             data-references offset)))
     (:array (let* ((name (second expression))
-                   (offset (third expression))
+                   (subscript (third expression))
                    (reference (or (cadr (assoc name data-references)) name)))
               `(,(vector-primitive "LOAD" element-type) ,reference
-                ,(vector-subscript name offset index data-references))))
+                ,(if offset
+                     (vector-offset-form name subscript index data-references
+                                         offset element-type)
+                     (vector-subscript name subscript index data-references)))))
     (:widen (let ((inner (second expression))
                   (source-type (third expression)))
+              ;; a widen reads a narrower element type than it writes, so its
+              ;; accesses do not share the destination's offset
               `(,(vector-primitive (vector-widen-base source-type element-type) element-type)
                 ,(or (cadr (assoc (second inner) data-references)) (second inner))
                 ,(vector-subscript (second inner) (third inner) index data-references))))
@@ -646,7 +655,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
              (reduce (lambda (left right) `(,name ,left ,right))
                      (mapcar (lambda (subexpression)
                                (vector-emit subexpression element-type index scalars
-                                            data-references))
+                                            data-references offset))
                              (cddr expression))))))
     ((:scalar :const)
      ;; splats are computed once, before the loop, and live in an SSE register
@@ -690,6 +699,18 @@ guard still covers the reads."
   (loop for (name offsets . simple-p) in (vector-loop-arrays loop)
         unless simple-p
           collect (cons name (cons (make-symbol "DATA") (make-symbol "START")))))
+
+;;; The byte offset of an access, for a backend whose loads and stores address by
+;;; one rather than by the element index.  A loop computes a single offset per
+;;; iteration and shares it among the accesses that use the plain index, since an
+;;; iteration reads and writes every array at that same one; an access at any
+;;; other subscript - a stencil's (+ i 2) - computes its own, which is what each
+;;; access cost before they could be shared.
+(defun vector-offset-form (name subscript index data-references shared element-type)
+  (let ((subscript (vector-subscript name subscript index data-references)))
+    (if (and shared (equal subscript index))
+        shared
+        `(,(vector-primitive "OFFSET" element-type) ,subscript))))
 
 ;;; The index expression for element I plus OFFSET of the array NAME: when the
 ;;; array's data is not inline, the element is at START + I + OFFSET of the data
@@ -755,7 +776,12 @@ guard still covers the reads."
                              operators))
          (indexed (and (memq :index operators) t))
          (ramp (and indexed (vector-primitive "RAMP" element-type)))
-         (stride (and indexed (vector-primitive "STRIDE" element-type))))
+         (stride (and indexed (vector-primitive "STRIDE" element-type)))
+;;; a backend whose loads and stores address by a byte offset lets the iteration
+;;; compute that offset once and share it; one that addresses by the index, as
+;;; x86-64 does with its scaled address mode, leaves this NIL and each access
+;;; builds its own.
+         (offset (and (vector-primitive "OFFSET" element-type) (make-symbol "OFFSET"))))
     (when indexed
 ;;; the lane offsets, then a constant step per iteration: rebuilding the index pack
 ;;; each time costs four instructions and a dependency chain.
@@ -780,7 +806,17 @@ guard still covers the reads."
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
-      (flet ((reference (name) (or (cadr (assoc name references)) name)))
+      (labels ((reference (name) (or (cadr (assoc name references)) name))
+               (store-form (offset)
+                 `(,store ,(vector-emit expression element-type index scalars references
+                                        offset)
+                          ,(reference (vloop-destination loop))
+                          ,(if offset
+                               (vector-offset-form (vloop-destination loop)
+                                                   destination-offset index references
+                                                   offset element-type)
+                               (vector-subscript (vloop-destination loop)
+                                                 destination-offset index references)))))
         (let ((guard
                 (loop for entry in arrays
                       for name = (first entry)
@@ -797,11 +833,12 @@ guard still covers the reads."
                     (do ((,index 0 (+ ,index ,width)))
                         ((>= ,index ,end))
                       (declare (type index ,index))
-                      (,store ,(vector-emit expression element-type index scalars references)
-                              ,(reference (vloop-destination loop))
-                              ,(vector-subscript (vloop-destination loop)
-                                                 destination-offset
-                                                 index references))
+                      ,(if offset
+                           `(let ((,offset (,(vector-primitive "OFFSET" element-type)
+                                            ,index)))
+                              (declare (type (unsigned-byte 64) ,offset))
+                              ,(store-form offset))
+                           (store-form nil))
                       ,@(when indexed
                           ;; leave the pack holding the offsets for the next
                           ;; iteration
@@ -858,6 +895,7 @@ guard still covers the reads."
          (store (vector-primitive "STORE" element-type))
          (splat (vector-primitive "SPLAT" element-type))
          (add (vector-primitive "ADD" element-type))
+         (offset (and (vector-primitive "OFFSET" element-type) (make-symbol "OFFSET")))
          (arithmetic (mapcar (lambda (operator)
                                (vector-primitive (vector-operator-base operator element-type)
                                                  element-type))
@@ -907,16 +945,28 @@ guard still covers the reads."
              (do ((,index 0 (+ ,index ,width)))
                  ((>= ,index ,end))
                (declare (type index ,index))
-               (setf ,accumulating
-                     (,add ,accumulating
-                           ,(vector-emit expression element-type index scalars nil))))
+               ,(if offset
+                    `(let ((,offset (,(vector-primitive "OFFSET" element-type)
+                                     ,index)))
+                       (declare (type (unsigned-byte 64) ,offset))
+                       (setf ,accumulating
+                             (,add ,accumulating
+                                   ,(vector-emit expression element-type index scalars
+                                                 nil offset))))
+                    `(setf ,accumulating
+                           (,add ,accumulating
+                                 ,(vector-emit expression element-type index scalars
+                                               nil)))))
              ;; the tail, one element at a time, exactly as written
              (do ((,index ,end (1+ ,index)))
                  ((>= ,index ,count))
                (declare (type index ,index))
                ,(vloop-body loop))
              ;; and the lanes into the variable
-             (,store ,accumulating ,lanes 0)
+             (,store ,accumulating ,lanes
+                     ,(if offset
+                          `(,(vector-primitive "OFFSET" element-type) 0)
+                          0))
              (dotimes (,lane ,width)
                (incf ,accumulator (aref ,lanes ,lane)))
              nil)

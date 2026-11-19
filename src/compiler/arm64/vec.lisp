@@ -103,81 +103,110 @@
 ;;; LDR and STR move a whole Q register when the destination is one, which is
 ;;; what an element slice of a simple array is: the guard the vectorizer emits
 ;;; covers a whole vector, so reading a vector at a time cannot leave the array.
-;;; one byte per element cannot be scaled - a tagged index counts two units per
-;;; element - so those vops untag the index and add it, and the rest shift it.
+;;;
+;;; both address memory by a byte offset rather than by the element index: one
+;;; byte per element cannot be scaled, a tagged index counts two units per
+;;; element, and an iteration touches every array at the same index, so the two
+;;; instructions that turn that index into an offset are worth spending once and
+;;; sharing.  %VEC-OFFSET-* computes it, and the loop vectorizer emits it once
+;;; per iteration for a backend that publishes it under the OFFSET base.
 
-(macrolet ((define-vec-load (name array-type pack-type sc element-size)
+(macrolet ((define-vec-load (name array-type pack-type sc)
              `(progn
-                (defknown (,name) (,(vec-array-ctype array-type) index) ,(vec-pack-ctype pack-type)
-                    (flushable))
+                (defknown (,name) (,(vec-array-ctype array-type) (unsigned-byte 64))
+                    ,(vec-pack-ctype pack-type)
+                  (flushable))
                 (define-vop (,name)
                 (:translate ,name)
                 (:args (vector :scs (descriptor-reg))
-                       (index :scs (any-reg)))
-                (:arg-types ,array-type tagged-num)
-                (:temporary (:sc non-descriptor-reg) offset)
+                       (offset :scs (unsigned-reg)))
+                (:arg-types ,array-type unsigned-byte-64)
                 (:results (result :scs (,sc)))
                 (:result-types ,pack-type)
-                (:generator 4
-                  (emit-vec-byte-offset offset index ,element-size)
+                (:generator 2
                   (inst ldr result (@ vector offset))))))
-           (define-vec-store (name pack-type array-type sc element-size)
+           (define-vec-store (name pack-type array-type sc)
              `(progn
-                (defknown (,name) (,(vec-pack-ctype pack-type) ,(vec-array-ctype array-type) index)
+                (defknown (,name) (,(vec-pack-ctype pack-type) ,(vec-array-ctype array-type)
+                                   (unsigned-byte 64))
                     (values)
                   ())
                 (define-vop (,name)
                 (:translate ,name)
                 (:args (value :scs (,sc))
                        (vector :scs (descriptor-reg))
-                       (index :scs (any-reg)))
-                (:arg-types ,pack-type ,array-type tagged-num)
-                (:temporary (:sc non-descriptor-reg) offset)
-                (:generator 4
-                  (emit-vec-byte-offset offset index ,element-size)
-                  (inst str value (@ vector offset)))))))
+                       (offset :scs (unsigned-reg)))
+                (:arg-types ,pack-type ,array-type unsigned-byte-64)
+                (:generator 2
+                  (inst str value (@ vector offset))))))
+           (define-vec-offset (name element-size)
+             `(progn
+                (defknown (,name) (index) (unsigned-byte 64) (flushable movable))
+                (define-vop (,name)
+                  (:translate ,name)
+                  (:args (index :scs (any-reg)))
+                  ;; the pass passes the loop's index, or an index plus a
+                  ;; displacement it has guarded to be non-negative, so a fixnum
+                  ;; is all this may claim: claiming POSITIVE-FIXNUM would add a
+                  ;; tag check to a variable subscript's offset on every iteration
+                  (:arg-types tagged-num)
+                  (:results (offset :scs (unsigned-reg)))
+                  (:result-types unsigned-byte-64)
+                  (:generator 2
+                    (emit-vec-byte-offset offset index ,element-size))))))
+  (define-vec-offset %vec-offset-single 4)
+  (define-vec-offset %vec-offset-double 8)
+  (define-vec-offset %vec-offset-ub8 1)
+  (define-vec-offset %vec-offset-sb8 1)
+  (define-vec-offset %vec-offset-ub16 2)
+  (define-vec-offset %vec-offset-sb16 2)
+  (define-vec-offset %vec-offset-ub32 4)
+  (define-vec-offset %vec-offset-sb32 4)
+  (define-vec-offset %vec-offset-ub64 8)
+  (define-vec-offset %vec-offset-sb64 8)
+
   (define-vec-load %vec-load-single simple-array-single-float simd-pack-single
-    single-neon-reg 4)
+    single-neon-reg)
   (define-vec-load %vec-load-double simple-array-double-float simd-pack-double
-    double-neon-reg 8)
+    double-neon-reg)
   (define-vec-store %vec-store-single simd-pack-single simple-array-single-float
-    single-neon-reg 4)
+    single-neon-reg)
   (define-vec-store %vec-store-double simd-pack-double simple-array-double-float
-    double-neon-reg 8)
+    double-neon-reg)
 
   (define-vec-load %vec-load-ub8 simple-array-unsigned-byte-8 simd-pack-ub8
-    int-neon-reg 1)
+    int-neon-reg)
   (define-vec-load %vec-load-sb8 simple-array-signed-byte-8 simd-pack-sb8
-    int-neon-reg 1)
+    int-neon-reg)
   (define-vec-load %vec-load-ub16 simple-array-unsigned-byte-16 simd-pack-ub16
-    int-neon-reg 2)
+    int-neon-reg)
   (define-vec-load %vec-load-sb16 simple-array-signed-byte-16 simd-pack-sb16
-    int-neon-reg 2)
+    int-neon-reg)
   (define-vec-load %vec-load-ub32 simple-array-unsigned-byte-32 simd-pack-ub32
-    int-neon-reg 4)
+    int-neon-reg)
   (define-vec-load %vec-load-sb32 simple-array-signed-byte-32 simd-pack-sb32
-    int-neon-reg 4)
+    int-neon-reg)
   (define-vec-load %vec-load-ub64 simple-array-unsigned-byte-64 simd-pack-ub64
-    int-neon-reg 8)
+    int-neon-reg)
   (define-vec-load %vec-load-sb64 simple-array-signed-byte-64 simd-pack-sb64
-    int-neon-reg 8)
+    int-neon-reg)
 
   (define-vec-store %vec-store-ub8 simd-pack-ub8 simple-array-unsigned-byte-8
-    int-neon-reg 1)
+    int-neon-reg)
   (define-vec-store %vec-store-sb8 simd-pack-sb8 simple-array-signed-byte-8
-    int-neon-reg 1)
+    int-neon-reg)
   (define-vec-store %vec-store-ub16 simd-pack-ub16 simple-array-unsigned-byte-16
-    int-neon-reg 2)
+    int-neon-reg)
   (define-vec-store %vec-store-sb16 simd-pack-sb16 simple-array-signed-byte-16
-    int-neon-reg 2)
+    int-neon-reg)
   (define-vec-store %vec-store-ub32 simd-pack-ub32 simple-array-unsigned-byte-32
-    int-neon-reg 4)
+    int-neon-reg)
   (define-vec-store %vec-store-sb32 simd-pack-sb32 simple-array-signed-byte-32
-    int-neon-reg 4)
+    int-neon-reg)
   (define-vec-store %vec-store-ub64 simd-pack-ub64 simple-array-unsigned-byte-64
-    int-neon-reg 8)
+    int-neon-reg)
   (define-vec-store %vec-store-sb64 simd-pack-sb64 simple-array-signed-byte-64
-    int-neon-reg 8))
+    int-neon-reg))
 
 ;;;; packed arithmetic
 ;;;
@@ -551,6 +580,16 @@
 (macrolet ((publish (base element-type name)
              `(push (cons (list ,base ',element-type) ',name) primitives)))
   (let ((primitives nil))
+    (publish "OFFSET" single-float %vec-offset-single)
+    (publish "OFFSET" double-float %vec-offset-double)
+    (publish "OFFSET" (unsigned-byte 8) %vec-offset-ub8)
+    (publish "OFFSET" (signed-byte 8) %vec-offset-sb8)
+    (publish "OFFSET" (unsigned-byte 16) %vec-offset-ub16)
+    (publish "OFFSET" (signed-byte 16) %vec-offset-sb16)
+    (publish "OFFSET" (unsigned-byte 32) %vec-offset-ub32)
+    (publish "OFFSET" (signed-byte 32) %vec-offset-sb32)
+    (publish "OFFSET" (unsigned-byte 64) %vec-offset-ub64)
+    (publish "OFFSET" (signed-byte 64) %vec-offset-sb64)
     (publish "LOAD" single-float %vec-load-single)
     (publish "LOAD" double-float %vec-load-double)
     (publish "STORE" single-float %vec-store-single)
