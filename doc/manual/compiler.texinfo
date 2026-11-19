@@ -1225,8 +1225,9 @@ efficient calling convention that forbids redefinition.
 @cindex vectorization
 @cindex SIMD
 
-On x86-64, an elementwise loop over an array is compiled to packed SSE
-instructions instead of scalar ones, so the loop
+On x86-64 and arm64, an elementwise loop over an array is compiled to packed
+SIMD instructions (@code{SSE} on x86-64, @code{NEON} on arm64) instead of scalar
+ones, so the loop
 
 @lisp
 (defun add (a b c n)
@@ -1239,7 +1240,8 @@ instructions instead of scalar ones, so the loop
 
 @noindent
 becomes one @code{movups}-@code{addps}-@code{movups} sequence per four elements
-followed by a scalar loop over the remaining ones.
+on x86-64, or one @code{ldr}-@code{fadd}-@code{str} sequence on arm64, followed
+by a scalar loop over the remaining ones.
 
 The pass takes its types from declarations rather than from type inference: an
 array takes part only when the code declares it to be a simple array of a
@@ -1271,9 +1273,19 @@ with @code{+}, @code{-}, @code{logand}, @code{logior}, @code{logxor},
 @end itemize
 
 @noindent
-SSE2 has byte-wise minimum and maximum for unsigned lanes only, so the pass
-reaches the others another way rather than using an instruction that would give
-the wrong answer.  Signed words use @code{PMINSW} and @code{PMAXSW}.
+@code{min} and @code{max} are packed on arm64 for the 8-bit, 16-bit and 32-bit
+lanes as well, and multiplication covers the 8-bit lanes there, which is one
+more width than SSE2 has.
+
+@noindent
+Which of those a build can do depends on the instructions its backend has.
+@code{NEON} has a packed minimum and maximum for every lane width up to 32 bits,
+in both signednesses, so an arm64 build vectorizes all of them, and it
+multiplies the 8-bit, 16-bit and 32-bit integer lanes; it has no packed
+minimum, maximum or multiply for 64-bit lanes, so those loops stay scalar.  On x86-64, SSE2 has
+byte-wise minimum and maximum for unsigned lanes only, so the pass reaches the
+others another way rather than using an instruction that would give the wrong
+answer.  Signed words use @code{PMINSW} and @code{PMAXSW}.
 @code{min} and @code{max} on signed bytes bias both operands with
 @code{PXOR} and then use the unsigned instruction, and unsigned words use the
 saturating subtract, since @code{min(a, b)} is @code{a - max(a - b, 0)}.
@@ -1302,9 +1314,10 @@ not need @code{(safety 0)}.
 @noindent
 Integer arithmetic wraps around at the width of the element type, which is what
 a scalar loop storing into an array of that type does once the range check is
-off.  Multiplication is available for the float element types and for the 16-bit
-integer ones, where it produces the low 16 bits of each product exactly as storing
-into such an element does; division is available for the floats only.
+off.  Multiplication is available for the float element types and, on x86-64, for the
+16-bit integer ones (8- and 16- and 32-bit lanes on arm64), where it produces the
+low bits of each product exactly as storing into such an element does; division is
+available for the floats only.
 
 The loop may be written as a @code{dotimes}, as a @code{do} whose single binding
 counts from zero by one and whose end test is @code{(>= i n)} or @code{(= i n)},
@@ -1449,6 +1462,10 @@ The pass also leaves alone a loop whose body carries its own policy declaration,
 since that policy is not the one the loop form is compiled under.
 
 @subsection 256-bit lanes
+
+The widths in this section are x86-64's: an arm64 build publishes 128-bit
+primitives, and every loop it takes runs four elements at a time for singles, two
+for doubles, sixteen for bytes and eight for 16-bit words.
 
 A build whose backend enables @code{:AVX2} publishes 256-bit primitives as well
 as 128-bit ones, and the pass then takes twice as many elements per iteration for
