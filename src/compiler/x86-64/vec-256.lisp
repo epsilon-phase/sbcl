@@ -558,6 +558,49 @@
     (simple-array (signed-byte 16) (*)) (simd-pack-256 single-float)
     simd-pack-256-single single-avx2-reg vpmovsxwd 2))
 
+;;;; packed minimum and maximum
+;;;
+;;; Every signedness and width a 128-bit loop has here has a one-instruction AVX2
+;;; form, where the 128-bit section needs the saturating-difference trick for
+;;; unsigned words and a bias for signed bytes.  Nothing is exact beyond these
+;;; four element types: 32-bit lanes keep the 128-bit width.
+
+(defknown (%vec-min-ub8-256 %vec-max-ub8-256)
+    ((simd-pack-256 (unsigned-byte 8)) (simd-pack-256 (unsigned-byte 8)))
+    (simd-pack-256 (unsigned-byte 8))
+  (flushable movable))
+(defknown (%vec-min-sb8-256 %vec-max-sb8-256)
+    ((simd-pack-256 (signed-byte 8)) (simd-pack-256 (signed-byte 8)))
+    (simd-pack-256 (signed-byte 8))
+  (flushable movable))
+(defknown (%vec-min-ub16-256 %vec-max-ub16-256)
+    ((simd-pack-256 (unsigned-byte 16)) (simd-pack-256 (unsigned-byte 16)))
+    (simd-pack-256 (unsigned-byte 16))
+  (flushable movable))
+(defknown (%vec-min-sb16-256 %vec-max-sb16-256)
+    ((simd-pack-256 (signed-byte 16)) (simd-pack-256 (signed-byte 16)))
+    (simd-pack-256 (signed-byte 16))
+  (flushable movable))
+
+(macrolet ((define-vec-min-max-256 (name type instruction)
+             `(define-vop (,name)
+                (:translate ,name)
+                (:args (a :scs (int-avx2-reg))
+                       (b :scs (int-avx2-reg)))
+                (:arg-types ,type ,type)
+                (:results (result :scs (int-avx2-reg)))
+                (:result-types ,type)
+                (:generator 2
+                  (inst ,instruction result a b)))))
+  (define-vec-min-max-256 %vec-min-ub8-256 simd-pack-256-ub8 vpminub)
+  (define-vec-min-max-256 %vec-max-ub8-256 simd-pack-256-ub8 vpmaxub)
+  (define-vec-min-max-256 %vec-min-sb8-256 simd-pack-256-sb8 vpminsb)
+  (define-vec-min-max-256 %vec-max-sb8-256 simd-pack-256-sb8 vpmaxsb)
+  (define-vec-min-max-256 %vec-min-ub16-256 simd-pack-256-ub16 vpminuw)
+  (define-vec-min-max-256 %vec-max-ub16-256 simd-pack-256-ub16 vpmaxuw)
+  (define-vec-min-max-256 %vec-min-sb16-256 simd-pack-256-sb16 vpminsw)
+  (define-vec-min-max-256 %vec-max-sb16-256 simd-pack-256-sb16 vpmaxsw))
+
 ;;;; handing the primitives to SB-C
 ;;;
 ;;; Only when the build enables :AVX2.  The pass asks for a 256-bit primitive by
@@ -589,6 +632,14 @@
       (publish "WIDEN-SB8" single-float %vec-widen-sb8-single-256)
       (publish "WIDEN-UB16" single-float %vec-widen-ub16-single-256)
       (publish "WIDEN-SB16" single-float %vec-widen-sb16-single-256)
+      (publish "MIN" (unsigned-byte 8) %vec-min-ub8-256)
+      (publish "MAX" (unsigned-byte 8) %vec-max-ub8-256)
+      (publish "MIN" (signed-byte 8) %vec-min-sb8-256)
+      (publish "MAX" (signed-byte 8) %vec-max-sb8-256)
+      (publish "MIN" (unsigned-byte 16) %vec-min-ub16-256)
+      (publish "MAX" (unsigned-byte 16) %vec-max-ub16-256)
+      (publish "MIN" (signed-byte 16) %vec-min-sb16-256)
+      (publish "MAX" (signed-byte 16) %vec-max-sb16-256)
       (publish "LOAD" (unsigned-byte 8) %vec-load-ub8-256)
       (publish "STORE" (unsigned-byte 8) %vec-store-ub8-256)
       (publish "SPLAT" (unsigned-byte 8) %vec-splat-ub8-256)
