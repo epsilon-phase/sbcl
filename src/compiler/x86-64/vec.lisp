@@ -325,22 +325,13 @@
 ;;; from there into int-sse-reg, so the transfer is an instruction: movd for
 ;;; 32-bit lanes, movq for 64-bit.
 ;;;
-;;; the splat vops take an unsigned-num or signed-num operand, so when the
-;;; operand's Lisp type is a subtype of fixnum the backend strips the tag where the
-;;; value is defined and the register holds an untagged word: the six vops for
-;;; lanes narrower than a word take the operand as it arrives.  a 64-bit lane may
-;;; be declared (unsigned-byte 64), which no fixnum subtype covers, so nothing
-;;; strips the tag there and the two 64-bit vops do it themselves.
-
-;;; true when tn holds a tagged fixnum.  the test is on the primitive type the
-;;; register was allocated for, not on the Lisp type of the reference: an integer
-;;; literal arrives untagged, a variable declared (unsigned-byte 64) arrives
-;;; tagged.  a logical shift looks right and is not: -3 is tagged -6, whose low 32
-;;; bits are #xFFFFFFFA, and shifting that logically by one gives 2147483645.
-(defun tagged-fixnum-tn-p (tn)
-  (let ((primitive-type (sb-c::tn-primitive-type tn)))
-    (or (eq primitive-type (sb-c::primitive-type-or-lose 'fixnum))
-        (eq primitive-type (sb-c::primitive-type-or-lose 'positive-fixnum)))))
+;;; the splat vops take an unsigned-num or signed-num operand, and every one of
+;;; them takes it as it arrives: the argument's storage class is one of the
+;;; untagged ones, so the move that put the value in the register is what
+;;; stripped the tag, whatever primitive type the value came from.  untagging
+;;; again in the 64-bit vops would halve a scalar the loop declared fixnum, which
+;;; the pass offers to a 64-bit lane loop just as it does a (signed-byte 64) one;
+;;; tests/auto-vectorize.pure.lisp pins both.
 
 (define-vop (%vec-splat-ub32)
   (:translate %vec-splat-ub32)
@@ -366,30 +357,20 @@
   (:translate %vec-splat-ub64)
   (:args (x :scs (unsigned-reg signed-reg) :target result))
   (:arg-types unsigned-num)
-  (:temporary (:sc unsigned-reg) word)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub64)
   (:generator 2
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x)
-               (inst sar word n-fixnum-tag-bits)
-               (inst movq result word))
-        (inst movq result x))
+    (inst movq result x)
     (inst punpcklqdq result result)))
 
 (define-vop (%vec-splat-sb64)
   (:translate %vec-splat-sb64)
   (:args (x :scs (unsigned-reg signed-reg) :target result))
   (:arg-types signed-num)
-  (:temporary (:sc unsigned-reg) word)
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb64)
   (:generator 2
-    (if (tagged-fixnum-tn-p x)
-        (progn (move word x)
-               (inst sar word n-fixnum-tag-bits)
-               (inst movq result word))
-        (inst movq result x))
+    (inst movq result x)
     (inst punpcklqdq result result)))
 
 ;;;; 8-bit lanes: sixteen at a time
