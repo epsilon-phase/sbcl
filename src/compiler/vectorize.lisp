@@ -59,9 +59,10 @@
     (case operator
       (+ "ADD")
       (- "SUB")
-      (* (and (or floats (member element-type '((signed-byte 16) (unsigned-byte 16))
-                                 :test #'equal))
-                     "MUL"))
+      ;; which widths have a multiply is the primitive table's business: pmullw
+      ;; covers 16-bit lanes at any build, pmulld and vpmulld need sse4.1 or avx2,
+      ;; and nothing multiplies 64-bit lanes short of avx512
+      (* "MUL")
       (/ (and floats "DIV"))
       (logand (and (not floats) "AND"))
       (logior (and (not floats) "OR"))
@@ -1079,10 +1080,18 @@ guard still covers the reads."
     (let ((reason (vector-negative-offset-reason expression index)))
       (when reason (push reason reasons)))
     (when element-type
-      (dolist (operator (remove-duplicates (vector-shape-operators expression) :test #'eq))
-        (unless (vector-operator-base operator element-type)
-          (push (format nil "~a is not available for ~a lanes" operator element-type)
-                reasons)))
+      ;; the operator having a base is not the whole answer: the base names a
+      ;; primitive, and whether this build has it is the table's business.  pmulld
+      ;; needs sse4.1 where vpmulld needs avx2, so a loop can be available at one
+      ;; width and not the other, and 64-bit lanes have no multiply at either.
+      (flet ((available-p (base)
+               (or (vector-primitive base element-type 16)
+                   (vector-primitive base element-type 32))))
+        (dolist (operator (remove-duplicates (vector-shape-operators expression) :test #'eq))
+          (let ((base (vector-operator-base operator element-type)))
+            (unless (and base (available-p base))
+              (push (format nil "~a is not available for ~a lanes" operator element-type)
+                    reasons)))))
       (unless (or (vector-float-element-type-p element-type) unchecked-p
                   (vector-exact-expression-p expression))
         (push (format nil "~a lanes wrap where a checked loop would signal, so they are only ~

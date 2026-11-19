@@ -1722,13 +1722,24 @@ a writer with a fixed color type ends up with."
     (assert (vectorize-note-mentions notes "not known to be an array") () "no note: ~s" notes)))
 
 (test-util:with-test (:name :vectorize-missed-operator-note :skipped-on (not :x86-64))
-  ;; SSE2 has no lane multiply for 32-bit integers; say so rather than nothing
+  ;; nothing multiplies 64-bit lanes at any width, so that is what the note says
+  (let ((notes (vectorize-notes-for
+                '(lambda (a b c n)
+                   (declare (type (simple-array (unsigned-byte 64) (*)) a b c)
+                            (type fixnum n) (optimize speed))
+                   (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))))))
+    (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes))
+  ;; 32-bit multiply exists on sse4.1 and later, and where it does not the note is
+  ;; the same one; where it does, the loop declines at default safety instead,
+  ;; because the lanes would wrap where a checked loop signals
   (let ((notes (vectorize-notes-for
                 '(lambda (a b c n)
                    (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
                             (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))))))
-    (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes))
+    (if (member :sse4 sb-c:*backend-subfeatures*)
+        (assert (vectorize-note-mentions notes "safety 0") () "no note: ~s" notes)
+        (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes)))
   ;; byte lanes outside (safety 0)
   (let ((notes (vectorize-notes-for
                 '(lambda (a b c n)
@@ -2430,6 +2441,73 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
       (assert (member "vpmovsxwd" (mnemonics #'vectorize-s16-to-single) :test #'string=) ()
               "s16 to single is not the 256-bit narrowing load: ~A"
               (vectorize-disassembly-text #'vectorize-s16-to-single)))))
+
+;;;; 32-bit multiplication.  PMULLD is SSE4.1 and VPMULLD is AVX2, so whether a
+;;;; loop is packed at all is a property of the build: a build with neither
+;;;; instruction declines it, and the values below are checked wherever it does not.
+
+(defun vectorize-mul-u32 (a b c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))
+  c)
+
+(defun vectorize-mul-s32 (a b c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a b c) (type vectorize-index n)
+           (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))
+  c)
+
+(test-util:with-test (:name :vectorize-32-bit-multiply :skipped-on (not :x86-64))
+  ;; the lane holds the low 32 bits of the product, which is what the scalar loop
+  ;; leaves once the store truncates - the same wrapping (safety 0) buys for
+  ;; addition.  The low bits of a product do not depend on signedness, so the
+  ;; unsigned expectation and the signed one are the same bits read differently.
+  (flet ((low-32 (product)
+           (logand product #xFFFFFFFF))
+         (as-signed (bits)
+           (if (logbitp 31 bits) (- bits #x100000000) bits)))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(unsigned-byte 32)
+                                           '(0 1 2 65536 4294967295 3 100000 7) n)
+          for b = (vectorize-integer-array '(unsigned-byte 32)
+                                           '(1 3 4294967295 65537 2 5 999 11) n 5)
+          for c = (make-array n :element-type '(unsigned-byte 32) :initial-element 0)
+          do (vectorize-mul-u32 a b c n)
+             (dotimes (i n)
+               (let ((want (low-32 (* (aref a i) (aref b i)))))
+                 (unless (= (aref c i) want)
+                   (error "~@<u32 multiply: element ~D of ~D is ~S, expected ~S~:@>"
+                          i n (aref c i) want)))))
+    (loop for n in *vectorize-lengths*
+          for a = (vectorize-integer-array '(signed-byte 32)
+                                           '(0 1 -1 2 -2 65536 -65536 2147483647) n)
+          for b = (vectorize-integer-array '(signed-byte 32)
+                                           '(1 -1 3 -3 65536 2 -2147483648 7) n 3)
+          for c = (make-array n :element-type '(signed-byte 32) :initial-element 0)
+          do (vectorize-mul-s32 a b c n)
+             (dotimes (i n)
+               (let ((want (as-signed (low-32 (* (aref a i) (aref b i))))))
+                 (unless (= (aref c i) want)
+                   (error "~@<s32 multiply: element ~D of ~D is ~S, expected ~S~:@>"
+                          i n (aref c i) want))))))
+  ;; packed when the build has an instruction for it, and the width picks itself:
+  ;; vpmulld at 256 bits, pmulld at 128
+  (flet ((disassembly (function) (vectorize-disassembly-text function)))
+    (if (member :avx2 sb-c:*backend-subfeatures*)
+        (progn
+          (dolist (function (list #'vectorize-mul-u32 #'vectorize-mul-s32))
+            (assert (search "vpmulld" (disassembly function)) ()
+                    "32-bit multiply did not take the 256-bit instruction: ~A"
+                    (disassembly function))
+            (assert (vectorize-wide-p function) ()
+                    "32-bit multiply stayed at 128 bits on an AVX2 build: ~A"
+                    (disassembly function))))
+        (when (member :sse4 sb-c:*backend-subfeatures*)
+          (dolist (function (list #'vectorize-mul-u32 #'vectorize-mul-s32))
+            (assert (search "pmulld" (disassembly function)) ()
+                    "32-bit multiply is not packed on an SSE4.1 build: ~A"
+                    (disassembly function)))))))
 
 ;;; Clamping is where the wider width earns its pay on image and audio data: a
 ;;; byte clamp is one VPMINUB per thirty-two elements.  The values are checked by
