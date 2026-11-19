@@ -1005,6 +1005,45 @@
     (inst pmullw arith-tmp b)
     (move result arith-tmp)))
 
+;;; 32-bit multiplication is PMULLD, which is SSE4.1 rather than SSE2, so both the
+;;; vop and its entry in the table are published only by a build that has the
+;;; instruction: a table entry with no vop behind it is worse than no entry, since
+;;; the pass finds it, emits the call, and the loop dies with an undefined function.
+;;;
+;;; one instruction serves both element types, because the low 32 bits of a product
+;;; do not depend on the signedness of the operands - the lane holds the same bits
+;;; either way, and only a load or store interprets them.
+
+(defknown (%vec-mul-ub32) ((simd-pack (unsigned-byte 32)) (simd-pack (unsigned-byte 32))) (simd-pack (unsigned-byte 32)) (flushable movable))
+
+(define-vop (%vec-mul-ub32)
+  (:translate %vec-mul-ub32)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub32 simd-pack-ub32)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub32)
+  (:generator 3
+    ;; the arguments are read before the result is written, so the product is
+    ;; computed into the temporary and moved to the result last
+    (move arith-tmp a)
+    (inst pmulld arith-tmp b)
+    (move result arith-tmp)))
+
+(defknown (%vec-mul-sb32) ((simd-pack (signed-byte 32)) (simd-pack (signed-byte 32))) (simd-pack (signed-byte 32)) (flushable movable))
+
+(define-vop (%vec-mul-sb32)
+  (:translate %vec-mul-sb32)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb32 simd-pack-sb32)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) arith-tmp)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb32)
+  (:generator 3
+    (move arith-tmp a)
+    (inst pmulld arith-tmp b)
+    (move result arith-tmp)))
+
 ;;; minimum and maximum beyond the unsigned bytes above.  pminsw and pmaxsw are
 ;;; sse2, so signed words take one instruction each.  unsigned words have no sse2
 ;;; form: min(a,b) is a - max(a-b,0) and max(a,b) is a + max(b-a,0), and psubusw
@@ -1386,6 +1425,9 @@
     (publish "STRIDE" double-float %vec-stride-double)
     (publish "MUL" (unsigned-byte 16) %vec-mul-ub16)
     (publish "MUL" (signed-byte 16) %vec-mul-sb16)
+    (when (member :sse4 *backend-subfeatures*)
+      (publish "MUL" (unsigned-byte 32) %vec-mul-ub32)
+      (publish "MUL" (signed-byte 32) %vec-mul-sb32))
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)
