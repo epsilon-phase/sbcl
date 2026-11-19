@@ -69,16 +69,22 @@ store would signal - so the integer pairs ask for it; float lanes do not care."
         (b (make-random-array element-type size))
         (c (make-array size :element-type element-type)))
     (funcall function a b c size)
-    (let ((start (get-internal-real-time))
-          (repetitions (repetitions-for size))
-          (elapsed 0))
-      (dotimes (i repetitions)
-        (funcall function a b c size)
-        (let ((now (get-internal-real-time)))
-          (incf elapsed (- now start))
-          (setf start now)))
-      (let* ((seconds (/ elapsed internal-time-units-per-second))
-             (bytes (* 2 size repetitions (element-size element-type))))
+    ;; The timer has millisecond resolution, so a measurement has to be a batch
+    ;; of calls; and the machine may be busy with something else for part of a
+    ;; run, so the fastest batch is the one that measures the loop.  Reporting
+    ;; the mean instead lets one preempted batch halve the number, which is
+    ;; exactly how a busy machine turns into a phantom regression.
+    (let* ((batches 5)
+           (calls (max 1 (floor (repetitions-for size) batches)))
+           (best most-positive-fixnum))
+      (dotimes (i batches)
+        (let ((start (get-internal-real-time)))
+          (dotimes (j calls)
+            (funcall function a b c size))
+          (setf best (min best (- (get-internal-real-time) start)))))
+      ;; BEST is the time of one batch, so the bytes are one batch's too
+      (let* ((seconds (/ best internal-time-units-per-second))
+             (bytes (* 2 size calls (element-size element-type))))
         (values seconds (/ bytes seconds 1d9))))))
 
 (dolist (size *sizes*)

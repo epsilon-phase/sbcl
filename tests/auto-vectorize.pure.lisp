@@ -2382,20 +2382,82 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
             (assert wide () "loop did not take 256-bit lanes on an AVX2 build: ~A" text)
             (assert (not wide) () "loop took 256-bit lanes without AVX2: ~A" text))))))
 
-;;; A widen has no 256-bit sequence yet, so a loop that reads narrow elements
-;;; into float lanes has to fall back to 128 bits rather than mix the two
-;;; widths, which would be a type error in the emitted form.  The fallback is
-;;; what makes it worth asserting that the values are still right.
+;;; A byte or word source read into four double lanes has no 256-bit widen: the
+;;; narrowing loads that would do it read eight bytes or sixteen, one element
+;;; wider than the loop consumes, and on the last iteration that reads past the
+;;; array.  So that loop keeps the 128-bit width, and the values still have to be
+;;; right.  Reading a narrow source into single lanes does have one, and the pass
+;;; must actually take it on a build that publishes it.
 (test-util:with-test (:name :vectorize-256-bit-widen-falls-back :skipped-on (not :x86-64))
-  (assert (not (vectorize-wide-p #'vectorize-u8-to-single)) ()
-          "a widening loop took 256-bit lanes: ~A"
-          (vectorize-disassembly-text #'vectorize-u8-to-single))
+  (assert (not (vectorize-wide-p #'vectorize-u8-to-double)) ()
+          "a byte-to-double widening loop took 256-bit lanes: ~A"
+          (vectorize-disassembly-text #'vectorize-u8-to-double))
   (let ((values '(10 20 30 40 50 60 70 80 90 100)))
     (let ((a (make-array 10 :element-type '(unsigned-byte 8) :initial-contents values))
-          (c (make-array 10 :element-type 'single-float :initial-element -1.0f0)))
-      (vectorize-u8-to-single a c 10)
-      (assert (equalp c (coerce (mapcar (lambda (x) (* 2.0 x)) values) 'vector))
-              () "widened values: ~A" c))))
+          (c (make-array 10 :element-type 'double-float :initial-element -1d0)))
+      (vectorize-u8-to-double a c 10)
+      (assert (equalp c (coerce values 'vector)) () "widened values: ~A" c))))
+
+;;; The narrow-to-single widens at both widths: which one a build takes is the
+;;; build's business, but a build that publishes the 256-bit primitive has to be
+;;; the one that uses it, or the publication is dead weight nobody notices.
+(test-util:with-test (:name :vectorize-256-bit-narrow-widen :skipped-on (not :x86-64))
+  (flet ((mnemonics (function)
+           (remove-if-not (lambda (m) (search m (vectorize-disassembly-text function)))
+                          '("vpmovzxbd" "vpmovsxbd" "vpmovzxwd" "vpmovsxwd"
+                            "pmovzxbd" "pmovsxbd" "pmovzxwd" "pmovsxwd" "cvtdq2ps"))))
+    (dolist (function (list #'vectorize-u8-to-single #'vectorize-s8-to-single
+                            #'vectorize-u16-to-single #'vectorize-s16-to-single))
+      (assert (member "cvtdq2ps" (mnemonics function) :test #'string=) ()
+              "narrow to single is not a packed widen: ~A"
+              (vectorize-disassembly-text function))
+      (if (vectorize-avx2-p)
+          (assert (vectorize-wide-p function) ()
+                  "a narrow-to-single widen stayed at 128 bits on an AVX2 build: ~A"
+                  (vectorize-disassembly-text function))
+          (assert (not (vectorize-wide-p function)) ()
+                  "a narrow-to-single widen took 256-bit lanes without AVX2: ~A"
+                  (vectorize-disassembly-text function))))
+    (when (vectorize-avx2-p)
+      (assert (member "vpmovzxbd" (mnemonics #'vectorize-u8-to-single) :test #'string=) ()
+              "u8 to single is not the 256-bit narrowing load: ~A"
+              (vectorize-disassembly-text #'vectorize-u8-to-single))
+      (assert (member "vpmovsxwd" (mnemonics #'vectorize-s16-to-single) :test #'string=) ()
+              "s16 to single is not the 256-bit narrowing load: ~A"
+              (vectorize-disassembly-text #'vectorize-s16-to-single)))))
+
+;;; A single-float source read into double lanes is exact, since every
+;;; single-float is a double-float.  The vop that does it once went missing while
+;;; the widen section was regenerated: the defknown and the table entry outlived
+;;; it, so the pass still emitted the call and the loop died at run time with an
+;;; undefined function.  Compiling one of these loops is the check that catches
+;;; that, and it is cheap.
+(defun vectorize-single-to-double (in out n)
+  (declare (type (simple-array single-float (*)) in)
+           (type (simple-array double-float (*)) out)
+           (type vectorize-index n) (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 1.0d0 (aref in i))))
+  out)
+
+(test-util:with-test (:name :vectorize-single-to-double-widen :skipped-on (not :x86-64))
+  (assert (search "cvtps2pd" (vectorize-disassembly-text #'vectorize-single-to-double)) ()
+          "single to double is not a packed widen: ~A"
+          (vectorize-disassembly-text #'vectorize-single-to-double))
+  (if (vectorize-avx2-p)
+      (assert (vectorize-wide-p #'vectorize-single-to-double) ()
+              "single to double stayed at 128 bits on an AVX2 build: ~A"
+              (vectorize-disassembly-text #'vectorize-single-to-double))
+      (assert (not (vectorize-wide-p #'vectorize-single-to-double)) ()
+              "single to double took 256-bit lanes without AVX2: ~A"
+              (vectorize-disassembly-text #'vectorize-single-to-double)))
+  (loop for n in *vectorize-lengths*
+        for in = (vectorize-integer-array 'single-float '(-1.5 0.0 0.25 3.0 1.0e30) n)
+        for out = (make-array n :element-type 'double-float :initial-element -1d0)
+        do (vectorize-single-to-double in out n)
+           (dotimes (i n)
+             (unless (= (aref out i) (aref in i))
+               (error "~@<single to double: element ~D of ~D is ~S, expected ~S~:@>"
+                      i n (aref out i) (aref in i))))))
 
 (test-util:with-test (:name :vectorize-widen-instruction-set :skipped-on (not :x86-64))
   (flet ((mnemonics (function)

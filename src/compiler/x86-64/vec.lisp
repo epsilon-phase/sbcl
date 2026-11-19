@@ -1332,6 +1332,30 @@
       (inst cvtdq2pd result result)))
 )
 
+;;;; a single-float source read into double lanes: two floats are one MOVQ, and
+;;;; CVTPS2PD takes them to two doubles with no rounding, since every single-float
+;;;; is exactly a double-float.
+;;;
+;;;; this vop went missing while the widen section was regenerated, and nothing
+;;;; failed until a loop needed it: the defknown above and the table entry below
+;;;; had outlived it, which is what a missing vop looks like.  the pass finds the
+;;;; entry, emits the call, and the loop dies at run time with an undefined
+;;;; function, so tests/auto-vectorize.pure.lisp compiles one now.
+
+(define-vop (%vec-widen-single-double)
+  (:translate %vec-widen-single-double)
+  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+  (:arg-types simple-array-single-float tagged-num)
+  (:temporary (:sc any-reg) byte-index)
+  (:results (result :scs (double-sse-reg)))
+  (:result-types simd-pack-double)
+  (:generator 4
+    (move byte-index index)
+    (inst shr byte-index n-fixnum-tag-bits)
+    (inst movq result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                          vector byte-index 4))
+    (inst cvtps2pd result result)))
+
 ;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
 
