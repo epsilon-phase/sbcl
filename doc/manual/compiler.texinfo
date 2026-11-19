@@ -1428,7 +1428,13 @@ turned off for a compilation with
 @noindent
 The pass uses integer lanes only where the packed store cannot disagree with a
 checked one.  Arithmetic wraps around where a checked store signals an error, so a
-loop that contains any is vectorized only at @code{(safety 0)}.  A loop whose value
+loop that contains any is vectorized only at @code{(safety 0)}.  That covers
+multiplication as well as addition: a packed lane holds the low bits of each
+product, which is what the scalar loop leaves once the store truncates, and the low
+bits do not depend on the signedness of the operands.  Multiplication of 32-bit
+lanes needs @code{PMULLD}, which is SSE4.1 rather than SSE2, so a build without
+that subfeature declines those loops - as it always did - and nothing multiplies
+64-bit lanes at any width.  A loop whose value
 is a load, a broadcast or a @code{min} or @code{max} is exact: every value it can
 store fits the element type, so it is vectorized at any safety.  Clamping code
 therefore does not need a policy declaration:
