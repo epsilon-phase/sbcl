@@ -314,6 +314,52 @@
            (type vectorize-index n) (optimize speed))
   (dotimes (i n) (setf (aref out i) (* 2d0 (aref in i)))))
 
+;;;; a body that writes more than one array
+
+;;; two destinations in one iteration, both at the loop index.
+(defun vec-two-destinations (re im n)
+  (declare (type (simple-array single-float (*)) re im) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref re i) (* 2.0 (aref re i)))
+    (setf (aref im i) (+ 1.0 (aref im i)))))
+
+;;; an in-place update: the iteration writes exactly the elements it read.
+(defun vec-in-place-swap (a n)
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type (and fixnum (unsigned-byte 62)) half))
+    (dotimes (i half)
+      (setf (aref a (+ i half)) (+ (aref a i) 1.0))
+      (setf (aref a i) (* 2.0 (aref a (+ i half)))))))
+
+;;; a butterfly: an index binding, intermediates the stores share, four stores
+;;; across two arrays.  This is the shape a radix-2 FFT's inner loop has.
+(defun vec-butterfly (re im wr wi n)
+  (declare (type (simple-array single-float (*)) re im wr wi)
+           (type vectorize-index n) (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type (and fixnum (unsigned-byte 62)) half))
+    (dotimes (k half)
+      (let* ((j (+ k half))
+             (tr (- (* (aref re j) (aref wr k)) (* (aref im j) (aref wi k))))
+             (ti (+ (* (aref re j) (aref wi k)) (* (aref im j) (aref wr k)))))
+        (declare (type single-float tr ti))
+        (setf (aref re j) (- (aref re k) tr))
+        (setf (aref im j) (- (aref im k) ti))
+        (setf (aref re k) (+ (aref re k) tr))
+        (setf (aref im k) (+ (aref im k) ti))))))
+
+;;; a write ahead of a read the loop cannot prove disjoint stays scalar.
+(defun vec-write-ahead (a n)
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type (and fixnum (unsigned-byte 62)) half))
+    (dotimes (i half)
+      (setf (aref a (+ i half)) (+ (aref a i) 1.0)))))
+
 ;;;; a reduction, and a stencil that reads ahead of what it writes
 
 (defun vec-u32-sum (a n total)
@@ -629,6 +675,72 @@
   (assert (uses #'vec-u16-to-double "ushll") () "u16 to double is not a packed widen")
   (assert (uses #'vec-s16-to-double "sshll") () "s16 to double is not a packed widen")
   (assert (uses #'vec-single-to-double "fcvtl") () "single to double is not a packed widen"))
+
+;;;; Several stores in one body.
+
+(test-util:with-test (:name :vectorize-arm64-multiple-stores)
+  ;; two destinations, each written once
+  (loop for n in *vectorize-lengths*
+        for re = (make-vector 'single-float *single-values* n)
+        for im = (make-vector 'single-float *single-values* n 2)
+        for want-re = (map 'vector (lambda (x) (* 2.0 x)) re)
+        for want-im = (map 'vector (lambda (x) (+ 1.0 x)) im)
+        do (vec-two-destinations re im n)
+           (dotimes (i n)
+             (unless (= (aref re i) (aref want-re i))
+               (error "two destinations: re ~D of ~D is ~S, expected ~S"
+                      i n (aref re i) (aref want-re i)))
+             (unless (= (aref im i) (aref want-im i))
+               (error "two destinations: im ~D of ~D is ~S, expected ~S"
+                      i n (aref im i) (aref want-im i)))))
+  (assert (uses #'vec-two-destinations "fmul" "fadd" ".4s")
+          () "two destinations are not packed")
+  ;; an in-place update: the iteration writes what it read
+  (loop for n in '(0 2 4 8 9 16 17 100)
+        for half = (ash n -1)
+        for a = (make-vector 'single-float *single-values* n)
+        for want = (let ((copy (copy-seq a)))
+                     (dotimes (i half)
+                       (let ((first (aref copy i)))
+                         (setf (aref copy (+ i half)) (+ first 1.0)
+                               (aref copy i) (* 2.0 (+ first 1.0)))))
+                     copy)
+        do (vec-in-place-swap a n)
+           (dotimes (i n)
+             (unless (= (aref a i) (aref want i))
+               (error "in-place update: element ~D of ~D is ~S, expected ~S"
+                      i n (aref a i) (aref want i)))))
+  (assert (uses #'vec-in-place-swap "fadd" "fmul") () "the in-place update is not packed")
+  ;; the butterfly
+  (loop for n in '(0 2 4 8 16 17 64 100)
+        for half = (ash n -1)
+        for re = (make-vector 'single-float *single-values* n)
+        for im = (make-vector 'single-float *single-values* n 3)
+        for wr = (make-vector 'single-float *single-values* half)
+        for wi = (make-vector 'single-float *single-values* half 1)
+        do (let ((want-re (copy-seq re))
+                 (want-im (copy-seq im)))
+             (dotimes (k half)
+               (let* ((j (+ k half))
+                      (tr (- (* (aref re j) (aref wr k)) (* (aref im j) (aref wi k))))
+                      (ti (+ (* (aref re j) (aref wi k)) (* (aref im j) (aref wr k)))))
+                 (setf (aref want-re j) (- (aref re k) tr)
+                       (aref want-im j) (- (aref im k) ti)
+                       (aref want-re k) (+ (aref re k) tr)
+                       (aref want-im k) (+ (aref im k) ti))))
+             (vec-butterfly re im wr wi n)
+             (dotimes (i n)
+               (unless (= (aref re i) (aref want-re i))
+                 (error "butterfly: re ~D of ~D is ~S, expected ~S"
+                        i n (aref re i) (aref want-re i)))
+               (unless (= (aref im i) (aref want-im i))
+                 (error "butterfly: im ~D of ~D is ~S, expected ~S"
+                        i n (aref im i) (aref want-im i)))))
+        (assert (uses #'vec-butterfly "fadd" "fsub" "fmul")
+                () "the butterfly is not packed"))
+  ;; a write the loop cannot prove lands behind its reads stays scalar
+  (assert (not (packed-p #'vec-write-ahead))
+          () "a write ahead of every read was packed"))
 
 (test-util:with-test (:name :vectorize-arm64-reduction)
   (loop for n in '(0 1 3 4 5 16 17 100)

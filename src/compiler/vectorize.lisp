@@ -142,8 +142,8 @@
 ;;;   (:const . number) a constant, broadcast
 ;;;   (:op operator subexpression ...) elementwise arithmetic
 (defstruct (vector-loop (:conc-name vloop-))
-  element-type index count destination destination-offset destination-simple-p
-  sources expression body fallback accumulator unchecked-p)
+  element-type index count stores sources expression intermediates body fallback
+  accumulator unchecked-p)
 
 ;;; a bound the generated code can evaluate without side effects: a variable, a
 ;;; literal, or arithmetic on one of those.
@@ -199,7 +199,7 @@ the loop, so it may not mention the index."
          (values (first (cdr subscript)) t))))
 
 ;;; Match an elementwise expression over N-element slices, or return NIL.
-(defun vector-match-expression (form env index element-type)
+(defun vector-match-expression (form env index element-type &optional substitutions)
   (cond ((numberp form)
 ;;; an integer constant has to fit in a fixnum: anything wider reaches the backend
 ;;; as a bignum, which no splat accepts.
@@ -208,17 +208,21 @@ the loop, so it may not mention the index."
                         (typep form 'fixnum)))
            (list :const form)))
         ((symbolp form)
-         ;; the loop index shadows whatever the enclosing scope says about that
-         ;; name, so it is never a broadcast operand
-         (unless (eq form index)
-           (multiple-value-bind (kind type) (vector-variable-info form env)
-             (when (and (eq kind :scalar) (equal type element-type))
-               (list :scalar form)))))
+         ;; a LET* binding of the loop body stands for the expression it is bound
+         ;; to: the stores below see that expression, or a name for it when they
+         ;; share it and it is worth computing once.
+         (or (cdr (assoc form substitutions))
+             ;; the loop index shadows whatever the enclosing scope says about that
+             ;; name, so it is never a broadcast operand
+             (unless (eq form index)
+               (multiple-value-bind (kind type) (vector-variable-info form env)
+                 (when (and (eq kind :scalar) (equal type element-type))
+                   (list :scalar form))))))
         ((atom form) nil)
         ((eq (car form) 'the)
          ;; only a THE that pins the element type exactly is usable
          (when (equal (second form) element-type)
-           (vector-match-expression (third form) env index element-type)))
+           (vector-match-expression (third form) env index element-type substitutions)))
         ;; the loop index itself, converted to the element type: a value that
         ;; depends on the index, like a gradient or a ramp table
         ((and (eq (car form) 'float) (null (cddr form))
@@ -250,7 +254,7 @@ the loop, so it may not mention the index."
 ;;; (- x) on a float flips the sign bit, which is not (- 0 x): the two disagree on
 ;;; zeroes, so floats get their own packed negation and integers subtract from zero.
         ((and (eq (car form) '-) (null (cdr (cdr form))))
-         (let ((subexpression (vector-match-expression (second form) env index element-type)))
+         (let ((subexpression (vector-match-expression (second form) env index element-type substitutions)))
            (when subexpression
              (if (vector-float-element-type-p element-type)
                  (list :negate subexpression)
@@ -260,7 +264,8 @@ the loop, so it may not mention the index."
            (when (and (cdr arguments) (vector-operator-base (car form) element-type))
              (let ((subexpressions
                      (mapcar (lambda (argument)
-                               (vector-match-expression argument env index element-type))
+                               (vector-match-expression argument env index element-type
+                                                        substitutions))
                              arguments)))
                (when (every #'identity subexpressions)
                  (cons :op (cons (car form) subexpressions)))))))
@@ -276,7 +281,7 @@ the loop, so it may not mention the index."
         `(setf ,place (,(if (eq (car form) 'incf) '+ '-) ,place ,delta)))
       form))
 
-(defun vector-match-element-store (form env index)
+(defun vector-match-element-store (form env index &optional substitutions element-type)
   (let ((form (vector-normalize-store form)))
     (when (and (consp form) (eq (car form) 'setf) (null (cdddr form)))
     (let ((place (second form)))
@@ -286,13 +291,147 @@ the loop, so it may not mention the index."
             (multiple-value-bind (offset literal-p)
                 (vector-subscript-offset (car subscripts) index)
               (when offset
-                (multiple-value-bind (name element-type simple-p) (vector-array-type array env)
-                  (when name
+                (multiple-value-bind (name store-type simple-p) (vector-array-type array env)
+                  (when (and name (or (null element-type) (equal store-type element-type)))
                     (let ((expression
-                            (vector-match-expression (third form) env index element-type)))
+                            (vector-match-expression (third form) env index store-type
+                                                     substitutions)))
                         (when expression
-                          (values name element-type expression offset
+                          (values name store-type expression offset
                                   simple-p literal-p))))))))))))))
+
+;;; How many times SYMBOL appears in FORM.
+(defun vector-count-symbol (form symbol)
+  (cond ((eq form symbol) 1)
+        ((consp form) (reduce #'+ (mapcar (lambda (part) (vector-count-symbol part symbol))
+                                          form)))
+        (t 0)))
+
+;;; The bindings and the stores of a loop body, with the body flattened:
+;;; (let* ((v init) ...) (setf ...) (setf ...))  is  bindings ((v init) ...) and
+;;; the stores it surrounds.  A SETF of several places is split the way the
+;;; scalar loop would perform it, left to right.
+(defun vector-flatten-body (statements)
+  (let ((bindings '()) (stores '()))
+    (labels ((walk (forms)
+               (dolist (form forms)
+                 (let ((form (vector-normalize-store form)))
+                   (cond ((and (consp form) (memq (car form) '(let let*)))
+                          (let ((pairs (second form)))
+                            (when (or (null pairs)
+                                      (not (every (lambda (pair)
+                                                    (and (consp pair) (= (length pair) 2)
+                                                         (symbolp (first pair))))
+                                                  pairs)))
+                              (return-from vector-flatten-body nil))
+                            (dolist (pair pairs) (push pair bindings))
+                            ;; a LET* that declares the type of its own bindings is
+                            ;; fine - those declarations are what the pass reads the
+                            ;; types from - but one that changes what the body means
+                            ;; is not
+                            (multiple-value-bind (declarations statements)
+                                (vector-split-declarations (cddr form))
+                              (when (vector-special-declaration-p declarations)
+                                (return-from vector-flatten-body nil))
+                              (walk statements))))
+                         ((and (consp form) (eq (car form) 'setf))
+                          (when (oddp (length (cdr form)))
+                            (return-from vector-flatten-body nil))
+                          (loop for (place value) on (cdr form) by #'cddr
+                                do (push `(setf ,place ,value) stores)))
+                         (t (return-from vector-flatten-body nil)))))))
+      (walk statements)
+      (values (nreverse bindings) (nreverse stores)))))
+
+;;; Match a loop body as element stores into arrays of one element type.  A body
+;;; may write several of them - a butterfly writes four elements across a real
+;;; and an imaginary vector, a complex multiply two - and may bind intermediates
+;;; in a LET*; one that the stores share is bound once in the emitted loop rather
+;;; than recomputed, since the expressions are trees.
+;;; The form a LET* binding stands for, following the bindings before it: a body
+;;; that writes (aref re j) with (j (+ k half)) is addressing k + HALF.
+(defun vector-resolve-index-form (form index-substitutions)
+  (if (symbolp form)
+      (let ((entry (assoc form index-substitutions :test #'eq)))
+        (if entry (vector-resolve-index-form (cdr entry) index-substitutions) form))
+      form))
+
+(defun vector-substitute-subscripts (form index-substitutions)
+  "Replace a LET*-bound index with the arithmetic it stands for, in every AREF."
+  (cond ((atom form) form)
+        ((eq (car form) 'aref)
+         (cons 'aref
+               (cons (second form)
+                     (mapcar (lambda (subscript)
+                               (vector-resolve-index-form subscript index-substitutions))
+                             (cddr form)))))
+        (t (mapcar (lambda (subform)
+                     (vector-substitute-subscripts subform index-substitutions))
+                   form))))
+
+;;; The element type of the array a store writes to, without matching its value:
+;;; the store matcher needs the type before it can match the bindings the value
+;;; is built from.
+(defun vector-store-place-type (form env)
+  (let ((form (vector-normalize-store form)))
+    (when (and (consp form) (eq (car form) 'setf) (null (cdddr form))
+               (consp (second form)) (eq (car (second form)) 'aref))
+      (destructuring-bind (array . subscripts) (cdr (second form))
+        (when (null (cdr subscripts))
+          (nth-value 1 (vector-array-type array env)))))))
+
+(defun vector-match-stores (statements env index)
+  (multiple-value-bind (bindings stores) (vector-flatten-body statements)
+    (when (and stores
+               ;; every store must write a slice of one and the same element type
+               (let ((type (vector-store-place-type (first stores) env)))
+                 (and type
+                      (every (lambda (store) (equal (vector-store-place-type store env) type))
+                             stores)
+                      type)))
+     ;; a binding that is an index - (j (+ k half)) - is not a value the stores
+     ;; compute; it is arithmetic the subscript matcher should see directly.
+     (let ((index-substitutions '()) (value-bindings '()))
+       (dolist (binding bindings)
+         (let ((form (vector-resolve-index-form (second binding) index-substitutions)))
+           (if (vector-subscript-offset form index)
+               (push (cons (first binding) form) index-substitutions)
+               (push binding value-bindings))))
+       (setf stores (mapcar (lambda (store)
+                              (vector-substitute-subscripts store index-substitutions))
+                            stores))
+       (setf bindings
+             (mapcar (lambda (binding)
+                       (list (first binding)
+                             (vector-substitute-subscripts (second binding)
+                                                           index-substitutions)))
+                     (nreverse value-bindings)))
+       (let ((element-type (vector-store-place-type (first stores) env))
+             (substitutions '()) (intermediates '()) (matched '()))
+         (flet ((uses (symbol)
+                  (reduce #'+ (append (mapcar (lambda (store)
+                                                (vector-count-symbol store symbol))
+                                              stores)
+                                      (mapcar (lambda (binding)
+                                                (vector-count-symbol (second binding) symbol))
+                                              bindings)))))
+           (dolist (binding bindings)
+             (let* ((var (first binding))
+                    (tree (vector-match-expression (second binding) env index
+                                                   element-type substitutions)))
+               (unless tree (return-from vector-match-stores nil))
+               (if (> (uses var) 1)
+                   (progn (push (list var tree) intermediates)
+                          (push (cons var (list :intermediate var)) substitutions))
+                   (push (cons var tree) substitutions))))
+           (dolist (store stores)
+             (multiple-value-bind (store-name store-type expression offset
+                                   simple-p literal-p)
+                 (vector-match-element-store store env index substitutions element-type)
+               (unless (and store-name (equal store-type element-type))
+                 (return-from vector-match-stores nil))
+               (push (list store-name offset simple-p literal-p expression) matched)))
+           (values element-type (nreverse matched) (nreverse intermediates))))))))
 
 ;;; Split leading DECLARE forms from a body.
 (defun vector-split-declarations (forms)
@@ -322,20 +461,19 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
           (when (and (symbolp index)
                      (vector-pure-count-p count))
             (multiple-value-bind (declarations statements) (vector-split-declarations body)
-              (when (and (null (cdr statements)) (not (vector-special-declaration-p declarations)))
-                (multiple-value-bind (destination element-type expression offset simple-p)
-                    (vector-match-element-store (car statements) env index)
-                  (when destination
+              (when (not (vector-special-declaration-p declarations))
+                (multiple-value-bind (element-type stores intermediates)
+                    (vector-match-stores statements env index)
+                  (when element-type
                     (make-vector-loop
                      :element-type element-type
                      :index index
                      :count count
-                     :destination destination
-                     :destination-offset offset
-                     :destination-simple-p simple-p
-                     :sources (vector-collect-arrays expression)
-                     :expression expression
-                     :body (car statements)
+                     :stores stores
+                     :sources (vector-stores-sources stores intermediates)
+                     :intermediates intermediates
+                     :expression (fifth (first stores))
+                     :body body
                      :fallback form :unchecked-p (policy env (= safety 0)))))))))))))
 
 ;;; the arrays read by an expression tree, as an alist of name to (offsets . simple-p)
@@ -361,6 +499,34 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
          (format nil "WIDEN-~a~a"
                  (if (eq (car source-type) 'signed-byte) "SB" "UB")
                  (second source-type)))))
+
+;;; Replace each (:INTERMEDIATE var) leaf by the expression VAR stands for, so that
+;;; the walkers see the work the loop really does.  The emitted code keeps the
+;;; marker, because there the value is computed once and reused.
+(defun vector-inline-intermediates (expression intermediates)
+  (when (eq (car expression) :intermediate)
+    (return-from vector-inline-intermediates
+      (vector-inline-intermediates
+       (second (assoc (second expression) intermediates :test #'eq)) intermediates)))
+  (case (car expression)
+    (:op (cons :op (cons (second expression)
+                         (mapcar (lambda (subexpression)
+                                   (vector-inline-intermediates subexpression intermediates))
+                                 (cddr expression)))))
+    (:negate (list :negate (vector-inline-intermediates (second expression) intermediates)))
+    (:widen (list :widen (vector-inline-intermediates (second expression) intermediates)
+                  (third expression)))
+    (t expression)))
+
+;;; Every array every store of a body reads, with the offsets it reads them at.
+(defun vector-stores-sources (stores &optional intermediates (accumulator '()))
+  (dolist (store stores accumulator)
+    (setf accumulator
+          (vector-collect-arrays
+           (if intermediates
+               (vector-inline-intermediates (fifth store) intermediates)
+               (fifth store))
+           accumulator))))
 
 (defun vector-collect-arrays (expression &optional (accumulator '()))
   (ecase (car expression)
@@ -438,19 +604,18 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
               (when (and (vector-loop-keyword (car clauses) "DO")
                          (null (cddr clauses))
                          (vector-pure-count-p count))
-                (multiple-value-bind (destination element-type expression offset simple-p)
-                    (vector-match-element-store (second clauses) env index)
-                  (when destination
+                (multiple-value-bind (element-type stores intermediates)
+                    (vector-match-stores (list (second clauses)) env index)
+                  (when element-type
                     (make-vector-loop
                      :element-type element-type
                      :index index
                      :count count
-                     :destination destination
-                     :destination-offset offset
-                     :destination-simple-p simple-p
-                     :sources (vector-collect-arrays expression)
-                     :expression expression
-                     :body (second clauses)
+                     :stores stores
+                     :sources (vector-stores-sources stores intermediates)
+                     :intermediates intermediates
+                     :expression (fifth (first stores))
+                     :body (list (second clauses))
                      :fallback form :unchecked-p (policy env (= safety 0)))))))))))))
 
 ;;; (1+ index) or (+ index 1) in a DO loop's step.
@@ -491,22 +656,19 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
                   (when (vector-pure-count-p count)
                     (multiple-value-bind (declarations statements)
                         (vector-split-declarations body)
-                      (when (and (null (cdr statements))
-                                 (not (vector-special-declaration-p declarations)))
-                        (multiple-value-bind (destination element-type expression
-                                              offset simple-p)
-                            (vector-match-element-store (first statements) env index)
-                          (when destination
+                      (when (not (vector-special-declaration-p declarations))
+                        (multiple-value-bind (element-type stores intermediates)
+                            (vector-match-stores statements env index)
+                          (when element-type
                             (make-vector-loop
                              :element-type element-type
                              :index index
                              :count count
-                             :destination destination
-                             :destination-offset offset
-                             :destination-simple-p simple-p
-                             :sources (vector-collect-arrays expression)
-                             :expression expression
-                             :body (first statements)
+                             :stores stores
+                             :sources (vector-stores-sources stores intermediates)
+                             :intermediates intermediates
+                             :expression (fifth (first stores))
+                             :body body
                              :fallback form :unchecked-p (policy env (= safety 0)))))))))))))))))
 
 ;;; The part of VALUE that is being added to the accumulator PLACE:
@@ -557,7 +719,7 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
                                              :accumulator place
                                              :sources (vector-collect-arrays expression)
                                              :expression expression
-                                             :body (first statements)
+                                             :body statements
                                              :fallback form :unchecked-p (policy env (= safety 0)))))
                                   ;; the reduction expansion addresses the sources
                                   ;; directly, so it needs their data inline
@@ -629,12 +791,12 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
 ;;; Emit an expression tree over SIMD packs. SCALARS maps each loop invariant
 ;;; leaf to the variable holding its broadcast pack.
 (defun vector-emit (expression element-type index scalars data-references
-                    &optional offset)
+                    &optional offset intermediates)
   (ecase (car expression)
     (:index (cdr (assoc :index scalars)))
     (:negate `(,(vector-primitive "NEG" element-type)
                ,(vector-emit (second expression) element-type index scalars
-                             data-references offset)))
+                             data-references offset intermediates)))
     (:array (let* ((name (second expression))
                    (subscript (third expression))
                    (reference (or (cadr (assoc name data-references)) name)))
@@ -655,11 +817,14 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
              (reduce (lambda (left right) `(,name ,left ,right))
                      (mapcar (lambda (subexpression)
                                (vector-emit subexpression element-type index scalars
-                                            data-references offset))
+                                            data-references offset intermediates))
                              (cddr expression))))))
     ((:scalar :const)
      ;; splats are computed once, before the loop, and live in an SSE register
-     (cdr (assoc expression scalars :test #'equal)))))
+     (cdr (assoc expression scalars :test #'equal)))
+    (:intermediate
+     ;; a value the body binds in a LET* and more than one store uses
+     (second expression))))
 
 ;;; an iteration reads everything it touches before writing anything, which matches
 ;;; the scalar loop only when the destination is written at or behind every place it
@@ -675,18 +840,52 @@ declares (SAFETY 3) must not be rewritten as if it were unchecked."
                (and (eql destination-offset 0) (not (integerp source-offset)))))
          source-offsets))
 
+;;; Whether a body that writes several arrays means, packed, what it means
+;;; element by element.  An array the body never reads is only written, which is
+;;; always safe.  An array it reads and writes is safe when every offset it writes
+;;; is an offset it reads - the iteration permutes the elements it read, which is
+;;; what a butterfly does - or when no write is ahead of any read, which is the
+;;; rule a single store has always had.
+(defun vector-stores-safe-p (stores sources)
+  (let ((written '()))
+    (dolist (store stores)
+      (let ((entry (assoc (first store) written :test #'eq)))
+        (if entry
+            (pushnew (second store) (cdr entry) :test #'equal)
+            (push (cons (first store) (list (second store))) written))))
+    (flet ((read-offsets (name) (second (assoc name sources :test #'eq)))
+           (write-offsets (name) (cdr (assoc name written :test #'eq))))
+      (every (lambda (store)
+               (let* ((name (first store))
+                      (writes (write-offsets name))
+                      (reads (read-offsets name)))
+                 (cond ((null reads) t)
+                       ;; every element the body writes to this array is one it
+                       ;; read: the iteration permutes what it touched
+                       ((and (subsetp writes reads :test #'equal)
+                             (subsetp reads writes :test #'equal))
+                        t)
+                       (t (vector-alias-safe-p (second store) reads)))))
+             stores))))
+
 (defun vector-loop-arrays (loop)
-  "The arrays a loop touches: the destination first, then the sources.  When the
-destination is also a source - (setf (aref c i) (+ (aref c (+ i 3)) ...)) - its
-offsets are merged into the destination's entry rather than dropped, so the length
-guard still covers the reads."
-  (let* ((destination (vloop-destination loop))
-         (same (find destination (vloop-sources loop) :key #'car :test #'eq))
-         (entry (cons (append (list (vloop-destination-offset loop))
-                              (and same (second same)))
-                      (vloop-destination-simple-p loop))))
-    (cons (cons destination entry)
-          (remove destination (vloop-sources loop) :key #'car :test #'eq))))
+  "The arrays a loop touches: the ones it writes first, then the ones it only
+reads.  An array it both reads and writes - (setf (aref c i) (+ (aref c (+ i 3))
+...)) - appears once, with every offset either side touches it at, so the length
+guard covers the reads as well as the writes."
+  (let ((arrays '()))
+    (flet ((touch (name offsets simple-p)
+             (let ((entry (assoc name arrays :test #'eq)))
+               (if entry
+                   (dolist (offset offsets)
+                     (pushnew offset (second entry) :test #'equal))
+                   (setf arrays (append arrays
+                                        (list (cons name (cons offsets simple-p)))))))))
+      (dolist (store (vloop-stores loop))
+        (touch (first store) (list (second store)) (third store)))
+      (dolist (source (vloop-sources loop))
+        (touch (first source) (second source) (cddr source))))
+    arrays))
 
 ;;; Whether every array a plan reads has its data inline.  A reduction has no
 ;;; destination, since its result is a variable, so only the sources matter.
@@ -750,10 +949,16 @@ guard still covers the reads."
          (width (vector-width element-type))
          (index (vloop-index loop))
          (count (vloop-count loop))
-         (destination-offset (vloop-destination-offset loop))
-         (expression (vloop-expression loop))
+         (stores (vloop-stores loop))
+         (intermediates (vloop-intermediates loop))
+         ;; the analysis below sees what the loop really computes; the emitted
+         ;; stores keep the markers, so a shared value is computed once
+         (expressions (mapcar (lambda (store)
+                                (vector-inline-intermediates (fifth store) intermediates))
+                              stores))
          (scalars (mapcar (lambda (leaf) (cons leaf (make-symbol "SPLAT")))
-                          (vector-collect-scalars expression)))
+                          (remove-duplicates (mapcan #'vector-collect-scalars expressions)
+                                             :test #'equal)))
          (arrays (vector-loop-arrays loop))
          (references (vector-data-references loop))
          (end (make-symbol "VECTOR-END"))
@@ -769,7 +974,8 @@ guard still covers the reads."
          (load (vector-primitive "LOAD" element-type))
          (store (vector-primitive "STORE" element-type))
          (splat (and scalars (vector-primitive "SPLAT" element-type)))
-         (operators (vector-collect-operators expression))
+         (operators (remove-duplicates (mapcan #'vector-collect-operators expressions)
+                                       :test #'eq))
          (arithmetic (mapcar (lambda (operator)
                                (vector-primitive (vector-operator-base operator element-type)
                                                  element-type))
@@ -792,31 +998,38 @@ guard still covers the reads."
 ;;; a widen or an operator the wider width has no instruction for has to be
 ;;; refused here, before anything is emitted, so that the 128-bit attempt runs
                (every (lambda (base) (vector-primitive base element-type))
-                      (vector-expression-primitives expression element-type))
+                      (remove-duplicates
+                       (mapcan (lambda (expression)
+                                 (vector-expression-primitives expression element-type))
+                               expressions)
+                       :test #'string=))
                (if indexed (and ramp stride) t)
                (or splat (null (remove-if (lambda (scalar)
                                             (memq (car scalar) '(:index :stride)))
                                           scalars)))
                (or (vector-float-element-type-p element-type)
                    (vloop-unchecked-p loop)
-                   (vector-exact-expression-p expression))
+                   (every #'vector-exact-expression-p expressions))
                (not negative-literals)
-               (vector-alias-safe-p destination-offset
-                                    (rest (second (first arrays)))))
+               (vector-stores-safe-p stores (vloop-sources loop)))
       (when *auto-vectorize-notes*
         (compiler-notify "vectorized loop over ~a, ~a elements at a time"
                          element-type width))
       (labels ((reference (name) (or (cadr (assoc name references)) name))
-               (store-form (offset)
-                 `(,store ,(vector-emit expression element-type index scalars references
-                                        offset)
-                          ,(reference (vloop-destination loop))
-                          ,(if offset
-                               (vector-offset-form (vloop-destination loop)
-                                                   destination-offset index references
-                                                   offset element-type)
-                               (vector-subscript (vloop-destination loop)
-                                                 destination-offset index references)))))
+               ;; the pack a LET* binding stood for, or the name it was given
+               (emit (expression offset)
+                 (vector-emit expression element-type index scalars references
+                              offset intermediates))
+               (store-form (entry offset)
+                 (let ((name (first entry)) (subscript-offset (second entry))
+                       (expression (fifth entry)))
+                   `(,store ,(emit expression offset)
+                            ,(reference name)
+                            ,(if offset
+                                 (vector-offset-form name subscript-offset index
+                                                     references offset element-type)
+                                 (vector-subscript name subscript-offset index
+                                                   references))))))
         (let ((guard
                 (loop for entry in arrays
                       for name = (first entry)
@@ -833,12 +1046,28 @@ guard still covers the reads."
                     (do ((,index 0 (+ ,index ,width)))
                         ((>= ,index ,end))
                       (declare (type index ,index))
-                      ,(if offset
-                           `(let ((,offset (,(vector-primitive "OFFSET" element-type)
-                                            ,index)))
-                              (declare (type (unsigned-byte 64) ,offset))
-                              ,(store-form offset))
-                           (store-form nil))
+                      ,(let* ((stores-form
+                                `(progn ,@(mapcar (lambda (entry)
+                                                    (store-form entry offset))
+                                                  stores)))
+                              ;; the intermediates a body binds and its stores share
+                              ;; are computed once here, in the order it bound them
+                              (stores-form
+                                (if intermediates
+                                    `(let* ,(loop for (var tree) in intermediates
+                                                  collect `(,var ,(emit tree offset)))
+                                       (declare (type ,pack-type
+                                                      ,@(mapcar #'first intermediates)))
+                                       ,stores-form)
+                                    stores-form)))
+                         ;; a backend that addresses by a byte offset computes it
+                         ;; once for the whole iteration
+                         (if offset
+                             `(let* ((,offset (,(vector-primitive "OFFSET" element-type)
+                                               ,index)))
+                                (declare (type (unsigned-byte 64) ,offset))
+                                ,stores-form)
+                             stores-form))
                       ,@(when indexed
                           ;; leave the pack holding the offsets for the next
                           ;; iteration
@@ -851,7 +1080,7 @@ guard still covers the reads."
                     (do ((,index ,end (1+ ,index)))
                         ((>= ,index ,count-var))
                       (declare (type index ,index))
-                      ,(vloop-body loop))))))
+                      ,@(vloop-body loop))))))
 ;;; the guard chooses END instead of branching between two copies of the loop.  When
 ;;; it fails, END is 0, the packed loop does not run, and the tail does all the
 ;;; work: it is the original loop, written once.
@@ -872,6 +1101,7 @@ guard still covers the reads."
                                     `(type ,pack-type ,(cdr scalar)))
                                   scalars))
                ,body)))))))
+
 
 ;;; expand a reduction: accumulate the elementwise expression in a vector, run it
 ;;; over the tail one element at a time, then add the accumulator's lanes to the
@@ -961,7 +1191,7 @@ guard still covers the reads."
              (do ((,index ,end (1+ ,index)))
                  ((>= ,index ,count))
                (declare (type index ,index))
-               ,(vloop-body loop))
+               ,@(vloop-body loop))
              ;; and the lanes into the variable
              (,store ,accumulating ,lanes
                      ,(if offset
