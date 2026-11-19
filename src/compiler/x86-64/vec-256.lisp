@@ -491,6 +491,73 @@
   (define-vec-splat-word %vec-splat-sb64-256 signed-num
     simd-pack-256-sb64 vpbroadcastq))
 
+;;;; reading narrow elements into wider 256-bit lanes
+;;;
+;;; The 128-bit widens in vec.lisp read exactly the elements one iteration
+;;; consumes, and these keep that rule at twice the width: a byte source feeds
+;;; eight single lanes out of eight bytes, a word source eight lanes out of
+;;; sixteen bytes, and a single-float source four double lanes out of sixteen.
+;;; The instruction that widens is also the load, so no lane is left holding
+;;; whatever was in the register.
+;;;
+;;; Only the single-float targets get a 256-bit widen here.  A byte or word
+;;; source read into four double lanes would have to widen four elements, and
+;;; the 256-bit narrowing loads read eight bytes or sixteen - one element wide
+;;; of what the loop needs, which on the last iteration would read past the
+;;; array.  Those loops keep the 128-bit width, where the read is exact.
+
+(progn
+  (defknown %vec-widen-single-double-256 ((simple-array single-float (*)) index)
+      (simd-pack-256 double-float)
+    (flushable movable))
+  (define-vop (%vec-widen-single-double-256)
+    (:translate %vec-widen-single-double-256)
+    (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+    (:arg-types simple-array-single-float tagged-num)
+    (:temporary (:sc any-reg) byte-index)
+    (:results (result :scs (double-avx2-reg)))
+    (:result-types simd-pack-256-double)
+    (:generator 4
+      (move byte-index index)
+      (inst shr byte-index n-fixnum-tag-bits)
+      (inst vcvtps2pd result (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                                 vector byte-index 4)))))
+
+(macrolet ((define-vec-widen-narrow (name element-type arg-type result-spec
+                                        pack-type reg-type load-instruction element-size)
+             ;; a defknown takes a type specifier and a vop's :result-types takes a
+             ;; primitive type name; (simd-pack-256 single-float) is only the first
+             `(progn
+                (defknown ,name (,arg-type index) ,result-spec
+                  (flushable movable))
+                (define-vop (,name)
+                  (:translate ,name)
+                  (:args (vector :scs (descriptor-reg)) (index :scs (any-reg)))
+                  (:arg-types ,element-type tagged-num)
+                  (:temporary (:sc any-reg) byte-index)
+                  (:results (result :scs (,reg-type)))
+                  (:result-types ,pack-type)
+                  (:generator 4
+                    (move byte-index index)
+                    (inst shr byte-index n-fixnum-tag-bits)
+                    (inst ,load-instruction
+                          result
+                          (ea (- (* vector-data-offset n-word-bytes) other-pointer-lowtag)
+                              vector byte-index ,element-size))
+                    (inst vcvtdq2ps result result))))))
+  (define-vec-widen-narrow %vec-widen-ub8-single-256 simple-array-unsigned-byte-8
+    (simple-array (unsigned-byte 8) (*)) (simd-pack-256 single-float)
+    simd-pack-256-single single-avx2-reg vpmovzxbd 1)
+  (define-vec-widen-narrow %vec-widen-sb8-single-256 simple-array-signed-byte-8
+    (simple-array (signed-byte 8) (*)) (simd-pack-256 single-float)
+    simd-pack-256-single single-avx2-reg vpmovsxbd 1)
+  (define-vec-widen-narrow %vec-widen-ub16-single-256 simple-array-unsigned-byte-16
+    (simple-array (unsigned-byte 16) (*)) (simd-pack-256 single-float)
+    simd-pack-256-single single-avx2-reg vpmovzxwd 2)
+  (define-vec-widen-narrow %vec-widen-sb16-single-256 simple-array-signed-byte-16
+    (simple-array (signed-byte 16) (*)) (simd-pack-256 single-float)
+    simd-pack-256-single single-avx2-reg vpmovsxwd 2))
+
 ;;;; handing the primitives to SB-C
 ;;;
 ;;; Only when the build enables :AVX2.  The pass asks for a 256-bit primitive by
@@ -517,6 +584,11 @@
       (publish "MUL" double-float %vec-mul-double-256)
       (publish "DIV" double-float %vec-div-double-256)
       (publish "NEG" double-float %vec-negate-double-256)
+      (publish "WIDEN-SINGLE" double-float %vec-widen-single-double-256)
+      (publish "WIDEN-UB8" single-float %vec-widen-ub8-single-256)
+      (publish "WIDEN-SB8" single-float %vec-widen-sb8-single-256)
+      (publish "WIDEN-UB16" single-float %vec-widen-ub16-single-256)
+      (publish "WIDEN-SB16" single-float %vec-widen-sb16-single-256)
       (publish "LOAD" (unsigned-byte 8) %vec-load-ub8-256)
       (publish "STORE" (unsigned-byte 8) %vec-store-ub8-256)
       (publish "SPLAT" (unsigned-byte 8) %vec-splat-ub8-256)
