@@ -2442,6 +2442,62 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
               "s16 to single is not the 256-bit narrowing load: ~A"
               (vectorize-disassembly-text #'vectorize-s16-to-single)))))
 
+;;;; 32-bit clamping.  PMINSD, PMAXSD, PMINUD and PMAXUD are SSE4.1, VPMINSD and
+;;;; friends are AVX2, and SSE2 has no packed 32-bit minimum at all - so a build
+;;;; with neither instruction set declines the loop, as it always did.
+
+(defun vectorize-clamp-s32 (a c n)
+  (declare (type (simple-array (signed-byte 32) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (max -1000000 (min 1000000 (aref a i)))))
+  c)
+
+(defun vectorize-clamp-u32 (a c n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) a c) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n) (setf (aref c i) (min (aref a i) 4000000000)))
+  c)
+
+(test-util:with-test (:name :vectorize-32-bit-clamp :skipped-on (not :x86-64))
+  ;; min and max of values that fit the lane cannot overflow it, so these loops
+  ;; vectorize at the default policy, unlike the multiply above
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(signed-byte 32)
+                                         '(0 1 -1 999999 1000001 -2000000 2147483647 -2147483648) n)
+        for c = (make-array n :element-type '(signed-byte 32) :initial-element 0)
+        do (vectorize-clamp-s32 a c n)
+           (dotimes (i n)
+             (let ((want (max -1000000 (min 1000000 (aref a i)))))
+               (unless (= (aref c i) want)
+                 (error "~@<s32 clamp: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref c i) want)))))
+  (loop for n in *vectorize-lengths*
+        for a = (vectorize-integer-array '(unsigned-byte 32)
+                                         '(0 1 3999999999 4000000001 4294967295 7) n)
+        for c = (make-array n :element-type '(unsigned-byte 32) :initial-element 0)
+        do (vectorize-clamp-u32 a c n)
+           (dotimes (i n)
+             (let ((want (min (aref a i) 4000000000)))
+               (unless (= (aref c i) want)
+                 (error "~@<u32 clamp: element ~D of ~D is ~S, expected ~S~:@>"
+                        i n (aref c i) want)))))
+  (flet ((disassembly (function) (vectorize-disassembly-text function))
+         (has (mnemonic function) (search mnemonic (vectorize-disassembly-text function))))
+    (cond ((member :avx2 sb-c:*backend-subfeatures*)
+           (assert (and (has "vpminud" #'vectorize-clamp-u32)
+                        (has "vpminsd" #'vectorize-clamp-s32))
+                   () "32-bit clamp did not take the 256-bit instructions: ~A"
+                   (disassembly #'vectorize-clamp-s32))
+           (dolist (function (list #'vectorize-clamp-u32 #'vectorize-clamp-s32))
+             (assert (vectorize-wide-p function) ()
+                     "32-bit clamp stayed at 128 bits on an AVX2 build: ~A"
+                     (disassembly function))))
+          ((member :sse4 sb-c:*backend-subfeatures*)
+           (assert (and (has "pminud" #'vectorize-clamp-u32)
+                        (has "pminsd" #'vectorize-clamp-s32))
+                   () "32-bit clamp is not packed on an SSE4.1 build: ~A"
+                   (disassembly #'vectorize-clamp-s32))))))
+
 ;;;; 32-bit multiplication.  PMULLD is SSE4.1 and VPMULLD is AVX2, so whether a
 ;;;; loop is packed at all is a property of the build: a build with neither
 ;;;; instruction declines it, and the values below are checked wherever it does not.

@@ -1395,6 +1395,38 @@
                           vector byte-index 4))
     (inst cvtps2pd result result)))
 
+;;; 32-bit minimum and maximum are PMINSD, PMAXSD, PMINUD and PMAXUD, which are
+;;; SSE4.1, so like the 32-bit multiply they are published by the build that has
+;;; the instructions rather than always.  A build without them declines the loop,
+;;; which is what it did before: no 32-bit lane has a packed minimum in SSE2.
+
+(defknown (%vec-min-sb32 %vec-max-sb32)
+    ((simd-pack (signed-byte 32)) (simd-pack (signed-byte 32)))
+    (simd-pack (signed-byte 32))
+  (flushable movable))
+
+(defknown (%vec-min-ub32 %vec-max-ub32)
+    ((simd-pack (unsigned-byte 32)) (simd-pack (unsigned-byte 32)))
+    (simd-pack (unsigned-byte 32))
+  (flushable movable))
+
+(macrolet ((define-vec-min-max-32 (name type instruction)
+             `(define-vop (,name)
+                (:translate ,name)
+                (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+                (:arg-types ,type ,type)
+                (:temporary (:sc int-sse-reg) arith-tmp)
+                (:results (result :scs (int-sse-reg)))
+                (:result-types ,type)
+                (:generator 2
+                  (move arith-tmp a)
+                  (inst ,instruction arith-tmp b)
+                  (move result arith-tmp)))))
+  (define-vec-min-max-32 %vec-min-sb32 simd-pack-sb32 pminsd)
+  (define-vec-min-max-32 %vec-max-sb32 simd-pack-sb32 pmaxsd)
+  (define-vec-min-max-32 %vec-min-ub32 simd-pack-ub32 pminud)
+  (define-vec-min-max-32 %vec-max-ub32 simd-pack-ub32 pmaxud))
+
 ;;; hand the primitives to the loop vectorizer in SB-C, which cannot name this
 ;;; package itself; see the comment on SB-C::*VECTOR-PRIMITIVES*.
 
@@ -1427,7 +1459,11 @@
     (publish "MUL" (signed-byte 16) %vec-mul-sb16)
     (when (member :sse4 *backend-subfeatures*)
       (publish "MUL" (unsigned-byte 32) %vec-mul-ub32)
-      (publish "MUL" (signed-byte 32) %vec-mul-sb32))
+      (publish "MUL" (signed-byte 32) %vec-mul-sb32)
+      (publish "MIN" (unsigned-byte 32) %vec-min-ub32)
+      (publish "MAX" (unsigned-byte 32) %vec-max-ub32)
+      (publish "MIN" (signed-byte 32) %vec-min-sb32)
+      (publish "MAX" (signed-byte 32) %vec-max-sb32))
     (publish "LOAD" (unsigned-byte 8) %vec-load-ub8)
     (publish "LOAD" (signed-byte 8) %vec-load-sb8)
     (publish "STORE" (unsigned-byte 8) %vec-store-ub8)

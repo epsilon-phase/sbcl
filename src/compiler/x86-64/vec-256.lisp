@@ -567,6 +567,14 @@
 ;;; unsigned words and a bias for signed bytes.  Nothing is exact beyond these
 ;;; four element types: 32-bit lanes keep the 128-bit width.
 
+(defknown (%vec-min-ub32-256 %vec-max-ub32-256)
+    ((simd-pack-256 (unsigned-byte 32)) (simd-pack-256 (unsigned-byte 32)))
+    (simd-pack-256 (unsigned-byte 32))
+  (flushable movable))
+(defknown (%vec-min-sb32-256 %vec-max-sb32-256)
+    ((simd-pack-256 (signed-byte 32)) (simd-pack-256 (signed-byte 32)))
+    (simd-pack-256 (signed-byte 32))
+  (flushable movable))
 (defknown (%vec-min-ub8-256 %vec-max-ub8-256)
     ((simd-pack-256 (unsigned-byte 8)) (simd-pack-256 (unsigned-byte 8)))
     (simd-pack-256 (unsigned-byte 8))
@@ -601,7 +609,14 @@
   (define-vec-min-max-256 %vec-min-ub16-256 simd-pack-256-ub16 vpminuw)
   (define-vec-min-max-256 %vec-max-ub16-256 simd-pack-256-ub16 vpmaxuw)
   (define-vec-min-max-256 %vec-min-sb16-256 simd-pack-256-sb16 vpminsw)
-  (define-vec-min-max-256 %vec-max-sb16-256 simd-pack-256-sb16 vpmaxsw))
+  (define-vec-min-max-256 %vec-max-sb16-256 simd-pack-256-sb16 vpmaxsw)
+  ;; 32-bit lanes have no packed minimum in any 128-bit instruction set below
+  ;; sse4.1, and the 128-bit forms need it; here VPMINUD, VPMAXUD, VPMINSD and
+  ;; VPMAXSD are AVX2, so they are always here
+  (define-vec-min-max-256 %vec-min-ub32-256 simd-pack-256-ub32 vpminud)
+  (define-vec-min-max-256 %vec-max-ub32-256 simd-pack-256-ub32 vpmaxud)
+  (define-vec-min-max-256 %vec-min-sb32-256 simd-pack-256-sb32 vpminsd)
+  (define-vec-min-max-256 %vec-max-sb32-256 simd-pack-256-sb32 vpmaxsd))
 
 ;;;; handing the primitives to SB-C
 ;;;
@@ -642,6 +657,10 @@
       (publish "MAX" (unsigned-byte 16) %vec-max-ub16-256)
       (publish "MIN" (signed-byte 16) %vec-min-sb16-256)
       (publish "MAX" (signed-byte 16) %vec-max-sb16-256)
+      (publish "MIN" (unsigned-byte 32) %vec-min-ub32-256)
+      (publish "MAX" (unsigned-byte 32) %vec-max-ub32-256)
+      (publish "MIN" (signed-byte 32) %vec-min-sb32-256)
+      (publish "MAX" (signed-byte 32) %vec-max-sb32-256)
       (publish "LOAD" (unsigned-byte 8) %vec-load-ub8-256)
       (publish "STORE" (unsigned-byte 8) %vec-store-ub8-256)
       (publish "SPLAT" (unsigned-byte 8) %vec-splat-ub8-256)
