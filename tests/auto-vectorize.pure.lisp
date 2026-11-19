@@ -621,6 +621,15 @@ OPERATION applied to the same numbers, which involves no array loop."
            (optimize speed (safety 0)))
   (dotimes (i n) (setf (aref c i) (+ (aref a i) -3))))
 
+;;; A scalar the loop declares FIXNUM reaches the 64-bit lane splat as an
+;;; untagged word, exactly like one declared (SIGNED-BYTE 64): the move into the
+;;; vop's untagged storage class is what strips the tag.  Untagging it a second
+;;; time inside the vop stores half the value.
+(defun vectorize-s64-add-fixnum (a c k n)
+  (declare (type (simple-array (signed-byte 64) (*)) a c) (type fixnum k)
+           (type vectorize-index n) (optimize speed (safety 0)))
+  (dotimes (i n) (setf (aref c i) (+ (aref a i) k))))
+
 (defun vectorize-s64-subtract-scalar (a b c n k)
   (declare (type (simple-array (signed-byte 64) (*)) a b c) (type vectorize-index n)
            (type (signed-byte 64) k) (optimize speed (safety 0)))
@@ -742,6 +751,29 @@ OPERATION applied to the same numbers, which involves no array loop."
         (assert (some (lambda (mnemonic) (search mnemonic text))
                       '("pshufd" "pbroadcast" "punpcklqdq"))
                 () "~A was not vectorized:~%~A" (first case) text)))))
+
+(test-util:with-test (:name :vectorize-broadcast-fixnum-scalar :skipped-on (not :x86-64))
+  (loop for k in '(-1 -7 12345 -1099511627776 1099511627776)
+        do (loop for n in *vectorize-lengths*
+                 for a = (vectorize-integer-array '(signed-byte 64)
+                                                  *vectorize-s64-values* n)
+                 for c = (make-array (+ n 8) :element-type '(signed-byte 64)
+                                       :initial-element 0)
+                 do (vectorize-s64-add-fixnum a c k n)
+                    (dotimes (i n)
+                      (let ((want (logand (+ (aref a i) k) (1- (ash 1 64)))))
+                        (unless (= (aref c i) (if (logbitp 63 want) (- want (ash 1 64)) want))
+                          (error "~@<broadcast of ~D: element ~D of ~D is ~S, expected ~S.~:@>"
+                                 k i n (aref c i) (+ (aref a i) k)))))
+                    (loop for i from n below (+ n 8)
+                          do (unless (zerop (aref c i))
+                               (error "~@<broadcast of ~D: element ~D is past the loop ~
+                                       bound but was written: ~S.~:@>"
+                                      k i (aref c i))))))
+  ;; the scalar is broadcast, so the loop must be packed
+  (let ((text (string-downcase (with-output-to-string (stream)
+                                 (disassemble #'vectorize-s64-add-fixnum :stream stream)))))
+    (assert (search "paddq" text) () "a fixnum scalar was not packed:~%~A" text)))
 
 ;;; A constant too wide for a fixnum has no splat: the loop must be left scalar,
 ;;; not rejected by the backend, and must compute what it always computed.

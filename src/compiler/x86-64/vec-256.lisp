@@ -461,20 +461,17 @@
                   (inst movd low x)
                   (inst ,instruction result low))))
            (define-vec-splat-word (name type result-type instruction)
+             ;; a word-wide scalar arrives untagged whatever primitive type it
+             ;; came from, so there is nothing to strip here either
              `(define-vop (,name)
                 (:translate ,name)
                 (:args (x :scs (unsigned-reg signed-reg)))
                 (:arg-types ,type)
-                (:temporary (:sc unsigned-reg) word)
                 (:temporary (:sc int-sse-reg) low)
                 (:results (result :scs (int-avx2-reg)))
                 (:result-types ,result-type)
                 (:generator 3
-                  (if (tagged-fixnum-tn-p x)
-                      (progn (move word x)
-                             (inst sar word n-fixnum-tag-bits)
-                             (inst movq low word))
-                      (inst movq low x))
+                  (inst movq low x)
                   (inst ,instruction result low)))))
   (define-vec-splat-narrow %vec-splat-ub8-256 unsigned-num
     simd-pack-256-ub8 vpbroadcastb)
