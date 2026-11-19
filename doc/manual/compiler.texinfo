@@ -1471,9 +1471,13 @@ signedness, where AVX2 has one instruction for each: @code{VPMINUB} and
 @code{VPMAXUB}, @code{VPMINSB} and @code{VPMAXSB}, @code{VPMINUW} and
 @code{VPMAXUW}, @code{VPMINSW} and @code{VPMAXSW}.  The 128-bit section needs the
 saturating-difference trick for unsigned words and a bias onto unsigned order for
-signed bytes; at 256 bits each is the single instruction.  Clamping a byte image
-at 8192 elements ran at 25.0 thousand million elements per second at 128 bits and
-36.4 at 256, and 16-bit audio at 13.3 and 19.0.
+signed bytes; at 256 bits each is the single instruction.  32-bit lanes have a
+packed minimum and maximum too, but only from SSE4.1, so a build without that
+subfeature declines those loops, the way it declines a 32-bit multiply.
+Clamping a byte image at 8192 elements ran at 25.0 thousand million elements per
+second at 128 bits and 36.4 at 256, 16-bit audio at 13.3 and 19.0, and a clamp
+over 32-bit lanes - which a build without SSE4.1 cannot vectorize at all - at 6.6
+and 9.1, against 1.2 for the same loop unvectorized.
 
 The subfeature is not part of the default build, so no code is generated for it
 unless the backend is configured with it:
