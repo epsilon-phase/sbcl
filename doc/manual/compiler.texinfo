@@ -1452,9 +1452,16 @@ as 128-bit ones, and the pass then takes twice as many elements per iteration fo
 every element type whose operations it has: eight @code{single-float}, four
 @code{double-float}, and so on.  Which width a loop gets is decided per loop, from
 the primitives the loop actually needs.  A loop that needs one the wider width
-does not have, such as the narrowing reads described above, stays at 128 bits
-rather than mixing the two, because a 256-bit pack is a different type from a
-128-bit one and the emitted form has to be one or the other.
+does not have stays at 128 bits rather than mixing the two, because a 256-bit pack
+is a different type from a 128-bit one and the emitted form has to be one or the
+other.  The widening reads described above are split by target: a
+@code{single-float} array read into @code{double-float} lanes widens with one
+@code{VCVTPS2PD}, and a byte or word array read into @code{single-float} lanes
+with one @code{VPMOVZXBD} or @code{VPMOVZXWD}, so those loops take the wider
+width.  The same narrow source read into four @code{double-float} lanes does not:
+the instruction that would load it reads eight bytes or sixteen where the loop
+consumes four, and on the last iteration that reads past the end of the array, so
+that loop stays at 128 bits.
 
 The subfeature is not part of the default build, so no code is generated for it
 unless the backend is configured with it:
@@ -1474,19 +1481,24 @@ three arrays of 8192 elements, small enough to stay in cache, against the same
 loops compiled to 128-bit loops:
 
 @itemize
-@item @code{single-float} addition 55.6 to 64.0 GB/s, multiplication 58.8 to 64.0;
-@item @code{double-float} addition 58.2 to 67.0 GB/s, multiplication 58.4 to 67.2;
-@item @code{(unsigned-byte 32)} addition 58.4 to 66.7 GB/s;
-@item @code{(unsigned-byte 64)} addition 59.0 to 70.2 GB/s.
+@item @code{single-float} addition 59.3 to 71.1 GB/s, multiplication 59.3 to 69.6;
+@item @code{double-float} addition 59.3 to 71.1 GB/s, multiplication 59.3 to 71.1;
+@item @code{(unsigned-byte 64)} addition 59.8 to 74.4 GB/s;
+@item @code{(unsigned-byte 16)} addition 59.3 to 72.7 GB/s.
 @end itemize
 
 @noindent
-Streaming from memory the two widths are within noise of each other, as the
-bandwidth limit says they must be, and the results are noisier than the
-cache-resident ones: the same loop measured three times can differ by a factor of
-two, which is the cost of a 256-bit access that crosses a cache line.  The wider
-lanes are therefore worth having for loops that fit in cache and not otherwise,
-and they are off unless the build asks for them.
+Streaming from memory the two widths are the same within a few percent, as the
+bandwidth limit says they must be: over three arrays of four million elements,
+@code{single-float} addition runs at 24.2 GB/s at 128 bits and 23.6 at 256,
+@code{double-float} at 20.3 and 20.0.  The wider lanes are therefore worth having
+for loops that fit in cache and not otherwise, and they are off unless the build
+asks for them.
+
+Measure either width on an idle machine.  Streaming numbers are sensitive to
+everything else running: a full test suite in the background is enough to halve
+the reported rate, and a measurement taken that way once read as a regression that
+did not exist.
 
 Not handled, and compiled exactly as before: float reductions, where summing the
 lanes would reorder the additions; integer division; a destination that is also
