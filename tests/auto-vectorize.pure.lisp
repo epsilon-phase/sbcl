@@ -1437,7 +1437,7 @@ a writer with a fixed color type ends up with."
              (dotimes (i n)
                (unless (= (aref c i) (max (aref a i) (aref b i)))
                  (error "~@<u8 max: element ~D of ~D is ~S.~:@>" i n (aref c i))))
-             ;; and the signed case still computes, just not packed
+             ;; and the signed case still computes
              (vectorize-s8-min-pair (make-array n :element-type '(signed-byte 8) :initial-element -5)
                                     (make-array n :element-type '(signed-byte 8) :initial-element 3)
                                     (make-array n :element-type '(signed-byte 8) :initial-element 0)
@@ -1446,11 +1446,13 @@ a writer with a fixed color type ends up with."
             () "byte minimum is not packed")
     (assert (search "pmaxub" (disassembly #'vectorize-u8-max-pair))
             () "byte maximum is not packed")
-    ;; signed bytes have no pminsb in SSE2, but they are packed all the same: the
-    ;; lanes are biased onto unsigned order, min'd with pminub, and biased back, so
-    ;; the result has to hold for negatives, where unsigned order says otherwise
-    (assert (search "pminub" (disassembly #'vectorize-s8-min-pair))
-            () "signed byte minimum is not packed")
+    ;; signed bytes have no packed minimum in SSE2, so that width biases the lanes
+    ;; onto unsigned order, min's them with pminub and biases them back; the 256-bit
+    ;; width has vpminsb and needs none of that.  Either way the result has to hold
+    ;; for negatives, where unsigned order says otherwise
+    (let ((text (disassembly #'vectorize-s8-min-pair)))
+      (assert (or (search "pminsb" text) (search "pminub" text))
+              () "signed byte minimum is not packed: ~a" text))
     (loop for n in *vectorize-lengths*
           for a = (vectorize-integer-array '(signed-byte 8) '(-128 -5 -1 0 3 127) n)
           for b = (vectorize-integer-array '(signed-byte 8) '(3 -6 1 -1 -128 0) n 2)
@@ -2140,14 +2142,17 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
   (flet ((mnemonics (function)
            (let ((text (string-downcase (with-output-to-string (stream)
                                           (disassemble function :stream stream)))))
-             (loop for mnemonic in '("pminsw" "pmaxsw" "psubusw" "pminub" "pmaxub" "paddw" "psubw")
+             (loop for mnemonic in '("pminsw" "pmaxsw" "psubusw" "pminub" "pmaxub" "paddw" "psubw"
+                                     "pminsb" "pmaxsb" "pminuw" "pmaxuw")
                    when (search mnemonic text) collect mnemonic))))
     (assert (member "pminsw" (mnemonics #'vectorize-s16-clamp) :test #'string=) ()
             "s16 clamp is not packed: ~a" (mnemonics #'vectorize-s16-clamp))
-    (assert (some (lambda (m) (member m '("psubusw" "paddw" "psubw") :test #'string=))
+    ;; unsigned words are a saturating difference at 128 bits and one vpmaxuw at 256
+    (assert (some (lambda (m) (member m '("psubusw" "paddw" "psubw" "pmaxuw") :test #'string=))
                   (mnemonics #'vectorize-u16-clamp)) ()
             "u16 clamp is not packed: ~a" (mnemonics #'vectorize-u16-clamp))
-    (assert (member "pminub" (mnemonics #'vectorize-s8-clamp) :test #'string=) ()
+    (assert (some (lambda (m) (member m '("pminub" "pminsb") :test #'string=))
+                  (mnemonics #'vectorize-s8-clamp)) ()
             "s8 clamp is not packed: ~a" (mnemonics #'vectorize-s8-clamp))))
 
 (with-test (:name :vectorize-inexact-integer-declined :skipped-on (not :x86-64))
@@ -2425,6 +2430,32 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
       (assert (member "vpmovsxwd" (mnemonics #'vectorize-s16-to-single) :test #'string=) ()
               "s16 to single is not the 256-bit narrowing load: ~A"
               (vectorize-disassembly-text #'vectorize-s16-to-single)))))
+
+;;; Clamping is where the wider width earns its pay on image and audio data: a
+;;; byte clamp is one VPMINUB per thirty-two elements.  The values are checked by
+;;; the min/max tests above, which run at whichever width the build gives them;
+;;; what these assert is the width, and that the instruction is the one the
+;;; 256-bit table published rather than the 128-bit sequence.
+(test-util:with-test (:name :vectorize-256-bit-min-max :skipped-on (not :x86-64))
+  ;; "vpminub" contains "pminub", so one search covers both widths; where the
+  ;; widths use different instructions, both are accepted
+  (dolist (case (list (cons #'vectorize-u8-clamp '("pminub"))
+                      (cons #'vectorize-u8-max-pair '("pmaxub"))
+                      (cons #'vectorize-s8-min-pair '("pminsb" "pminub"))
+                      (cons #'vectorize-u16-clamp '("pmaxuw" "psubusw"))
+                      (cons #'vectorize-s16-clamp '("pminsw"))))
+    (let ((function (car case))
+          (mnemonics (cdr case)))
+      (assert (some (lambda (m) (search m (vectorize-disassembly-text function))) mnemonics) ()
+              "no ~{~a~^ or ~} in the min/max loop: ~A" mnemonics
+              (vectorize-disassembly-text function))
+      (if (vectorize-avx2-p)
+          (assert (vectorize-wide-p function) ()
+                  "a min/max loop stayed at 128 bits on an AVX2 build: ~A"
+                  (vectorize-disassembly-text function))
+          (assert (not (vectorize-wide-p function)) ()
+                  "a min/max loop took 256-bit lanes without AVX2: ~A"
+                  (vectorize-disassembly-text function))))))
 
 ;;; A single-float source read into double lanes is exact, since every
 ;;; single-float is a double-float.  The vop that does it once went missing while
