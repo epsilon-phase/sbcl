@@ -31,6 +31,9 @@
 ;;;; LAMBDA", and ENVIRONMENT-ANALYZE (envanal.lisp:277) would lose that entry's
 ;;;; cleanup.  *VECTOR-NODE-CHECK-ENTRIES* asserts it at the splice.
 ;;;;
+;;;; doc/internals-notes/vectorizer-ir1-pass.txt records the blocker in full, the two
+;;;; deletion rules the splice must follow, and the three routes to finishing it.
+;;;;
 ;;;; The differential harness that measures both passes (54 shapes, both dispatch
 ;;;; paths, a scalar reference) is not in this tree yet; until it is, the numbers in
 ;;;; the commit messages are not reproducible from the branch.
