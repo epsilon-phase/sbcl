@@ -1061,7 +1061,12 @@ guard covers the reads as well as the writes."
                  ;; the readers are not total yet (a WITH-ARRAY-DATA store hands
                  ;; them an MV-COMBINATION); until they are, a plan attempt that
                  ;; signals declines.  Scope: planning only, never the splice.
-                 (let ((plan (vector-node-plan loop)))
+                 ;; rest of the readers still meet nodes they cannot type-check:
+                 ;; a WITH-ARRAY-DATA store reaches the plan as an MV-COMBINATION
+                 ;; somewhere we have not found yet.  Planning only; the splice is
+                 ;; not guarded, so a bug there still takes the compiler down.
+                 (let ((plan (handler-case (vector-node-plan loop)
+                               (error () nil))))
                    ;; VECTOR-NODE-PLAN returns a plan plist or a failure reason,
                    ;; and reasons are keywords as often as lists
                    (when (and (consp plan) (getf plan :element-type))
