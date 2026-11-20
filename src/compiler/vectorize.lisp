@@ -1532,7 +1532,7 @@ registered with one lambda and found through another.  ENVIRONMENT-ANALYZE
 iterates LAMBDA-ENTRIES (envanal.lisp:277), so a mismatch loses that entry's
 cleanup."
   (dolist (block (component-blocks component))
-    (unless (or (block-delete-p block) (block-deleted-p block))
+    (unless (block-delete-p block)
       (do-nodes (node nil block)
         (when (and (typep node 'entry)
                    (not (block-delete-p (node-block node)))
