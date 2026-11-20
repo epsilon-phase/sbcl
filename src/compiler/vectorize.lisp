@@ -942,6 +942,76 @@ guard covers the reads as well as the writes."
   (let ((*vector-lane-bytes* bytes))
     (funcall expander loop)))
 
+;;; ---------------------------------------------------------------- probe
+;;; A pass that will live after LOOP-ANALYZE (src/compiler/main.lisp) has a natural
+;;; loop object for every loop in the component, with the blocks that make it up and
+;;; with the bodies already macroexpanded, inline-expanded and let-converted.  This
+;;; probe prints what such a loop is really made of, so that the analysis can be
+;;; written against the IR1 that exists instead of the source forms it comes from.
+
+(defvar *vector-node-probe* nil
+  "When true, print the IR1 of every loop in each compiled component.")
+
+(defun vector-probe-fun-name (node)
+  (let ((use (lvar-uses (combination-fun node))))
+    (typecase use
+      (ref (let ((leaf (ref-leaf use)))
+             (typecase leaf
+               (functional (or (functional-debug-name leaf) "functional"))
+               (global-var (leaf-source-name leaf))
+               (t (type-of leaf)))))
+      (t (type-of use)))))
+
+(defun vector-probe-type (lvar)
+  (if lvar
+      (type-specifier (lvar-type lvar))
+      'null))
+
+(defun vector-probe-node (node)
+  (typecase node
+    (basic-combination
+     (format nil "~a(~{~a~^, ~}) -> ~a"
+             (vector-probe-fun-name node)
+             (mapcar #'vector-probe-type (combination-args node))
+             (vector-probe-type (node-lvar node))))
+    (cset (format nil "set ~a = ~a"
+                  (leaf-source-name (set-var node))
+                  (vector-probe-type (set-value node))))
+    (if (format nil "if ~a" (vector-probe-type (if-test node))))
+    (ref (let ((leaf (ref-leaf node)))
+           (typecase leaf
+             (functional (format nil "ref ~a" (or (functional-debug-name leaf) "functional")))
+             (constant (format nil "ref constant ~s" (constant-value leaf)))
+             (t (format nil "ref ~a" (leaf-source-name leaf))))))
+    (bind (format nil "bind ~a" (leaf-source-name (bind-lambda node))))
+    (return (format nil "return ~a" (vector-probe-type (node-lvar node))))
+    (exit (format nil "exit"))
+    (entry (format nil "entry"))
+    (t (format nil "~a" (type-of node)))))
+
+(defun vector-probe-loop (loop depth)
+  (format *error-output* "~&;~va ~a loop: depth ~a, ~a block~:p, head b~a, exits ~a~%"
+          depth (if (eq (loop-kind loop) :outer) "outer" "natural")
+          (loop-depth loop) (length (loop-blocks loop))
+          (block-number (loop-head loop))
+          (mapcar #'block-number (loop-exits loop)))
+  (do ((block (loop-blocks loop) (block-loop-next block)))
+      ((null block))
+    (format *error-output* "~&;~va  b~a -> ~a~%"
+            depth (block-number block) (mapcar #'block-number (block-succ block)))
+    (do-nodes (node lvar block)
+      (format *error-output* "~&;~va    ~a~@[ ; value ~a~]~%"
+              depth (vector-probe-node node)
+              lvar (and lvar (vector-probe-type lvar)))))
+  (dolist (inferior (loop-inferiors loop))
+    (vector-probe-loop inferior (+ depth 2))))
+
+(defun vector-node-probe-component (component)
+  (when *vector-node-probe*
+    (format *error-output* "~&; component ~a~%" (component-name component))
+    (vector-probe-loop (component-outer-loop component) 2)
+    (format *error-output* "~&;~%")))
+
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
       (vector-expand-reduction-loop loop)

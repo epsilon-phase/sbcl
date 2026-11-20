@@ -742,6 +742,7 @@ necessary, since type inference may take arbitrarily long to converge.")
     (find-dominators component)
     (maybe-mumble "Loop ")
     (loop-analyze component)
+    (vector-node-probe-component component)
 
     #|
     (when *compiler-trace-output*
