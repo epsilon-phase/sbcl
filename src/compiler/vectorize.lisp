@@ -1413,11 +1413,17 @@ increment and the stores gives the set of nodes the replacement reproduces."
             (dolist (node (mapcan #'vector-node-nodes blocks))
               (unless (or (gethash node consumed)
                           (not (basic-combination-p node))
-                          (and (flushable-combination-p node)
-                               (let ((res (node-lvar node)))
-                                 (or (null res)
-                                     (let ((dest (lvar-dest res)))
-                                       (and dest (memq (node-block dest) blocks)))))))
+                          ;; the value is consumed inside the loop: the stores
+                          ;; reproduce it
+                          (let ((res (node-lvar node)))
+                            (and res
+                                 (let ((dest (lvar-dest res)))
+                                   (and dest (memq (node-block dest) blocks)))))
+                          ;; a transform or an inline expansion, which is compiler
+                          ;; machinery rather than a call that can have an effect
+                          (let ((use (lvar-uses (combination-fun node))))
+                            (and (ref-p use) (functional-p (ref-leaf use))))
+                          (flushable-combination-p node))
                 (vector-node-fail (list :endangers (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
