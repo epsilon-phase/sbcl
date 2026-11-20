@@ -88,3 +88,33 @@ Options for finishing it
    and the source pass requires the stores to agree).  It does NOT by itself fix
    the ENTRY problem, since it still converts a form in place -- it is worth doing
    before 1 or 2 because it shrinks what would have to be built.
+
+Progress on option 2 (fresh lambda), and where it stops
+-------------------------------------------------------
+
+Implemented: the replacement is a LABELS local function called with the loop's
+arrays and its limit, with the array types declared (a fresh lambda inherits none,
+and the source pass reads types from declarations).  The differential harness still
+reports 50 of 54 shapes packed with correct values, and the inlined-call shape is
+still vectorized, so the wrapper costs nothing.
+
+What it fixed: the self-build with the pass on no longer stops with "ENTRY is not
+in ENTRIES for its home LAMBDA".  Converting into a lambda of its own gives IR1 the
+top-down conversion it expects, which is what the note predicted.
+
+Where it now stops: cross-compiling src/code/weak.lisp aborts with
+
+  attempt to THROW to a tag that does not exist: SB-C::LOCALL-ALREADY-LET-CONVERTED
+
+from RETURN-FROM (ir1-translators.lisp:231), which throws when the block's exit
+ctran has been deleted.  Two forms were tried and both hit it: (FUNCALL (LAMBDA
+...)) -- let-converted while being converted -- and LABELS.  The remaining
+suspicion is the destination: the form is converted into the LOOP's exit ctran
+(vector-node-splice-loop), which is a ctran the loop's own BLOCK/RETURN may already
+have touched.  Converting into a fresh ctran chained before that block, or building
+the lambda with IR1-CONVERT-LAMBDA and splicing a direct local call instead of
+converting a LABELS form, are the two next things to try.
+
+So option 2 is one step from working and one hurdle from working: the ENTRY problem
+is gone, the new problem is a conversion-destination problem, in the splice rather
+than in the emitted form.

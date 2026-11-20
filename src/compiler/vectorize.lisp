@@ -972,7 +972,7 @@ guard covers the reads as well as the writes."
 ;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
 ;;; only exists after inlining, which the source pass cannot see, but converting
 ;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
-(defvar *vector-node-splice* t
+(defvar *vector-node-splice* nil
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
