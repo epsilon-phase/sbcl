@@ -1166,6 +1166,12 @@ guard covers the reads as well as the writes."
 (defun vector-node-index-p (lvar index-var depth)
   "True when LVAR carries the loop index: I itself, or a parameter of an inline
 function called with it - ARET's lowering passes the index through one."
+  ;; the index reaches an access through a CAST after inlining (the array's index
+  ;; type is not the loop variable's), so look through it
+  (let ((use (and (lvar-p lvar) (lvar-uses lvar))))
+    (when (cast-p use)
+      (return-from vector-node-index-p
+        (vector-node-index-p (cast-value use) index-var depth))))
   (when (> depth 12) (return-from vector-node-index-p nil))
   (let ((leaf (vector-node-leaf-var lvar)))
     (cond ((and leaf (eq leaf index-var)) t)
