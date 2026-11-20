@@ -1,0 +1,90 @@
+Vectorizing loops at the IR1 level: why the second pass is off
+
+State of things
+---------------
+
+src/compiler/vectorize.lisp holds two passes.  The source-form pass ships: it
+rewrites a recognized DOTIMES/DO/LOOP form during IR1 conversion, before
+macroexpansion, using the ctype of each variable's leaf.  tests/auto-vectorize*.lisp
+and tests/auto-vectorize-differential.pure.lisp cover it.
+
+The second pass, *VECTOR-NODE-SPLICE*, recognizes an elementwise loop on IR1 after
+LOOP-ANALYZE and is off.  What it can do that the source pass cannot: see
+arithmetic that only exists after inlining.  For
+
+  (declaim (inline helper-add)) (defun helper-add (x y) (+ x y))
+  (dotimes (i n) (setf (aref c i) (helper-add (aref a i) (aref b i))))
+
+the source pass never sees a "+" -- at source level the body is still a call -- so
+it declines; the IR1 pass sees the inlined load/load/add tree and vectorizes it.
+tests/auto-vectorize.pure.lisp :IR1-VECTORIZES-AN-INLINED-CALL asserts both halves
+of that, so it fails if either stops being true.
+
+Why it cannot be enabled
+------------------------
+
+It recognizes the loop, prints a DOTIMES for the emitter to rewrite, and converts
+that form in place, inside a live component.
+
+IR1 registers an ENTRY node on (LEXENV-LAMBDA *LEXENV*) when it is created
+(ir1-translators.lisp:199-208, 294-314), and everything else finds an entry's home
+through (NODE-HOME-LAMBDA ...), which walks out of a :DELETED or :ZOMBIE lambda to
+the caller (ir1util.lisp:1382-1389).  A LET merge or a LET-converted transform
+between the two leaves an ENTRY that one lambda registered and another is asked
+about.  In-place conversion creates exactly that situation, because inline
+expansion and source transforms build their lambdas in the middle of an existing
+component.
+
+Symptoms, in the order they were found:
+
+- a self-build with the pass on stops in MAKE-WEAK-VECTOR and later shapes with
+  "#<SB-C::ENTRY ...> is not in ENTRIES for its home LAMBDA" (debug.lisp:517-519);
+- the offending entry sits in LIVE code -- (block-delete-p) NIL, reachable from
+  the component head -- so it is not debris from the deleted region;
+- ENVIRONMENT-ANALYZE iterates LAMBDA-ENTRIES (envanal.lisp:277), so a detached
+  entry loses its cleanup: an NLX target with a missing unwind.  This is the part
+  that makes it a correctness problem and not a failed assertion.
+
+*VECTOR-NODE-CHECK-ENTRIES* (off by default) asserts it at the splice, where the
+component is still intact; it fires for the differential harness's simplest shapes,
+which is the evidence that the problem is general to in-place conversion.
+
+Deleting the loop's blocks
+--------------------------
+
+Two things are settled and should not be undone:
+
+- do not call DELETE-BLOCK on the loop's own blocks.  DELETE-LAMBDA deliberately
+  leaves a deleted lambda's blocks queued (ir1util.lisp:2191-2194), so hand
+  deletion leaves ENTRY/EXIT bookkeeping inconsistent;
+- do not call FIND-DFO inside the splice either.  The replacement's functionals sit
+  in COMPONENT-NEW-FUNCTIONALS and are not reachable until LOCALL-ANALYZE-COMPONENT
+  runs, so a sweep there can delete the replacement as unreachable.
+
+unlink-blocks / link-blocks / (setf (component-reanalyze component) t), then let
+LOCALL run and the next round's dfo-as-needed sweep the region transitively.
+
+Options for finishing it
+------------------------
+
+1. Build the replacement as IR1 instead of converting a form.  Correct, and it is
+   what the pipeline expects, but it means reimplementing
+   VECTOR-ELEMENTWISE-PLAN / VECTOR-EMIT-ELEMENTWISE (the guards, the 256/128
+   dispatch, the scalar tail, the alias check, and the WITH-ARRAY-DATA hoisting)
+   as IR1 construction, i.e. writing the tested half of the feature a second time.
+
+2. Convert the replacement into a FRESH LAMBDA and splice a call to it, passing
+   the loop's arrays as arguments.  Conversion is then top-down into a new lambda,
+   which is the shape IR1 expects, and LOCAL call analysis can inline it back.  The
+   recogniser keeps its work; the risk moves to the splice: the call must be
+   analysed before the loop's blocks go, and the arguments must be free of
+   evaluation order surprises.  This looks like the cheapest sound route and has
+   not been tried.
+
+3. Share the emitter's VLOOP.  Build the (DEFSTRUCT VECTOR-LOOP) the source pass uses
+   and call VECTOR-EXPAND-LOOP on it, converting the form that returns.  This
+   deletes VECTOR-NODE-SOURCE-FORM and the second set of shape rules, and makes the
+   one-element-type rule enforced rather than assumed (VLOOP has one element type,
+   and the source pass requires the stores to agree).  It does NOT by itself fix
+   the ENTRY problem, since it still converts a form in place -- it is worth doing
+   before 1 or 2 because it shrinks what would have to be built.
