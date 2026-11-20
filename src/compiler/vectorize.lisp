@@ -1270,7 +1270,13 @@ function called with it - ARET's lowering passes the index through one."
                            (and (consp et) (string= (symbol-name (first et))
                                                     "UNSIGNED-BYTE"))))
                 (vector-node-fail :unary-minus-on-unsigned))
-              (push (list (leaf-source-name array) (type-specifier (lvar-type (fourth sargs))) tree)
+              ;; the element type comes from the ARRAY, not from the stored value:
+              ;; the value's lvar can carry the type of a cast or a constant (this
+              ;; printed (SIMPLE-ARRAY (INTEGER 0 0) (*)) and failed at run time)
+              (push (list (leaf-source-name array)
+                          (type-specifier
+                           (array-type-element-type (lvar-type (first sargs))))
+                          tree)
                     entries)))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
