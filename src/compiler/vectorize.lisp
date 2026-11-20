@@ -952,7 +952,7 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
-(defvar *vector-node-splice* t
+(defvar *vector-node-splice* nil
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1517,6 +1517,31 @@ scalar code and the recogniser would find it again and splice it again."
 ;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
 ;;; for building a block here; there is no call to repoint, so this is the same
 ;;; surgery WITHOUT the lambda that the inline-expansion path uses.
+(defvar *vector-node-check-entries* t
+  "Assert, at the splice, that every live ENTRY is listed by its home lambda.")
+
+(defun check-entries-after-splice (component)
+  "Report an ENTRY that its home lambda does not list.
+
+IR1 registration pushes the entry onto (LAMBDA-ENTRIES (LEXENV-LAMBDA *LEXENV*))
+at creation (ir1-translators.lisp:199-208), and the checker asks
+(LAMBDA-ENTRIES (NODE-HOME-LAMBDA node)), which walks out through
+LAMBDA-CALL-LEXENV for a :DELETED or :ZOMBIE lambda (ir1util.lisp:1382-1389).  An
+entry created inside a lambda that a LET merge or a transform later detached is
+registered with one lambda and found through another.  ENVIRONMENT-ANALYZE
+iterates LAMBDA-ENTRIES (envanal.lisp:277), so a mismatch loses that entry's
+cleanup."
+  (dolist (block (component-blocks component))
+    (unless (or (block-delete-p block) (block-deleted-p block))
+      (do-nodes (node nil block)
+        (when (and (typep node 'entry)
+                   (not (block-delete-p (node-block node)))
+                   (not (member node (lambda-entries (node-home-lambda node)))))
+          (error "stale ENTRY ~s in live block ~a: home lambda ~s kind ~a, entries registered on ~s"
+                 node (block-number (node-block node))
+                 (node-home-lambda node) (functional-kind (node-home-lambda node))
+                 (lambda-entries (node-home-lambda node))))))))
+
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (loop-head loop))
@@ -1603,6 +1628,15 @@ scalar code and the recogniser would find it again and splice it again."
             ;; next round's dfo-as-needed (dfo.lisp:51-69 -> ir1util.lisp:2826)
             ;; sweep the old region transitively, by which time locall has run.
             (setf (component-reanalyze component) t)
+            ;; Converting a FORM in place inside a live component collides with
+            ;; IR1 entry bookkeeping: inline-expansion and transform machinery
+            ;; creates ENTRY nodes whose home lambda resolves through
+            ;; LAMBDA-CALL-LEXENV after LET merging, and the lambda the checker
+            ;; asks about does not list them.  ENVIRONMENT-ANALYZE iterates
+            ;; LAMBDA-ENTRIES, so such an entry loses its cleanup.  This asserts
+            ;; it at the splice, where the component is still intact.
+            (when *vector-node-check-entries*
+              (check-entries-after-splice component))
             ;; The replacement brought a fresh lambda, entries and local exits;
             ;; put them through the same fixpoint the rest of the component ran.
             ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
