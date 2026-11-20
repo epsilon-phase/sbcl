@@ -1040,15 +1040,21 @@ guard covers the reads as well as the writes."
             (and (typep fun 'clambda)
                  (mapcar (lambda (v) (and (lambda-var-p v) (leaf-source-name v)))
                          (lambda-vars fun)))
-            (and (typep fun 'clambda) (length (lambda-blocks fun))))
+            (and (typep fun 'clambda)
+                 (let ((bind (lambda-bind fun))) (and bind (block-number (node-block bind))))))
+    ;; a functional has no blocks slot: its body starts at its BIND node's block
     (when (typep fun 'clambda)
-      (dolist (b (lambda-blocks fun))
-        (format *error-output* "~&;~a    b~a -> ~a~%"
-                indent (block-number b) (mapcar #'block-number (block-succ b)))
-        (handler-case
-            (do-nodes (n l b)
-              (format *error-output* "~&;~a      ~a~%" indent (vector-probe-node n)))
-          (error (e) (format *error-output* "~&;~a      <unwalkable: ~a>~%" indent e)))))))
+      (let ((bind (lambda-bind fun)))
+        (when bind
+          (do ((b (node-block bind) (first (block-succ b)))
+               (n 0 (1+ n)))
+              ((or (null b) (> n 6)))
+            (format *error-output* "~&;~a    b~a -> ~a~%"
+                    indent (block-number b) (mapcar #'block-number (block-succ b)))
+            (handler-case
+                (do-nodes (node l b)
+                  (format *error-output* "~&;~a      ~a~%" indent (vector-probe-node node)))
+              (error (e) (format *error-output* "~&;~a      <unwalkable: ~a>~%" indent e)))))))))
 
 (defun vector-node-probe-component (component)
   (when *vector-node-probe*
