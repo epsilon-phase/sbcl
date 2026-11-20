@@ -1163,7 +1163,12 @@ function called with it - ARET's lowering passes the index through one."
                    (and (every #'identity trees) (list :op op trees)))))))))
 
 ;;; the whole loop, if it is one this pass understands
-(defmacro vector-node-fail (reason) `(return-from vector-node-plan ,reason))
+;;; why the last shapes declined, for the differential harness to report: the
+;;; recogniser's answers are only useful if the reasons are visible
+(defvar *vector-node-refusals* nil)
+(defmacro vector-node-fail (reason)
+  `(progn (push ,reason *vector-node-refusals*)
+          (return-from vector-node-plan ,reason)))
 (defun vector-node-plan (loop)
   (unless (and (eq (loop-kind loop) :natural) (null (loop-inferiors loop)))
     (vector-node-fail :not-a-simple-loop))
