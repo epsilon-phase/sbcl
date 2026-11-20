@@ -984,7 +984,7 @@ guard covers the reads as well as the writes."
              (constant (format nil "ref constant ~s" (constant-value leaf)))
              (t (format nil "ref ~a" (leaf-source-name leaf))))))
     (bind (format nil "bind ~a" (leaf-source-name (bind-lambda node))))
-    (creturn (format nil "return ~a" (vector-probe-type (node-lvar node))))
+    (creturn (format nil "return"))
     (exit (format nil "exit"))
     (entry (format nil "entry"))
     (t (format nil "~a" (type-of node)))))
@@ -1001,9 +1001,11 @@ guard covers the reads as well as the writes."
       (format *error-output* "~&;~a  b~a -> ~a~%"
               indent (block-number block) (mapcar #'block-number (block-succ block)))
       (do-nodes (node lvar block)
-        (format *error-output* "~&;~a    ~a~@[ ; value ~a~]~%"
+        (format *error-output* "~&;~a    ~a~a~%"
                 indent (vector-probe-node node)
-                lvar (and lvar (vector-probe-type lvar)))))
+                (if lvar
+                    (format nil " ; value ~a" (vector-probe-type lvar))
+                    ""))))
     (dolist (inferior (loop-inferiors loop))
       (vector-probe-loop inferior (+ depth 2)))))
 
