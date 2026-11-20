@@ -1156,6 +1156,14 @@ function called with it - ARET's lowering passes the index through one."
                   (list :load (leaf-source-name array)
                         (vector-node-constant (third args))
                         (type-specifier (lvar-type (node-lvar use)))))))
+          ;; an integer store narrows its value: (+ ub32 ub32) derives (unsigned-byte
+          ;; 33), so the VALUE is wrapped in LOGAND with the lane mask.  The mask is
+          ;; implied by the array's element type when the form is printed, so the
+          ;; reader looks through it
+          ((and (vector-node-name-p use "LOGAND")
+                (= (length (combination-args use)) 2)
+                (vector-node-constant (second (combination-args use))))
+           (vector-node-tree (first (combination-args use)) (1+ depth) index-var))
           (t (let ((op (vector-node-call-name use)))
                (when (member op '("+" "-" "*" "/") :test #'string=)
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
