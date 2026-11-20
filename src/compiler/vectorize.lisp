@@ -1058,7 +1058,11 @@ guard covers the reads as well as the writes."
                ;; (SIMPLE-ARRAY (INTEGER 0 0) (*))
                (when (and (eq (loop-kind loop) :natural)
                           (policy (block-last (loop-head loop)) (>= speed 2)))
-                 (let ((plan (vector-node-plan loop)))
+                 ;; the readers are not total yet (a WITH-ARRAY-DATA store hands
+                 ;; them an MV-COMBINATION); until they are, a plan attempt that
+                 ;; signals declines.  Scope: planning only, never the splice.
+                 (let ((plan (handler-case (vector-node-plan loop)
+                               (error () nil))))
                    ;; VECTOR-NODE-PLAN returns a plan plist or a failure reason,
                    ;; and reasons are keywords as often as lists
                    (when (and (consp plan) (getf plan :element-type))
