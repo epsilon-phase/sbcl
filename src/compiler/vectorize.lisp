@@ -1522,23 +1522,19 @@ The parameters are declared because a fresh lambda's variables have no types of
 their own and the source-form pass reads the array types from declarations; the
 recogniser took them from the original lexenv, which the new lambda does not
 inherit."
-  (let* ((stores (getf plan :stores))
-         (names (remove-duplicates (mapcar #'first stores) :test #'equal))
-         (types (mapcar (lambda (name)
-                          (second (find name stores :key #'first :test #'equal)))
-                        names))
+  (let* ((stores (getf plan :stores))          ; (array-name . value-tree) pairs
+         (names (remove-duplicates (mapcar #'car stores) :test #'equal))
+         (type (getf plan :element-type))
          (index (make-symbol "VN-I"))
          (limit (make-symbol "VN-N")))
     `(funcall
       (lambda (,@names ,limit)
-        (declare ,@(mapcar (lambda (name type)
-                             `(type (simple-array ,type (*)) ,name))
-                           names types)
+        (declare (type (simple-array ,type (*)) ,@names)
                  (type fixnum ,limit))
         (dotimes (,index ,limit)
           ,@(mapcar (lambda (store)
-                      `(setf (aref ,(first store) ,index)
-                             ,(vector-node-print-tree (third store) nil index)))
+                      `(setf (aref ,(car store) ,index)
+                             ,(vector-node-print-tree (cdr store) nil index)))
                     stores)))
       ,@names ,(getf plan :limit))))
 
