@@ -1015,6 +1015,8 @@ guard covers the reads as well as the writes."
       ;; probe cannot walk; report that instead of taking the probe down
       (handler-case
           (do-nodes (node lvar block)
+            (when (mv-combination-p node)
+              (vector-probe-mv-call node indent))
             (format *error-output* "~&;~a    ~a~a~%"
                     indent (vector-probe-node node)
                     (if lvar
@@ -1024,6 +1026,29 @@ guard covers the reads as well as the writes."
           (format *error-output* "~&;~a    <block unwalkable: ~a>~%" indent e))))
     (dolist (inferior (loop-inferiors loop))
       (vector-probe-loop inferior (+ depth 2)))))
+
+;;; an MV-CALL to a local lambda hides the work in another functional: print it,
+;;; so a shape like WITH-ARRAY-DATA can be recognised against the IR1 that exists
+(defun vector-probe-mv-call (node indent)
+  (let* ((fun-lvar (mv-combination-fun node))
+         (use (lvar-uses fun-lvar))
+         (fun (and (ref-p use) (ref-leaf use))))
+    (format *error-output* "~&;~a  MV-CALL -> ~a, kind ~a, vars ~a, blocks ~a~%"
+            indent
+            (and (functional-p fun) (functional-debug-name fun))
+            (and (functional-p fun) (functional-kind fun))
+            (and (functional-p fun)
+                 (mapcar (lambda (v) (and (lambda-var-p v) (leaf-source-name v)))
+                         (lambda-vars (functional-%source-name fun))))
+            (and (functional-p fun) (length (lambda-blocks fun))))
+    (when (functional-p fun)
+      (dolist (b (lambda-blocks fun))
+        (format *error-output* "~&;~a    b~a -> ~a~%"
+                indent (block-number b) (mapcar #'block-number (block-succ b)))
+        (handler-case
+            (do-nodes (n l b)
+              (format *error-output* "~&;~a      ~a~%" indent (vector-probe-node n)))
+          (error (e) (format *error-output* "~&;~a      <unwalkable: ~a>~%" indent e)))))))
 
 (defun vector-node-probe-component (component)
   (when *vector-node-probe*
