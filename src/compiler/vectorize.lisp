@@ -1234,24 +1234,6 @@ function called with it - ARET's lowering passes the index through one."
 ;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
 ;;; for building a block here; there is no call to repoint, so this is the same
 ;;; surgery WITHOUT the lambda that the inline-expansion path uses.
-(defun vector-node-last-node (block)
-  (let ((last nil) (ctran (block-start block)))
-    (loop while ctran
-          for node = (ctran-next ctran)
-          while node
-          do (setf last node ctran (node-next node)))
-    last))
-
-;;; Put the replacement where the loop was.  The replacement is converted as a
-;;; LAMBDA and called once, the way the inline-expansion path does it, because a
-;;; form converted straight into a block would bring its own entries and exits and
-;;; the component has already been through IR1 optimization: the exits it creates
-;;; never meet MAYBE-DELETE-EXIT (ir1opt.lisp:1239), which is what the assertions
-;;; about environments and new functionals are complaining about.  So the work
-;;; goes back through the fixpoint afterwards.
-(defvar *vector-node-splice* nil
-  "When true, replace each loop the node analysis plans with what it emits.")
-
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (loop-head loop))
@@ -1260,39 +1242,85 @@ function called with it - ARET's lowering passes the index through one."
     ;; one way in and one way out: anything else needs more care than this
     (unless (and (= (length outside-in) 1) (= (length outside-out) 1))
       (return-from vector-node-splice-loop nil))
-    (let ((preheader (first outside-in))
-          (exit (first outside-out))
-          (component (block-component head)))
-      (with-ir1-environment-from-node (or (vector-node-last-node preheader)
-                                            (first (vector-node-nodes head)))
-        (let* ((start (make-ctran))
-               (next (make-ctran))
-               (middle (ctran-starts-block start))
-               (after (ctran-starts-block next))
-               (fun (ir1-convert-lambda `(lambda () ,(vector-node-source-form plan))
-                                        :debug-name (debug-name 'vector-replacement nil)))
-               (fun-lvar (make-lvar))
-               (call-ctran (make-ctran)))
-          (reference-leaf start call-ctran fun-lvar fun)
-          (ir1-convert-combination-args fun-lvar call-ctran next nil nil)
-          ;; the call's own continuation is NEXT, so the only edges to add are the
-          ;; way in and the way out
-          (unlink-blocks preheader head)
-          (link-blocks preheader middle)
-          (link-blocks after exit)
-          ;; drop the loop: every block marked before any is deleted
-          (dolist (block blocks)
-            (setf (block-delete-p block) t))
-          (dolist (block blocks)
-            (delete-block block t))
-          ;; the replacement brought lambdas and exits; put them through the same
-          ;; phases the rest of the component has been through.  IR1-PHASES binds
-          ;; the specials itself - binding them here would be a lexical binding of
-          ;; a variable the host does not know is special, which is fatal in
-          ;; make-host-2
-          (ir1-phases component)
-          (setf (component-reanalyze component) t)
-          t)))))
+    (let* ((preheader (first outside-in))
+           (exit (first outside-out))
+           (component (block-component head))
+           (head-home (block-home-lambda-or-null head))
+           (exit-ctran (and exit (block-start exit)))
+           (exit-home (and exit-ctran (block-home-lambda-or-null exit))))
+      ;; EXIT must be a real block we can deliver into, and both edges of the
+      ;; loop must stay inside the loop's home lambda: a cross-lambda edge is
+      ;; an NLX target that environment-analyze has not established yet
+      ;; (envanal.lisp:200-225 runs later).  BLOCK-HOME-LAMBDA on an empty
+      ;; block would read (block-last block) = nil (ir1util.lisp:1437-1439),
+      ;; hence BLOCK-HOME-LAMBDA-OR-NULL (ir1util.lisp:1405-1433).
+      (unless (and head-home exit-ctran
+                   (eq exit-home head-home)
+                   (or (null (block-last preheader))   ; the component head
+                       (eq (block-home-lambda-or-null preheader) head-home)))
+        (return-from vector-node-splice-loop nil))
+      ;; The anchor is the loop's own ENTRY node: the mess-up of the cleanup in
+      ;; the lexenv of the head's test.  The block/tagbody translators convert
+      ;; that entry BEFORE adding the cleanup (ir1-translators.lisp:199-208 and
+      ;; 294-314), so its lexenv is the scope the loop runs in -- every binding
+      ;; and every enclosing cleanup still in effect, minus the loop's own
+      ;; cleanups, which the splice deletes.  Anchoring on a preheader node
+      ;; instead would drop the loop-construct cleanups; anchoring inside the
+      ;; loop would inherit cleanups of code that is about to be deleted
+      ;; (merge-lets stores this lexenv as the call's LAMBDA-CALL-LEXENV,
+      ;; locall.lisp:1081, and node-enclosing-cleanup walks it, ir1util.lisp:23).
+      (let ((anchor (or (let ((cleanup (and (block-last head)
+                                            (lexenv-cleanup (node-lexenv (block-last head))))))
+                          (and cleanup (cleanup-mess-up cleanup)))
+                        (block-last preheader)
+                        (lambda-bind head-home))))
+        (with-ir1-environment-from-node anchor
+          (let* ((start (make-ctran))
+                 (middle (ctran-starts-block start)))
+            ;; Convert the replacement IN PLACE, in the loop's own lexical
+            ;; environment.  The emitted form is (LET ((VN-A (THE ... A)) ...)
+            ;; (DOTIMES ...)): the LET translator converts the binding values --
+            ;; the casts -- right here, where the loop's variables are bound,
+            ;; and moves the dotimes into a fresh lambda that it also calls,
+            ;; pushing the lambda on COMPONENT-NEW-FUNCTIONALS
+            ;; (ir1-translators.lisp:898-911; ir1tran-lambda.lisp:301-302).
+            ;; Converting `(lambda () ,form) directly loses the loop's
+            ;; variables: the body is converted in a fresh lexenv that binds
+            ;; only the lambda's own vars (ir1tran-lambda.lisp:256-258), so
+            ;; the original names arrive as free symbols.  The conversion goes
+            ;; through the vectorize-form hook like any other form
+            ;; (ir1tran.lisp:641-652).
+            ;;
+            ;; The form is delivered straight into EXIT's block: an extra empty
+            ;; continuation block would crash JOIN-SUCCESSOR-IF-POSSIBLE on its
+            ;; nil BLOCK-START-NODE (ir1opt.lisp:519 -> ir1util.lisp:1897,
+            ;; block-start-node ir1util.lisp:931-933).
+            (ir1-convert start exit-ctran nil (vector-node-source-form plan))
+            ;; rewire the entry, then drop the loop.  Every block is flagged
+            ;; before any is deleted: delete-block avers that no surviving
+            ;; predecessor is left without a successor (ir1util.lisp:2430-2438;
+            ;; same mark-then-delete shape as locall.lisp:521-526).
+            (unlink-blocks preheader head)
+            (link-blocks preheader middle)
+            (dolist (block blocks)
+              (setf (block-delete-p block) t))
+            (dolist (block blocks)
+              (delete-block block t))
+            ;; The replacement brought a fresh lambda, entries and local exits;
+            ;; put them through the same fixpoint the rest of the component ran.
+            ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
+            ;; let-converts the call (main.lisp:503-506; locall.lisp:1411,
+            ;; 1044-1136), and the next ir1-optimize round deletes the now
+            ;; local exits with MAYBE-DELETE-EXIT (ir1opt.lisp:516 and 1239).
+            ;; IR1-PHASES binds *constraint-universe* and *delayed-ir1-transforms*
+            ;; itself (main.lisp:549-552); binding them lexically here would be
+            ;; fatal in make-host-2.
+            (ir1-phases component)
+            ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
+            ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
+            ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).
+            (setf (component-reanalyze component) t)
+            t))))))
 
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
