@@ -1593,8 +1593,14 @@ scalar code and the recogniser would find it again and splice it again."
             ;; and MARK-FOR-DELETION stops walking predecessors at one.
             (unlink-blocks preheader head)
             (link-blocks preheader middle)
+            ;; Do NOT sweep here.  The replacement's own functionals are queued in
+            ;; COMPONENT-NEW-FUNCTIONALS and only become reachable once
+            ;; LOCALL-ANALYZE-COMPONENT runs, which happens after this: a sweep now
+            ;; can delete the replacement as unreachable, leaving an ENTRY whose
+            ;; home lambda no longer lists it.  Flagging the component makes the
+            ;; next round's dfo-as-needed (dfo.lisp:51-69 -> ir1util.lisp:2826)
+            ;; sweep the old region transitively, by which time locall has run.
             (setf (component-reanalyze component) t)
-            (find-dfo component)
             ;; The replacement brought a fresh lambda, entries and local exits;
             ;; put them through the same fixpoint the rest of the component ran.
             ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
