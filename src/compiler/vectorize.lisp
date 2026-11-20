@@ -1210,9 +1210,13 @@ function called with it - ARET's lowering passes the index through one."
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
           (list :element-type (second (first entries))
                 :index (leaf-source-name index-var)
+                ;; the limit has to be a name or a literal: an expression would
+                ;; be re-evaluated by the emitted DOTIMES, and it was printing as
+                ;; NIL, i.e. (THE INTEGER NIL)
                 :limit (or (vector-node-constant limit-lvar)
                            (let ((leaf (vector-node-leaf-var limit-lvar)))
-                             (and leaf (leaf-source-name leaf))))
+                             (and leaf (leaf-source-name leaf)))
+                           (vector-node-fail :limit-not-expressible))
                 :stores (mapcar (lambda (e) (cons (first e) (third e))) (nreverse entries))))))))
 
 
