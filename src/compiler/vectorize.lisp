@@ -1265,6 +1265,23 @@ function called with it - ARET's lowering passes the index through one."
 (defmacro vector-node-fail (reason)
   `(progn (push ,reason *vector-node-refusals*)
           (return-from vector-node-plan ,reason)))
+(defun vector-node-mark-consumed (node table)
+  "Mark NODE and everything its arguments are computed from in TABLE.
+
+The splice deletes the loop's blocks, so a node the plan did not account for is
+deleted with them: a side effect inside the loop would simply vanish, with no
+warning and correct values for the arrays.  Walking backwards from the test, the
+increment and the stores gives the set of nodes the replacement reproduces."
+  (when (and node (not (gethash node table)))
+    (setf (gethash node table) t)
+    (when (basic-combination-p node)
+      (dolist (lvar (combination-args node))
+        (let ((use (and (lvar-p lvar) (lvar-uses lvar))))
+          (cond ((consp use)
+                 (mapc (lambda (u) (vector-node-mark-consumed u table)) use))
+                (use (vector-node-mark-consumed use table)))))))
+  table)
+
 (defun vector-node-plan (loop)
   (unless (and (eq (loop-kind loop) :natural) (null (loop-inferiors loop)))
     (vector-node-fail :not-a-simple-loop))
@@ -1371,6 +1388,17 @@ function called with it - ARET's lowering passes the index through one."
                            (array-type-element-type (lvar-type (first sargs))))
                           tree)
                     entries)))
+          ;; everything else in the loop's blocks has to be accounted for, or the
+          ;; splice deletes it
+          (let ((consumed (make-hash-table :test 'eq)))
+            (dolist (store stores)
+              (vector-node-mark-consumed store consumed))
+            (mapc (lambda (n) (vector-node-mark-consumed n consumed)) (list test step))
+            (dolist (node (mapcan #'vector-node-nodes blocks))
+              (unless (or (typep node 'cif) (typep node 'cset) (typep node 'cexit)
+                          (typep node 'cblock-start) (typep node 'cblock-end)
+                          (gethash node consumed))
+                (vector-node-fail (list :unconsumed-node (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
           (list :element-type (second (first entries))
