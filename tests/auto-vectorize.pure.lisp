@@ -867,6 +867,136 @@ OPERATION applied to the same numbers, which involves no array loop."
                       *vectorize-packed-mnemonics*)
                 () "~S was not vectorized:~%~A" function text)))))
 
+;;; A loop body that writes more than one array.  The matcher that recognizes
+;;; these is the portable one, so an arm64 build runs the same shapes
+;;; (tests/auto-vectorize-arm64.pure.lisp); the two files have to agree on what
+;;; the shapes mean, and this is the one that runs on the backend where the pass
+;;; can be exercised.
+
+(defun vectorize-multi-two-destinations (re im n)
+  (declare (type (simple-array single-float (*)) re im) (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref re i) (* 2.0 (aref re i)))
+    (setf (aref im i) (+ 1.0 (aref im i))))
+  (values))
+
+;;; the second store reads the element the first one wrote, so the packed body
+;;; has to keep the two stores in that order, as the scalar loop does
+(defun vectorize-multi-in-place (a n)
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type vectorize-index half))
+    (dotimes (i half)
+      (setf (aref a (+ i half)) (+ (aref a i) 1.0))
+      (setf (aref a i) (* 2.0 (aref a (+ i half)))))
+    a))
+
+;;; a radix-2 butterfly: an index binding, intermediates that two stores share,
+;;; and four stores across two arrays
+(defun vectorize-multi-butterfly (re im wr wi n)
+  (declare (type (simple-array single-float (*)) re im wr wi)
+           (type vectorize-index n) (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type vectorize-index half))
+    (dotimes (k half)
+      (let* ((j (+ k half))
+             (tr (- (* (aref re j) (aref wr k)) (* (aref im j) (aref wi k))))
+             (ti (+ (* (aref re j) (aref wi k)) (* (aref im j) (aref wr k)))))
+        (declare (type single-float tr ti))
+        (setf (aref re j) (- (aref re k) tr))
+        (setf (aref im j) (- (aref im k) ti))
+        (setf (aref re k) (+ (aref re k) tr))
+        (setf (aref im k) (+ (aref im k) ti))))
+    (values)))
+
+;;; one store, ahead of what the loop reads: no permutation argument makes this
+;;; safe, so it stays scalar
+(defun vectorize-multi-write-ahead (a n)
+  (declare (type (simple-array single-float (*)) a) (type vectorize-index n)
+           (optimize speed))
+  (let ((half (ash n -1)))
+    (declare (type vectorize-index half))
+    (dotimes (i half)
+      (setf (aref a (+ i half)) (+ (aref a i) 1.0)))
+    a))
+
+(test-util:with-test (:name :vectorize-multiple-stores :skipped-on (not :x86-64))
+  ;; LABELS, not FLET: PACKED calls DISASSEMBLY
+  (labels ((disassembly (function)
+             (string-downcase (with-output-to-string (stream)
+                                (disassemble function :stream stream))))
+           (packed (function)
+           (some (lambda (mnemonic) (search mnemonic (disassembly function)))
+                 *vectorize-packed-mnemonics*)))
+    ;; two destinations, neither one read
+    (loop for n in *vectorize-lengths*
+          for re = (vectorize-array 'single-float '(1.5 -2.25 0.5 3.75 -1.25) n)
+          for im = (vectorize-array 'single-float '(7.5 -8.25 2.5 -3.0 0.25) n 2)
+          for want-re = (map 'vector (lambda (x) (* 2.0 x)) re)
+          for want-im = (map 'vector (lambda (x) (+ 1.0 x)) im)
+          do (vectorize-multi-two-destinations re im n)
+             (dotimes (i n)
+               (unless (vectorize-same-value-p (aref re i) (aref want-re i))
+                 (error "~@<two destinations: re ~D of ~D is ~S, expected ~S.~:@>"
+                        i n (aref re i) (aref want-re i)))
+               (unless (vectorize-same-value-p (aref im i) (aref want-im i))
+                 (error "~@<two destinations: im ~D of ~D is ~S, expected ~S.~:@>"
+                        i n (aref im i) (aref want-im i)))))
+    (assert (packed #'vectorize-multi-two-destinations) ()
+            "a loop with two destinations was not vectorized:~%~A"
+            (disassembly #'vectorize-multi-two-destinations))
+    ;; an in-place update where each store reads what the one before it wrote
+    (loop for n in '(0 2 4 5 8 9 16 17 100)
+          for half = (ash n -1)
+          for a = (vectorize-array 'single-float '(1.5 -2.25 0.5 3.75 -1.25) n)
+          do (let ((want (copy-seq a)))
+               (dotimes (i half)
+                 (let ((first (aref a i)))
+                   (setf (aref want (+ i half)) (+ first 1.0)
+                         (aref want i) (* 2.0 (+ first 1.0)))))
+               (vectorize-multi-in-place a n)
+               (dotimes (i n)
+                 (unless (vectorize-same-value-p (aref a i) (aref want i))
+                   (error "~@<in-place update: element ~D of ~D is ~S, expected ~S.~:@>"
+                          i n (aref a i) (aref want i))))))
+    (assert (packed #'vectorize-multi-in-place) ()
+            "an in-place update was not vectorized:~%~A"
+            (disassembly #'vectorize-multi-in-place))
+    ;; the butterfly
+    (loop for n in '(0 2 4 8 9 16 17 64 100)
+          for half = (ash n -1)
+          for re = (vectorize-array 'single-float '(1.5 -2.25 0.5 3.75 -1.25) n)
+          for im = (vectorize-array 'single-float '(7.5 -8.25 2.5 -3.0 0.25) n 3)
+          for wr = (vectorize-array 'single-float '(0.5 1.5 -0.75 2.25 1.0) half)
+          for wi = (vectorize-array 'single-float '(1.25 -0.5 0.75 -1.5 2.0) half 1)
+          do (let ((want-re (copy-seq re))
+                   (want-im (copy-seq im)))
+               (dotimes (k half)
+                 (let* ((j (+ k half))
+                        (tr (- (* (aref re j) (aref wr k)) (* (aref im j) (aref wi k))))
+                        (ti (+ (* (aref re j) (aref wi k)) (* (aref im j) (aref wr k)))))
+                   (setf (aref want-re j) (- (aref re k) tr)
+                         (aref want-im j) (- (aref im k) ti)
+                         (aref want-re k) (+ (aref re k) tr)
+                         (aref want-im k) (+ (aref im k) ti))))
+               (vectorize-multi-butterfly re im wr wi n)
+               (dotimes (i n)
+                 (unless (vectorize-same-value-p (aref re i) (aref want-re i))
+                   (error "~@<butterfly: re ~D of ~D is ~S, expected ~S.~:@>"
+                          i n (aref re i) (aref want-re i)))
+                 (unless (vectorize-same-value-p (aref im i) (aref want-im i))
+                   (error "~@<butterfly: im ~D of ~D is ~S, expected ~S.~:@>"
+                          i n (aref im i) (aref want-im i))))))
+    (assert (packed #'vectorize-multi-butterfly) ()
+            "the butterfly was not vectorized:~%~A"
+            (disassembly #'vectorize-multi-butterfly))
+    ;; and the shape that cannot be packed
+    (assert (not (packed #'vectorize-multi-write-ahead)) ()
+            "a write ahead of every read was vectorized:~%~A"
+            (disassembly #'vectorize-multi-write-ahead))))
+
 ;;; Loops that must be left alone, and must still be right.
 
 (defun vectorize-single-add-loop-from-1 (a b c n)
