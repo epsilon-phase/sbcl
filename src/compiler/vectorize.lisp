@@ -1030,6 +1030,15 @@ guard covers the reads as well as the writes."
 ;;; analysis can describe is replaced by what it emits.
 (defun vector-node-component-pass (component)
   (when *vector-node-splice*
+    ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
+    ;; COMPILE-COMPONENT has analysed this component, so the analysis the pass
+    ;; needs is done here rather than assumed.  Running inside the fixpoint is
+    ;; what makes the splice sound: the round after it deletes the exits the
+    ;; replacement's TAGBODY brings, in a component whose constraint state and
+    ;; environment are the live ones.
+    (find-dfo component)
+    (find-dominators component)
+    (loop-analyze component)
     (labels ((walk (loop)
                (when (eq (loop-kind loop) :natural)
                  (let ((plan (vector-node-plan loop)))
@@ -1321,8 +1330,6 @@ function called with it - ARET's lowering passes the index through one."
             ;; functionals, and the flags let the phases still ahead of us redo the
             ;; optimization and the DFO that the new code needs
             (locall-analyze-component component)
-            (setf (component-reoptimize component) t)
-            (setf (component-reanalyze component) t)
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
             ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
             ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).

@@ -544,13 +544,21 @@ necessary, since type inference may take arbitrarily long to converge.")
          (go again)))))
 
 ;;; Do all the IR1 phases for a non-top-level component.
+(declaim (ftype (function (component) t) vector-node-component-pass))
+
 (defun ir1-phases (component)
   (declare (type component component))
   (let ((*constraint-universe* (make-array 64 ; arbitrary, but don't make this 0
                                            :fill-pointer 0 :adjustable t))
         (*delayed-ir1-transforms* nil))
     (declare (special *constraint-universe* *delayed-ir1-transforms*))
-    (ir1-optimize-phase-1 component)
+    ;; the vectorizer splices into components that have been optimised, and the
+    ;; round after each splice is what cleans up what it inserted, so it runs
+    ;; here rather than in COMPILE-COMPONENT after the fixpoint is over
+    (loop
+      (ir1-optimize-phase-1 component)
+      (unless (vector-node-component-pass component)
+        (return)))
     (when *compiler-trace-output*
       (when (memq :checkgen *compile-trace-targets*)
         (describe-component component *compiler-trace-output*)))
@@ -742,8 +750,8 @@ necessary, since type inference may take arbitrarily long to converge.")
     (find-dominators component)
     (maybe-mumble "Loop ")
     (loop-analyze component)
+    ;; the splice itself runs inside IR1-PHASES now, see there
     (vector-node-probe-component component)
-    (vector-node-component-pass component)
 
     #|
     (when *compiler-trace-output*
