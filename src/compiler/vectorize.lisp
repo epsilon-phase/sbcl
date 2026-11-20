@@ -1170,6 +1170,14 @@ function called with it - ARET's lowering passes the index through one."
                                  body-nodes))
              (stores (remove-if-not (lambda (n) (vector-node-name-p n "DATA-VECTOR-SET-WITH-OFFSET"))
                                     body-nodes)))
+        ;; the loop must be exactly: test, index increment, and stores.  Anything
+        ;; else -- an accumulator, a conditional inside the body, hidden state -- is
+        ;; not elementwise, and reverse-engineering the rest of the loop is what
+        ;; splices this into code it cannot represent (the harness's LOOP COLLECT
+        ;; compiled with it on was the first casualty)
+        (unless (= 1 (count-if (lambda (n) (typep n 'cset))
+                               (mapcan #'vector-node-nodes blocks)))
+          (vector-node-fail :more-than-the-index-is-set))
         (unless index-var (vector-node-fail :no-index))
         (unless increment (vector-node-fail :no-increment))
         (unless stores (vector-node-fail :no-store))
