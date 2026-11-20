@@ -1551,12 +1551,12 @@ cleanup."
       ((null block))
     (unless (block-delete-p block)
       (do-nodes (node nil block)
-        (when (and (typep node 'entry)
-                   (not (member node (lambda-entries (node-home-lambda node)))))
-          (error "stale ENTRY ~s in live block ~a: home lambda ~s kind ~a, entries ~s"
-                 node (block-number (node-block node))
-                 (node-home-lambda node) (functional-kind (node-home-lambda node))
-                 (lambda-entries (node-home-lambda node))))))))
+        (when (typep node 'entry)
+          (let ((home (node-home-lambda node)))
+            (when (and home (not (member node (lambda-entries home))))
+              (error "stale ENTRY ~s in live block ~a: home ~s kind ~a, entries ~s"
+                     node (block-number (node-block node))
+                     home (functional-kind home) (lambda-entries home)))))))))
 
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
