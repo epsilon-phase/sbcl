@@ -1337,23 +1337,21 @@ increment and the stores gives the set of nodes the replacement reproduces."
                                 (not (array-type-complexp ty)))))
                        stores)
           (vector-node-fail :not-a-simple-array))
-        (let* ((step (lvar-uses (set-value increment))))
+        (let ((step (lvar-uses (set-value increment))))
           (setf step-node step)
-          (let* ((step-args (and (basic-combination-p step) (combination-args step))))
           ;; the increment's value can arrive through a cast, as every other value
-          ;; in this pass can
+          ;; in this pass can; the cast chain is walked before the shape is read
           (loop repeat 4
                 while (cast-p step)
-                do (setf step (lvar-uses (cast-value step))
-                         step-args (and (basic-combination-p step)
-                                        (combination-args step))))
-          ;; (1+ i) is as common as (+ i 1), and DOTIMES expands to either
-          (let ((name (and (basic-combination-p step) (vector-node-call-name step))))
+                do (setf step (lvar-uses (cast-value step))))
+          (setf step-node step)
+          (let ((step-args (and (basic-combination-p step) (combination-args step)))
+                (name (and (basic-combination-p step) (vector-node-call-name step))))
+            ;; (1+ i) is as common as (+ i 1), and DOTIMES expands to either
             (unless (and step-args (member name '("+" "1+") :test #'string=))
-              (vector-node-fail (list :increment-not-plus name))))
+              (vector-node-fail (list :increment-not-plus name)))
             (unless (and (eq (vector-node-leaf-var (first step-args)) index-var)
-                         (or (and (string= (or (vector-node-call-name step) "") "1+")
-                                  (= (length step-args) 1))
+                         (or (and (string= (or name "") "1+") (= (length step-args) 1))
                              (eql (vector-node-constant (second step-args)) 1)))
               (vector-node-fail :increment-not-by-one))))
         (unless (every (lambda (ref) (memq (ctran-block (node-prev ref)) blocks))
