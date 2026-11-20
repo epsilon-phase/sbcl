@@ -1038,6 +1038,10 @@ guard covers the reads as well as the writes."
 
 (defun vector-node-component-pass (component)
   (when (and *vector-node-splice*
+             ;; the same policy gate the source pass uses: at low speed the lvars
+             ;; carry no useful types, and the emitted (THE ...) casts become
+             ;; nonsense like (SIMPLE-ARRAY (INTEGER 0 0) (*))
+             (>= (policy-quality (component-policy component) 'speed) 2)
              (not (gethash component *vector-node-spliced*)))
     ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
     ;; COMPILE-COMPONENT has analysed this component, so the analysis the pass
