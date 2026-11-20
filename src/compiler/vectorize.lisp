@@ -1247,6 +1247,15 @@ function called with it - ARET's lowering passes the index through one."
         (unless index-var (vector-node-fail :no-index))
         (unless increment (vector-node-fail :no-increment))
         (unless stores (vector-node-fail :no-store))
+        ;; a non-simple array is not supported yet: its AREF inlines to data-vector
+        ;; access behind WITH-ARRAY-DATA, and the data vector has to be hoisted out
+        ;; of the loop.  Refuse it here, before walking nodes the pass cannot read
+        (unless (every (lambda (store)
+                         (let ((ty (lvar-type (first (combination-args store)))))
+                           (and (array-type-p ty)
+                                (not (array-type-complexp ty)))))
+                       stores)
+          (vector-node-fail :not-a-simple-array))
         (let* ((step (lvar-uses (set-value increment)))
                (step-args (and (basic-combination-p step) (combination-args step))))
           (unless (and step-args (string= (or (vector-node-call-name step) "") "+"))
