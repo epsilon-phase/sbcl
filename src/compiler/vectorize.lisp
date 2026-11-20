@@ -1317,7 +1317,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
     ;; queues the lambda's blocks outside the region, where an ENTRY then reports
     ;; the caller as its home and the consistency check barfs
     (dolist (node (mapcan #'vector-node-nodes blocks))
-      (when (typep node '(or entry bind enclose creturn jump-table))
+      (when (typep node '(or entry enclose creturn jump-table))
         (vector-node-fail (list :structural-node (type-of node)))))
     (let* ((cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
            (test (and cif (lvar-uses (if-test cif))))
@@ -1575,16 +1575,20 @@ scalar code and the recogniser would find it again and splice it again."
               ;; pass has to be on while it is converted or the replacement runs
               ;; scalar
               (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
-            ;; rewire the entry, then drop the loop.  Every block is flagged
-            ;; before any is deleted: delete-block avers that no surviving
-            ;; predecessor is left without a successor (ir1util.lisp:2430-2438;
-            ;; same mark-then-delete shape as locall.lisp:521-526).
+            ;; rewire the entry and let the sweep delete the loop: the blocks are
+            ;; unreachable now, so FIND-DFO -> CLEAN-COMPONENT retires them
+            ;; together with everything only reachable through them -- including
+            ;; the blocks of a lambda that DELETE-BLOCK marks :deleted on the way
+            ;; (ir1util.lisp:2191-2194 leaves those queued on purpose).  Hand
+            ;; deletion breaks ENTRY/EXIT bookkeeping: an ENTRY left in a
+            ;; surviving region reports its home through the :deleted lambda and
+            ;; the consistency check barfs.  Do not flag the blocks first either:
+            ;; DELETE-BLOCK-LAZILY skips a flagged block (ir1util.lisp:2402-2406)
+            ;; and MARK-FOR-DELETION stops walking predecessors at one.
             (unlink-blocks preheader head)
             (link-blocks preheader middle)
-            (dolist (block blocks)
-              (setf (block-delete-p block) t))
-            (dolist (block blocks)
-              (delete-block block t))
+            (setf (component-reanalyze component) t)
+            (find-dfo component)
             ;; The replacement brought a fresh lambda, entries and local exits;
             ;; put them through the same fixpoint the rest of the component ran.
             ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
