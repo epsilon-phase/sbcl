@@ -1397,9 +1397,16 @@ increment and the stores gives the set of nodes the replacement reproduces."
                   (list test step-node increment))
             ;; only nodes that do work matter: a combination or a set.  The
             ;; structural nodes (block starts, exits) go with the blocks
+            ;; a node whose value nothing consumes and which is pure can go with
+            ;; the block: what must not be lost is work with an effect.  An AREF
+            ;; that has not been turned into data-vector access yet is such a pure
+            ;; node, so it is exempt
             (dolist (node (mapcan #'vector-node-nodes blocks))
               (when (and (or (basic-combination-p node) (typep node 'cset))
-                         (not (gethash node consumed)))
+                         (not (gethash node consumed))
+                         (not (member (and (basic-combination-p node)
+                                           (vector-node-call-name node))
+                                      '("AREF" "%AREF") :test #'string=)))
                 (vector-node-fail (list :unconsumed-node (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
