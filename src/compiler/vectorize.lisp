@@ -1011,12 +1011,17 @@ guard covers the reads as well as the writes."
         ((null block))
       (format *error-output* "~&;~a  b~a -> ~a~%"
               indent (block-number block) (mapcar #'block-number (block-succ block)))
-      (do-nodes (node lvar block)
-        (format *error-output* "~&;~a    ~a~a~%"
-                indent (vector-probe-node node)
-                (if lvar
-                    (format nil " ; value ~a" (vector-probe-type lvar))
-                    ""))))
+      ;; a block whose nodes have not been analysed yet has ctran links the
+      ;; probe cannot walk; report that instead of taking the probe down
+      (handler-case
+          (do-nodes (node lvar block)
+            (format *error-output* "~&;~a    ~a~a~%"
+                    indent (vector-probe-node node)
+                    (if lvar
+                        (format nil " ; value ~a" (vector-probe-type lvar))
+                        "")))
+        (error (e)
+          (format *error-output* "~&;~a    <block unwalkable: ~a>~%" indent e))))
     (dolist (inferior (loop-inferiors loop))
       (vector-probe-loop inferior (+ depth 2)))))
 
