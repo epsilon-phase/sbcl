@@ -1048,6 +1048,10 @@ guard covers the reads as well as the writes."
     (find-dfo component)
     (find-dominators component)
     (loop-analyze component)
+    ;; TEMPORARY: the readers below are not total yet, and a shape the pass
+    ;; cannot read must decline rather than take the compiler down with it.
+    ;; Every case this hides is a rule still to be written.
+    (handler-case
     (labels ((walk (loop)
                (when (eq (loop-kind loop) :natural)
                  (let ((plan (vector-node-plan loop)))
@@ -1060,7 +1064,8 @@ guard covers the reads as well as the writes."
                (dolist (inferior (loop-inferiors loop))
                  (when (walk inferior) (return-from walk t)))
                nil))
-      (walk (component-outer-loop component)))))
+      (walk (component-outer-loop component)))
+      (error () nil))))
 
 ;;; ------------------------------------------------- recognition, on IR1
 ;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
