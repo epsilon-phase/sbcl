@@ -1196,8 +1196,13 @@ function called with it - ARET's lowering passes the index through one."
   (let* ((home (lambda-var-home var))
          (call (and home (handler-case (let-combination home) (error () nil)))))
     (unless (basic-combination-p call) (return-from vector-node-var-init nil))
-    (let ((pos (position var (lambda-vars home))))
-      (and pos (vector-node-constant (nth pos (combination-args call)))))))
+    (let* ((pos (position var (lambda-vars home)))
+           (value (and pos (vector-node-constant (nth pos (combination-args call))))))
+      (unless value
+        (push (list :var-init :home (and home t) :call (and call t) :pos pos
+                    :value value :args (length (combination-args call)))
+              *vector-node-refusals*))
+      value)))
 
 ;;; why a shape declined, for the differential harness to report: the recogniser's
 ;;; answers are only useful if the reasons are visible
