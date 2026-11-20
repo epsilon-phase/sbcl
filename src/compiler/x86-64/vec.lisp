@@ -986,6 +986,77 @@
     (inst pmullw arith-tmp b)
     (move result arith-tmp)))
 
+;;; byte lanes have no multiply at any width, so the operands are unpacked into
+;;; 16-bit lanes, multiplied with PMULLW, masked to the low byte and packed back.
+;;; PACKUSWB saturates, so the mask before the pack is what makes the result wrap
+;;; like the scalar loop does; the mask is made with PCMPEQD + PSRLW rather than a
+;;; 128-bit constant, which register-inline-constant takes only as one integer.
+(defknown (%vec-mul-ub8) ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8))) (simd-pack (unsigned-byte 8)) (flushable movable))
+
+(define-vop (%vec-mul-ub8)
+  (:translate %vec-mul-ub8)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-ub8 simd-pack-ub8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) lo-a)
+  (:temporary (:sc int-sse-reg :from (:argument 1)) lo-b)
+  (:temporary (:sc int-sse-reg)) hi-a)
+  (:temporary (:sc int-sse-reg)) hi-b)
+  (:temporary (:sc int-sse-reg)) zero)
+  (:temporary (:sc int-sse-reg)) mask)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-ub8)
+  (:generator 8
+    (inst pxor zero zero)
+    (inst pcmpeqd mask mask)
+    (inst psrlw mask 8)
+    (move lo-a a)
+    (inst punpcklbw lo-a zero)
+    (move lo-b b)
+    (inst punpcklbw lo-b zero)
+    (move hi-a a)
+    (inst punpckhbw hi-a zero)
+    (move hi-b b)
+    (inst punpckhbw hi-b zero)
+    (inst pmullw lo-a lo-b)
+    (inst pmullw hi-a hi-b)
+    (inst pand lo-a mask)
+    (inst pand hi-a mask)
+    (inst packuswb lo-a hi-a)
+    (move result lo-a)))
+
+(defknown (%vec-mul-sb8) ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8))) (simd-pack (signed-byte 8)) (flushable movable))
+
+(define-vop (%vec-mul-sb8)
+  (:translate %vec-mul-sb8)
+  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
+  (:arg-types simd-pack-sb8 simd-pack-sb8)
+  (:temporary (:sc int-sse-reg :from (:argument 0)) lo-a)
+  (:temporary (:sc int-sse-reg :from (:argument 1)) lo-b)
+  (:temporary (:sc int-sse-reg)) hi-a)
+  (:temporary (:sc int-sse-reg)) hi-b)
+  (:temporary (:sc int-sse-reg)) zero)
+  (:temporary (:sc int-sse-reg)) mask)
+  (:results (result :scs (int-sse-reg)))
+  (:result-types simd-pack-sb8)
+  (:generator 8
+    (inst pxor zero zero)
+    (inst pcmpeqd mask mask)
+    (inst psrlw mask 8)
+    (move lo-a a)
+    (inst punpcklbw lo-a zero)
+    (move lo-b b)
+    (inst punpcklbw lo-b zero)
+    (move hi-a a)
+    (inst punpckhbw hi-a zero)
+    (move hi-b b)
+    (inst punpckhbw hi-b zero)
+    (inst pmullw lo-a lo-b)
+    (inst pmullw hi-a hi-b)
+    (inst pand lo-a mask)
+    (inst pand hi-a mask)
+    (inst packuswb lo-a hi-a)
+    (move result lo-a)))
+
 ;;; 32-bit multiplication is PMULLD, which is SSE4.1 rather than SSE2, so both the
 ;;; vop and its entry in the table are published only by a build that has the
 ;;; instruction: a table entry with no vop behind it is worse than no entry, since
@@ -1426,6 +1497,8 @@
     (publish "SUB" double-float %vec-sub-double)
     (publish "MUL" single-float %vec-mul-single)
     (publish "MUL" double-float %vec-mul-double)
+    (publish "MUL" (unsigned-byte 8) %vec-mul-ub8)
+    (publish "MUL" (signed-byte 8) %vec-mul-sb8)
     (publish "DIV" single-float %vec-div-single)
     (publish "DIV" double-float %vec-div-double)
     (publish "NEG" single-float %vec-negate-single)
