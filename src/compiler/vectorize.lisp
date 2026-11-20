@@ -963,6 +963,9 @@ guard covers the reads as well as the writes."
          (narrow (let ((*auto-vectorize-notes* nil))
                    (vector-elementwise-attempt #'vector-expand-reduction loop 16))))
     (cond ((not (or wide narrow)) nil)
+;;; a wide attempt with no narrow one would be emitted with no test to stop it, and a
+;;; reduction has nothing to fall back to: leave it scalar
+          ((and wide dispatch (null narrow)) nil)
           (t (when *auto-vectorize-notes*
                (if (and wide narrow dispatch)
                    (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
@@ -1138,12 +1141,19 @@ guard covers the reads as well as the writes."
         (ok (make-symbol "PACKED-RUNS"))
         (wide-p (make-symbol "WIDE")))
     (when *auto-vectorize-notes*
-      (if dispatch
-          (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
-                            the machine has avx2 and ~a where it does not"
-                           element-type (getf wide :width) (getf narrow :width))
-          (compiler-notify "vectorized loop over ~a, ~a elements at a time"
-                           element-type (getf (or wide narrow) :width))))
+      (cond ((and dispatch narrow)
+             (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
+                               the machine has avx2 and ~a where it does not"
+                              element-type (getf wide :width) (getf narrow :width)))
+            (dispatch
+;;; nothing narrower can express this loop, so what the machine cannot run it must
+;;; not reach: the element loop does all the work instead
+             (compiler-notify "vectorized loop over ~a, ~a elements at a time, where ~
+                               the machine has avx2 and element by element where it ~
+                               does not" element-type (getf wide :width)))
+            (t
+             (compiler-notify "vectorized loop over ~a, ~a elements at a time"
+                              element-type (getf (or wide narrow) :width)))))
     (flet ((packed-branch (plan)
              `(let* ,(getf plan :bindings)
                 (declare (type ,(getf plan :pack-type) ,@(getf plan :names)))
@@ -1154,20 +1164,23 @@ guard covers the reads as well as the writes."
                   ((>= ,index ,count-var))
                 (declare (type index ,index))
                 ,@(vloop-body loop))))
-      (let* ((guard (if dispatch (getf narrow :guard) (getf (or wide narrow) :guard)))
+      (let* ((guard (if dispatch (getf (or narrow wide) :guard)
+                        (getf (or wide narrow) :guard)))
              (body
                (vector-with-data-vectors
                 references
                 (if dispatch
+;;; the lane bindings are 256-bit instructions too, so the test has to cover them:
+;;; a machine without avx2 must not reach them, not merely skip the loop
                     `(let* ((,ok (and (typep ,count-var 'index) ,@guard))
                             (,wide-p (and ,ok (,*vector-wide-predicate*)))
                             (,end (if ,wide-p
                                       ,(getf wide :pick-end)
-                                      (if ,ok ,(getf narrow :pick-end) 0))))
+                                      ,(if narrow `(if ,ok ,(getf narrow :pick-end) 0) 0))))
                        (declare (type index ,end))
                        (if ,wide-p
                            ,(packed-branch wide)
-                           (when ,ok ,(packed-branch narrow)))
+                           ,(when narrow `(when ,ok ,(packed-branch narrow))))
                        ,(tail))
                     `(let* ((,end (if (and (typep ,count-var 'index) ,@guard)
                                       ,(getf (or wide narrow) :pick-end)
