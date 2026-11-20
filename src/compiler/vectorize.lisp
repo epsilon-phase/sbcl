@@ -1315,12 +1315,18 @@ function called with it - ARET's lowering passes the index through one."
             ;; IR1-PHASES binds *constraint-universe* and *delayed-ir1-transforms*
             ;; itself (main.lisp:549-552); binding them lexically here would be
             ;; fatal in make-host-2.
-            ;; re-running IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE*
-            ;; while the component's lvars still index the old one, and constraint
-            ;; propagation dies on that; local call analysis is what drains the new
-            ;; functionals, and the flags let the phases still ahead of us redo the
-            ;; optimization and the DFO that the new code needs
-            (locall-analyze-component component)
+            ;; the replacement brought a tagbody and its GO's, whose exits only go
+            ;; away when IR1 optimization runs MAYBE-DELETE-EXIT over them, and local
+            ;; call analysis folds the lambda.  Locally that is IR1-PHASES, but the
+            ;; specials it binds have to be declared special here: bound in a plain
+            ;; LET they are lexical as far as the host is concerned, which is fatal
+            ;; in make-host-2
+            (locally (declare (special *constraint-universe* *delayed-ir1-transforms*))
+              (let ((*constraint-universe* (make-array 64 :fill-pointer 0
+                                                          :adjustable t))
+                    (*delayed-ir1-transforms* nil))
+                (ir1-optimize-until-done component)
+                (locall-analyze-component component)))
             (setf (component-reoptimize component) t)
             (setf (component-reanalyze component) t)
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
