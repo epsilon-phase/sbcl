@@ -1953,6 +1953,17 @@ a writer with a fixed color type ends up with."
       (let ((notes (notes-for 'single-float source-type)))
         (assert (not (vectorize-note-mentions notes "packed load reads")) ()
                 "~a was reported as having no widening load: ~s" source-type notes))))
+  ;; the widening loads take a simple array, so a source that is only declared a
+  ;; VECTOR is told that rather than that nothing reads it
+  (let ((notes (vectorize-notes-for
+                '(lambda (in out n)
+                   (declare (type (vector (unsigned-byte 8)) in)
+                            (type (simple-array single-float (*)) out)
+                            (type fixnum n) (optimize speed))
+                   (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i))))))))
+    (assert (vectorize-note-mentions notes "not a simple array") () "no note: ~s" notes)
+    (assert (not (vectorize-note-mentions notes "no packed load reads")) ()
+            "a VECTOR source was reported as unreadable rather than not simple: ~s" notes))
   ;; and the loop those notes are about stays scalar, computing what it always did
   (flet ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
