@@ -743,6 +743,7 @@ necessary, since type inference may take arbitrarily long to converge.")
     (maybe-mumble "Loop ")
     (loop-analyze component)
     (vector-node-probe-component component)
+    (vector-node-component-pass component)
 
     #|
     (when *compiler-trace-output*

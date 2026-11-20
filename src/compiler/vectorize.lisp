@@ -1023,6 +1023,21 @@ guard covers the reads as well as the writes."
     (vector-probe-loop (component-outer-loop component) 2)
     (format *error-output* "~&;~%")))
 
+;;; The pass: after LOOP-ANALYZE, every natural loop is looked at, and one the node
+;;; analysis can describe is replaced by what it emits.
+(defun vector-node-component-pass (component)
+  (when *vector-node-splice*
+    (labels ((walk (loop)
+               (when (eq (loop-kind loop) :natural)
+                 (let ((plan (vector-node-plan loop)))
+                   (when (and plan (not (stringp plan)))
+                     (when (vector-node-splice-loop loop plan)
+                       (return-from walk t)))))
+               (dolist (inferior (loop-inferiors loop))
+                 (when (walk inferior) (return-from walk t)))
+               nil))
+      (walk (component-outer-loop component)))))
+
 ;;; ------------------------------------------------- recognition, on IR1
 ;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
 ;;; body has been macroexpanded, inline-expanded and let-converted: an inlined helper
