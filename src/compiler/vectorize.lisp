@@ -990,21 +990,22 @@ guard covers the reads as well as the writes."
     (t (format nil "~a" (type-of node)))))
 
 (defun vector-probe-loop (loop depth)
-  (format *error-output* "~&;~va ~a loop: depth ~a, ~a block~:p, head b~a, exits ~a~%"
-          depth (if (eq (loop-kind loop) :outer) "outer" "natural")
-          (loop-depth loop) (length (loop-blocks loop))
-          (block-number (loop-head loop))
-          (mapcar #'block-number (loop-exits loop)))
-  (do ((block (loop-blocks loop) (block-loop-next block)))
-      ((null block))
-    (format *error-output* "~&;~va  b~a -> ~a~%"
-            depth (block-number block) (mapcar #'block-number (block-succ block)))
-    (do-nodes (node lvar block)
-      (format *error-output* "~&;~va    ~a~@[ ; value ~a~]~%"
-              depth (vector-probe-node node)
-              lvar (and lvar (vector-probe-type lvar)))))
-  (dolist (inferior (loop-inferiors loop))
-    (vector-probe-loop inferior (+ depth 2))))
+  (let ((indent (make-string depth :initial-element #\space)))
+    (format *error-output* "~&;~a~a loop: depth ~a, ~a block~:p, head b~a, exits ~a~%"
+            indent (if (eq (loop-kind loop) :outer) "outer" "natural")
+            (loop-depth loop) (length (loop-blocks loop))
+            (block-number (loop-head loop))
+            (mapcar #'block-number (loop-exits loop)))
+    (do ((block (loop-blocks loop) (block-loop-next block)))
+        ((null block))
+      (format *error-output* "~&;~a  b~a -> ~a~%"
+              indent (block-number block) (mapcar #'block-number (block-succ block)))
+      (do-nodes (node lvar block)
+        (format *error-output* "~&;~a    ~a~@[ ; value ~a~]~%"
+                indent (vector-probe-node node)
+                lvar (and lvar (vector-probe-type lvar)))))
+    (dolist (inferior (loop-inferiors loop))
+      (vector-probe-loop inferior (+ depth 2)))))
 
 (defun vector-node-probe-component (component)
   (when *vector-node-probe*
