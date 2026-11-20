@@ -1394,7 +1394,10 @@ increment and the stores gives the set of nodes the replacement reproduces."
             (dolist (store stores)
               (vector-node-mark-consumed store consumed))
             (mapc (lambda (n) (vector-node-mark-consumed n consumed))
-                  (list test step-node increment))
+                  (list test step-node increment
+                        ;; the limit can be computed inside the loop (a hoisted
+                        ;; VECTOR-LENGTH, say) and the emitted DOTIMES names it
+                        (and (lvar-p limit-lvar) (lvar-uses limit-lvar))))
             ;; only nodes that do work matter: a combination or a set.  The
             ;; structural nodes (block starts, exits) go with the blocks
             ;; a node whose value nothing consumes and which is pure can go with
