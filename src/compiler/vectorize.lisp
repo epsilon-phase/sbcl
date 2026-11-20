@@ -1129,6 +1129,11 @@ guard covers the reads as well as the writes."
 ;;; that push to it, because make-host-2 treats a forward reference as fatal.
 (defvar *vector-node-refusals* nil)
 
+;;; FIXME: FLUSHABLE-COMBINATION-P is in ir1util.lisp, which this file precedes in
+;;; build-order, so the reference is forward.  The node pass belongs in a file
+;;; after ir1util/loop/dfo; until it moves, the type is declared here.
+(declaim (ftype (function (t) t) flushable-combination-p))
+
 (defun vector-node-call-name (node)
   ;; callers pass whatever they found in a block, and an INLINE-expanded AREF on a
   ;; non-simple array is not a COMBINATION at all: not recognising it is the right
@@ -1400,17 +1405,20 @@ increment and the stores gives the set of nodes the replacement reproduces."
                         (and (lvar-p limit-lvar) (lvar-uses limit-lvar))))
             ;; only nodes that do work matter: a combination or a set.  The
             ;; structural nodes (block starts, exits) go with the blocks
-            ;; a node whose value nothing consumes and which is pure can go with
-            ;; the block: what must not be lost is work with an effect.  An AREF
-            ;; that has not been turned into data-vector access yet is such a pure
-            ;; node, so it is exempt
+            ;; a node goes with the blocks unless deleting it would be observable:
+            ;; it has an effect, or its value is used outside the loop.  Asking
+            ;; "would deleting this change behaviour" is the question; asking
+            ;; "is it in the emitted form" enumerates the compiler's pure
+            ;; operations one refusal at a time
             (dolist (node (mapcan #'vector-node-nodes blocks))
-              (when (and (or (basic-combination-p node) (typep node 'cset))
-                         (not (gethash node consumed))
-                         (not (let ((name (and (basic-combination-p node)
-                                               (vector-node-call-name node))))
-                                (and name (search "AREF" name)))))
-                (vector-node-fail (list :unconsumed-node (vector-probe-node node))))))
+              (unless (or (gethash node consumed)
+                          (not (basic-combination-p node))
+                          (and (flushable-combination-p node)
+                               (let ((res (node-lvar node)))
+                                 (or (null res)
+                                     (let ((dest (lvar-dest res)))
+                                       (and dest (memq (node-block dest) blocks)))))))
+                (vector-node-fail (list :endangers (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
           (list :element-type (second (first entries))
