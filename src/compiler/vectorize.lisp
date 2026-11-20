@@ -1124,6 +1124,11 @@ guard covers the reads as well as the writes."
 ;;;
 ;;; (:element-type SINGLE-FLOAT :index I :limit N
 ;;;  :stores ((C :op "+" ((:load A 0 SINGLE-FLOAT) (:load B 0 SINGLE-FLOAT)))))
+;;; why a shape declined, for the differential harness to report: the recogniser's
+;;; answers are only useful if the reasons are visible.  Defined above the readers
+;;; that push to it, because make-host-2 treats a forward reference as fatal.
+(defvar *vector-node-refusals* nil)
+
 (defun vector-node-call-name (node)
   ;; callers pass whatever they found in a block, and an INLINE-expanded AREF on a
   ;; non-simple array is not a COMBINATION at all: not recognising it is the right
@@ -1203,10 +1208,6 @@ function called with it - ARET's lowering passes the index through one."
                     :value value :args (length (combination-args call)))
               *vector-node-refusals*))
       value)))
-
-;;; why a shape declined, for the differential harness to report: the recogniser's
-;;; answers are only useful if the reasons are visible
-(defvar *vector-node-refusals* nil)
 
 (defun vector-node-tree (lvar depth index-var)
   (unless (lvar-p lvar) (return-from vector-node-tree nil))
