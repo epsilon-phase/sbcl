@@ -1300,6 +1300,16 @@ function called with it - ARET's lowering passes the index through one."
         (unless index-var (vector-node-fail :no-index))
         (unless increment (vector-node-fail :no-increment))
         (unless stores (vector-node-fail :no-store))
+        ;; a loop that already holds vector primitives is vector code: it came
+        ;; from this pass or from the source-form emitter, and rewriting it again
+        ;; is how the self-build ran out of heap
+        (when (find-if (lambda (node)
+                         (and (basic-combination-p node)
+                              (let ((name (vector-node-call-name node)))
+                                (and name (>= (length name) 4)
+                                     (string= name "%VEC" :end1 4 :end2 4)))))
+                       (mapcan #'vector-node-nodes blocks))
+          (vector-node-fail :already-vector-code))
         ;; a non-simple array is not supported yet: its AREF inlines to data-vector
         ;; access behind WITH-ARRAY-DATA, and the data vector has to be hoisted out
         ;; of the loop.  Refuse it here, before walking nodes the pass cannot read
