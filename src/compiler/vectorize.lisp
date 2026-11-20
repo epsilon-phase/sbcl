@@ -977,14 +977,14 @@ guard covers the reads as well as the writes."
     (cset (format nil "set ~a = ~a"
                   (leaf-source-name (set-var node))
                   (vector-probe-type (set-value node))))
-    (if (format nil "if ~a" (vector-probe-type (if-test node))))
+    (cif (format nil "if ~a" (vector-probe-type (if-test node))))
     (ref (let ((leaf (ref-leaf node)))
            (typecase leaf
              (functional (format nil "ref ~a" (or (functional-debug-name leaf) "functional")))
              (constant (format nil "ref constant ~s" (constant-value leaf)))
              (t (format nil "ref ~a" (leaf-source-name leaf))))))
     (bind (format nil "bind ~a" (leaf-source-name (bind-lambda node))))
-    (return (format nil "return ~a" (vector-probe-type (node-lvar node))))
+    (creturn (format nil "return ~a" (vector-probe-type (node-lvar node))))
     (exit (format nil "exit"))
     (entry (format nil "entry"))
     (t (format nil "~a" (type-of node)))))
