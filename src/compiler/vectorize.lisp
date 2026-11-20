@@ -1272,8 +1272,7 @@ function called with it - ARET's lowering passes the index through one."
     ;; increment a block of its own (test / body / increment), so the shape check
     ;; below looks at every block rather than assuming the body is the second
     (unless (<= (length blocks) 3) (vector-node-fail (list :block-count (length blocks))))
-    (let* ((body (second blocks))
-           (cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
+    (let* ((cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
            (test (and cif (lvar-uses (if-test cif))))
            (args (and (basic-combination-p test) (combination-args test))))
       (unless cif (vector-node-fail :no-if-in-header))
