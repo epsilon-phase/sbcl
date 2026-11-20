@@ -1211,6 +1211,43 @@ function called with it - ARET's lowering passes the index through one."
                    stores)))))
 
 
+;;; Put the replacement where the loop was: convert it into a fresh block between
+;;; the loop's preheader and its exit, relink those two edges, and delete the two
+;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
+;;; for building a block here; there is no call to repoint, so this is the same
+;;; surgery WITHOUT the lambda that the inline-expansion path uses.
+(defvar *vector-node-splice* nil
+  "When true, a loop the node analysis plans is replaced by what it emits.")
+
+(defun vector-node-splice-loop (loop plan)
+  (let* ((blocks (vector-node-blocks loop))
+         (head (loop-head loop))
+         (outside-in (remove-if (lambda (block) (memq block blocks)) (block-pred head)))
+         (outside-out (remove-if (lambda (block) (memq block blocks)) (block-succ head))))
+    ;; one way in and one way out: anything else is a shape that needs more care
+    (unless (and (= (length outside-in) 1) (= (length outside-out) 1))
+      (return-from vector-node-splice-loop nil))
+    (let ((preheader (first outside-in))
+          (exit (first outside-out))
+          (start (make-ctran))
+          (next (make-ctran)))
+      (declare (ignorable exit))
+      (let ((middle (ctran-starts-block start))
+            (after (ctran-starts-block next)))
+        (with-ir1-environment-from-node (first (vector-node-nodes head))
+          (ir1-convert-progn-body start next nil (list (vector-node-source-form plan))))
+        ;; the code runs after the preheader and before the loop's exit
+        (link-blocks middle after)
+        (link-blocks after exit)
+        (setf (block-succ preheader) (list middle))
+        (setf (block-pred middle) (list preheader))
+        ;; the loop is gone: drop both blocks, back edge and all
+        (dolist (block blocks)
+          (setf (block-delete-p block) t))
+        (dolist (block blocks)
+          (delete-block block t))
+        t))))
+
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
       (vector-expand-reduction-loop loop)
