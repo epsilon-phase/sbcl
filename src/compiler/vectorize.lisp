@@ -983,17 +983,25 @@ guard covers the reads as well as the writes."
              (functional (format nil "ref ~a" (or (functional-debug-name leaf) "functional")))
              (constant (format nil "ref constant ~s" (constant-value leaf)))
              (t (format nil "ref ~a" (leaf-source-name leaf))))))
-    (bind (format nil "bind ~a" (leaf-source-name (bind-lambda node))))
+    (bind (format nil "bind ~a" (or (functional-debug-name (bind-lambda node))
+                                    "lambda")))
     (creturn (format nil "return"))
     (exit (format nil "exit"))
     (entry (format nil "entry"))
     (t (format nil "~a" (type-of node)))))
 
+(defun vector-probe-block-count (loop)
+  ;; LOOP-BLOCKS is the first block of the loop, the rest follow it through
+  ;; BLOCK-LOOP-NEXT: it is a chain, not a list.
+  (do ((block (loop-blocks loop) (block-loop-next block))
+       (count 0 (1+ count)))
+      ((null block) count)))
+
 (defun vector-probe-loop (loop depth)
   (let ((indent (make-string depth :initial-element #\space)))
     (format *error-output* "~&;~a~a loop: depth ~a, ~a block~:p, head b~a, exits ~a~%"
             indent (if (eq (loop-kind loop) :outer) "outer" "natural")
-            (loop-depth loop) (length (loop-blocks loop))
+            (loop-depth loop) (vector-probe-block-count loop)
             (block-number (loop-head loop))
             (mapcar #'block-number (loop-exits loop)))
     (do ((block (loop-blocks loop) (block-loop-next block)))
