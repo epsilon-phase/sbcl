@@ -2588,7 +2588,10 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
 ;;;; both; what these assert is the width that was actually chosen.
 
 (defun vectorize-avx2-p ()
-  (and (member :avx2 sb-c:*backend-subfeatures*) t))
+  "True when this machine has AVX2, which is what decides now between the two
+loops the pass puts in one function: the build no longer has to know."
+  (and (>= (sb-vm::%cpu-identification 0 0) 7)
+       (logbitp 5 (nth-value 1 (sb-vm::%cpu-identification 7 0)))))
 
 (defun vectorize-disassembly-text (function)
   (string-downcase
@@ -2626,11 +2629,12 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
                              (setf (aref c i) (logand (aref a i) (aref b i))))))))
     (dolist (function (list (add-loop 'single-float) (add-loop 'double-float)
                             (and-loop '(unsigned-byte 8)) (and-loop '(unsigned-byte 64))))
-      (let ((text (vectorize-disassembly-text function))
-            (wide (vectorize-wide-p function)))
-        (if (vectorize-avx2-p)
-            (assert wide () "loop did not take 256-bit lanes on an AVX2 build: ~A" text)
-            (assert (not wide) () "loop took 256-bit lanes without AVX2: ~A" text))))))
+      ;; both loops are in the text of a build that can emit either: which one
+      ;; runs is decided when the code runs, by SB-VM::AVX2-AVAILABLE-P
+      (assert (vectorize-wide-p function) ()
+              "the 256-bit loop is missing: ~A" (vectorize-disassembly-text function))
+      (assert (search "xmm" (vectorize-disassembly-text function)) ()
+              "the 128-bit loop is missing: ~A" (vectorize-disassembly-text function)))))
 
 ;;; A byte or word source read into four double lanes has no 256-bit widen: the
 ;;; narrowing loads that would do it read eight bytes or sixteen, one element
@@ -2661,20 +2665,43 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
       (assert (member "cvtdq2ps" (mnemonics function) :test #'string=) ()
               "narrow to single is not a packed widen: ~A"
               (vectorize-disassembly-text function))
-      (if (vectorize-avx2-p)
-          (assert (vectorize-wide-p function) ()
-                  "a narrow-to-single widen stayed at 128 bits on an AVX2 build: ~A"
-                  (vectorize-disassembly-text function))
-          (assert (not (vectorize-wide-p function)) ()
-                  "a narrow-to-single widen took 256-bit lanes without AVX2: ~A"
-                  (vectorize-disassembly-text function))))
-    (when (vectorize-avx2-p)
+      ;; both widths are emitted; the machine picks, so both are in the text
+      (assert (vectorize-wide-p function) ()
+              "the 256-bit widen is missing: ~A" (vectorize-disassembly-text function)))
+    (progn
       (assert (member "vpmovzxbd" (mnemonics #'vectorize-u8-to-single) :test #'string=) ()
               "u8 to single is not the 256-bit narrowing load: ~A"
               (vectorize-disassembly-text #'vectorize-u8-to-single))
       (assert (member "vpmovsxwd" (mnemonics #'vectorize-s16-to-single) :test #'string=) ()
               "s16 to single is not the 256-bit narrowing load: ~A"
               (vectorize-disassembly-text #'vectorize-s16-to-single)))))
+
+;;;; One function, two loops, and the machine picks between them: the pass emits
+;;;; both widths when the backend hands it a predicate, so an image built on an
+;;;; AVX2 machine still runs on one without it (the manual's instruction-set
+;;;; dispatch section, applied to the vectorizer).
+
+(test-util:with-test (:name :vectorize-runtime-width-dispatch :skipped-on (not :x86-64))
+  (let* ((function (vectorize-avx2-add-loop 'single-float))
+         (text (vectorize-disassembly-text function)))
+    (assert (search "ymm" text) () "no 256-bit loop in:~%~A" text)
+    (assert (search "xmm" text) () "no 128-bit loop in:~%~A" text)
+    ;; the same compiled function computes the same thing down either path
+    (flet ((run-with (flag)
+             (let ((sb-vm::*avx2-available* flag)
+                   (a (vectorize-array 'single-float '(1.5 -2.25 0.5) 1000))
+                   (b (vectorize-array 'single-float '(7.5 0.25 -1.0) 1000))
+                   (c (make-array 1000 :element-type 'single-float
+                                       :initial-element 0.0)))
+               (funcall function a b c 1000)
+               (map 'list (lambda (x y) (+ x y)) a b))))
+      (assert (equal (run-with t) (run-with nil)) ()
+              "the two loops disagree:~%~A~%~A" (run-with t) (run-with nil)))
+    ;; and the flag is asked again at startup rather than fixed when the image was
+    ;; dumped, which is what makes it right on a machine without the instructions
+    (assert (eql (and sb-vm::*avx2-available* t) (vectorize-avx2-p)) ()
+            "the flag disagrees with this machine: ~S vs ~S"
+            sb-vm::*avx2-available* (vectorize-avx2-p))))
 
 ;;;; 32-bit clamping.  PMINSD, PMAXSD, PMINUD and PMAXUD are SSE4.1, VPMINSD and
 ;;;; friends are AVX2, and SSE2 has no packed 32-bit minimum at all - so a build
@@ -2817,13 +2844,9 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
       (assert (some (lambda (m) (search m (vectorize-disassembly-text function))) mnemonics) ()
               "no ~{~a~^ or ~} in the min/max loop: ~A" mnemonics
               (vectorize-disassembly-text function))
-      (if (vectorize-avx2-p)
-          (assert (vectorize-wide-p function) ()
-                  "a min/max loop stayed at 128 bits on an AVX2 build: ~A"
-                  (vectorize-disassembly-text function))
-          (assert (not (vectorize-wide-p function)) ()
-                  "a min/max loop took 256-bit lanes without AVX2: ~A"
-                  (vectorize-disassembly-text function))))))
+      (assert (vectorize-wide-p function) ()
+              "the 256-bit min/max loop is missing: ~A"
+              (vectorize-disassembly-text function)))))
 
 ;;; A single-float source read into double lanes is exact, since every
 ;;; single-float is a double-float.  The vop that does it once went missing while
@@ -2842,13 +2865,9 @@ the lane, so nothing here can signal and the loop needs no (safety 0)."
   (assert (search "cvtps2pd" (vectorize-disassembly-text #'vectorize-single-to-double)) ()
           "single to double is not a packed widen: ~A"
           (vectorize-disassembly-text #'vectorize-single-to-double))
-  (if (vectorize-avx2-p)
-      (assert (vectorize-wide-p #'vectorize-single-to-double) ()
-              "single to double stayed at 128 bits on an AVX2 build: ~A"
-              (vectorize-disassembly-text #'vectorize-single-to-double))
-      (assert (not (vectorize-wide-p #'vectorize-single-to-double)) ()
-              "single to double took 256-bit lanes without AVX2: ~A"
-              (vectorize-disassembly-text #'vectorize-single-to-double)))
+  (assert (vectorize-wide-p #'vectorize-single-to-double) ()
+          "the 256-bit single-to-double loop is missing: ~A"
+          (vectorize-disassembly-text #'vectorize-single-to-double))
   (loop for n in *vectorize-lengths*
         for in = (vectorize-integer-array 'single-float '(-1.5 0.0 0.25 3.0 1.0e30) n)
         for out = (make-array n :element-type 'double-float :initial-element -1d0)

@@ -938,36 +938,41 @@ guard covers the reads as well as the writes."
 ;;; Return the vectorized form for a matched loop, or NIL if this backend cannot
 ;;; express it (which is the normal answer on a build whose backend has not
 ;;; published its primitives, and for byte lanes outside SAFETY 0).
+(defun attempt-expansion (expander loop bytes)
+  (let ((*vector-lane-bytes* bytes))
+    (funcall expander loop)))
+
 (defun vector-expand-loop (loop)
-  (let ((expander (if (vloop-accumulator loop)
-                      #'vector-expand-reduction
-                      #'vector-expand-elementwise-loop)))
-    (flet ((attempt (bytes)
-             (let ((*vector-lane-bytes* bytes))
-               (funcall expander loop))))
-      (let* ((element-type (vloop-element-type loop))
-             (dispatch (and *vector-wide-predicate*
-                            (vector-wide-available-p element-type)
-                            t))
-             (wide (and (vector-wide-available-p element-type)
-                        (let ((*auto-vectorize-notes* (and *auto-vectorize-notes*
-                                                           (not dispatch))))
-                          (attempt 32))))
-             (narrow (let ((*auto-vectorize-notes* (and *auto-vectorize-notes*
-                                                        (not dispatch))))
-                       (attempt 16))))
+  (let* ((expander (if (vloop-accumulator loop)
+                       #'vector-expand-reduction
+                       #'vector-expand-elementwise-loop))
+         (element-type (vloop-element-type loop))
 ;;; a backend that hands over a predicate wants one image to run on machines with
 ;;; and without the wider instruction set, so both loops go in and the machine
-;;; picks: the wide one costs text and nothing else where it cannot be reached.
-        (if (and wide narrow dispatch)
-            (progn
-              (when *auto-vectorize-notes*
-                (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
-                                  the machine has avx2 and ~a where it does not"
-                                 element-type (vector-width element-type 32)
-                                 (vector-width element-type 16)))
-              `(if (,*vector-wide-predicate*) ,wide ,narrow))
-            (or wide narrow))))))
+;;; picks at run time: the wide one costs text, and nothing else where it cannot
+;;; be reached
+         (dispatch (and *vector-wide-predicate*
+                        (vector-wide-available-p element-type)
+                        t))
+;;; both attempts are silent here: which note to print depends on what the pair
+;;; of them produced, and only one note should be printed
+         (wide (let ((*auto-vectorize-notes* nil))
+                 (and (vector-wide-available-p element-type) (attempt-expansion expander loop 32))))
+         (narrow (let ((*auto-vectorize-notes* nil))
+                   (attempt-expansion expander loop 16))))
+    (cond ((not (or wide narrow)) nil)
+          (t (when *auto-vectorize-notes*
+               (if (and wide narrow dispatch)
+                   (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
+                                     the machine has avx2 and ~a where it does not"
+                                    element-type (vector-width element-type 32)
+                                    (vector-width element-type 16))
+                   (compiler-notify "vectorized loop over ~a, ~a elements at a time"
+                                    element-type
+                                    (vector-width element-type (if wide 32 16)))))
+             (if (and wide narrow dispatch)
+                 `(if (,*vector-wide-predicate*) ,wide ,narrow)
+                 (or wide narrow))))))
 
 (defun vector-expand-elementwise-loop (loop)
   (let* ((element-type (vloop-element-type loop))
