@@ -1519,8 +1519,8 @@ conversion top-down into a fresh lambda, the shape IR1 expects.
 
 LABELS rather than (FUNCALL (LAMBDA ...)): the latter is let-converted while it is
 being converted, and DOTIMES contains a BLOCK whose RETURN then targets the ctran
-that let-conversion deleted ("attempt to THROW to a tag that does not exist:
-SB-C::LOCALL-ALREADY-LET-CONVERTED").  A local function is analysed by
+that let-conversion deleted, which surfaces as a THROW to
+SB-C::LOCALL-ALREADY-LET-CONVERTED and an abort.  A local function is analysed by
 LOCALL-ANALYZE-COMPONENT after its body is converted, which is the order IR1
 expects, and it can be inlined back into the caller.
 
