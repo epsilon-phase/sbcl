@@ -1285,13 +1285,11 @@ function called with it - ARET's lowering passes the index through one."
           (dolist (block blocks)
             (delete-block block t))
           ;; the replacement brought lambdas and exits; put them through the same
-          ;; phases the rest of the component has been through
-          (let ((*ir1-transforms-after-ir1-phases* t)
-                (*delayed-ir1-transforms* nil))
-            (loop (ir1-optimize-until-done component)
-                  (locall-analyze-component component)
-                  (unless (component-new-functionals component)
-                    (return))))
+          ;; phases the rest of the component has been through.  IR1-PHASES binds
+          ;; the specials itself - binding them here would be a lexical binding of
+          ;; a variable the host does not know is special, which is fatal in
+          ;; make-host-2
+          (ir1-phases component)
           (setf (component-reanalyze component) t)
           t)))))
 
