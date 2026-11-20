@@ -1394,10 +1394,11 @@ increment and the stores gives the set of nodes the replacement reproduces."
             (dolist (store stores)
               (vector-node-mark-consumed store consumed))
             (mapc (lambda (n) (vector-node-mark-consumed n consumed)) (list test step))
+            ;; only nodes that do work matter: a combination or a set.  The
+            ;; structural nodes (block starts, exits) go with the blocks
             (dolist (node (mapcan #'vector-node-nodes blocks))
-              (unless (or (typep node 'cif) (typep node 'cset) (typep node 'cexit)
-                          (typep node 'cblock-start) (typep node 'cblock-end)
-                          (gethash node consumed))
+              (when (and (or (basic-combination-p node) (typep node 'cset))
+                         (not (gethash node consumed)))
                 (vector-node-fail (list :unconsumed-node (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
