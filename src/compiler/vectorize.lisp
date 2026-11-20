@@ -1234,41 +1234,65 @@ function called with it - ARET's lowering passes the index through one."
 ;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
 ;;; for building a block here; there is no call to repoint, so this is the same
 ;;; surgery WITHOUT the lambda that the inline-expansion path uses.
+(defun vector-node-last-node (block)
+  (let ((last nil) (ctran (block-start block)))
+    (loop while ctran
+          for node = (ctran-next ctran)
+          while node
+          do (setf last node ctran (node-next node)))
+    last))
+
+;;; Put the replacement where the loop was.  The replacement is converted as a
+;;; LAMBDA and called once, the way the inline-expansion path does it, because a
+;;; form converted straight into a block would bring its own entries and exits and
+;;; the component has already been through IR1 optimization: the exits it creates
+;;; never meet MAYBE-DELETE-EXIT (ir1opt.lisp:1239), which is what the assertions
+;;; about environments and new functionals are complaining about.  So the work
+;;; goes back through the fixpoint afterwards.
+(defvar *vector-node-splice* nil
+  "When true, replace each loop the node analysis plans with what it emits.")
+
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (loop-head loop))
          (outside-in (remove-if (lambda (block) (memq block blocks)) (block-pred head)))
          (outside-out (remove-if (lambda (block) (memq block blocks)) (block-succ head))))
-    ;; one way in and one way out: anything else is a shape that needs more care
+    ;; one way in and one way out: anything else needs more care than this
     (unless (and (= (length outside-in) 1) (= (length outside-out) 1))
       (return-from vector-node-splice-loop nil))
     (let ((preheader (first outside-in))
-          (exit (first outside-out)))
-      (declare (ignorable exit))
-      ;; the ctrans and blocks are part of the component, so they are made inside
-      ;; the environment that knows which component this is
-      (with-ir1-environment-from-node (first (vector-node-nodes head))
+          (exit (first outside-out))
+          (component (loop-component loop)))
+      (with-ir1-environment-from-node (vector-node-last-node preheader)
         (let* ((start (make-ctran))
                (next (make-ctran))
                (middle (ctran-starts-block start))
-               (after (ctran-starts-block next)))
-          (ir1-convert-progn-body start next nil (list (vector-node-source-form plan)))
-          ;; the code just converted brought its own lambdas (the LET it binds and the
-          ;; loop it runs); they are new functionals in this component, and nothing
-          ;; will fold them unless local call analysis runs again
-          (locall-analyze-component *current-component*)
-          ;; the code runs after the preheader and before the loop's exit; the old
-          ;; edge has to come out through UNLINK-BLOCKS, or the loop head keeps a
-          ;; predecessor that no longer branches to it
-          (link-blocks middle after)
-          (link-blocks after exit)
+               (after (ctran-starts-block next))
+               (fun (ir1-convert-lambda `(lambda () ,(vector-node-source-form plan))
+                                        :debug-name (debug-name 'vector-replacement)))
+               (fun-lvar (make-lvar))
+               (call-ctran (make-ctran)))
+          (reference-leaf start call-ctran fun-lvar fun)
+          (ir1-convert-combination-args fun-lvar call-ctran next nil nil)
+          ;; the call's own continuation is NEXT, so the only edges to add are the
+          ;; way in and the way out
           (unlink-blocks preheader head)
           (link-blocks preheader middle)
-          ;; the loop is gone: drop both blocks, back edge and all
+          (link-blocks after exit)
+          ;; drop the loop: every block marked before any is deleted
           (dolist (block blocks)
             (setf (block-delete-p block) t))
           (dolist (block blocks)
             (delete-block block t))
+          ;; the replacement brought lambdas and exits; put them through the same
+          ;; phases the rest of the component has been through
+          (let ((*ir1-transforms-after-ir1-phases* t)
+                (*delayed-ir1-transforms* nil))
+            (loop (ir1-optimize-until-done component)
+                  (locall-analyze-component component)
+                  (unless (component-new-functionals component)
+                    (return))))
+          (setf (component-reanalyze component) t)
           t)))))
 
 (defun vector-expand-loop (loop)
