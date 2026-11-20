@@ -1350,8 +1350,9 @@ guard covers the reads as well as the writes."
         (cond ((null kind)
                (push name unregistered))
               ((eq kind :array)
+;;; TYPE is dotted: the element type in the CAR, the simple-array flag in the CDR
                (if element-type
-                   (push (list name (car type) (cddr type)) reads)
+                   (push (list name (car type) (cdr type)) reads)
                    (setf element-type (car type)))))))
     (dolist (name (nreverse unregistered))
       (push (if element-type
