@@ -952,7 +952,7 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
-(defvar *vector-node-splice* nil
+(defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1438,10 +1438,11 @@ increment and the stores gives the set of nodes the replacement reproduces."
                           (vector-node-redundant-call-p node blocks)
                           ;; the value is consumed inside the loop: the stores
                           ;; reproduce it
-                          (let ((res (node-lvar node)))
-                            (and res
-                                 (let ((dest (lvar-dest res)))
-                                   (and dest (memq (node-block dest) blocks)))))
+                          (and (not (eq (basic-combination-kind node) :local))
+                               (let ((res (node-lvar node)))
+                                 (and res
+                                      (let ((dest (lvar-dest res)))
+                                        (and dest (memq (node-block dest) blocks))))))
                           ;; a transform or an inline expansion, which is compiler
                           ;; machinery rather than a call that can have an effect
                           (let ((use (lvar-uses (combination-fun node))))
@@ -1452,7 +1453,8 @@ increment and the stores gives the set of nodes the replacement reproduces."
                           (let ((name (and (basic-combination-p node)
                                            (vector-node-call-name node))))
                             (and name (search "%CHECK-BOUND" name)))
-                          (flushable-combination-p node))
+                          (and (not (eq (basic-combination-kind node) :local))
+                               (flushable-combination-p node)))
                 (vector-node-fail (list :endangers (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
