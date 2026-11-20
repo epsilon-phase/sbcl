@@ -952,6 +952,9 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
+(defvar *vector-node-splice* nil
+  "When true, replace each loop the node analysis plans with what it emits.")
+
 (defun vector-probe-fun-name (node)
   (let ((use (lvar-uses (combination-fun node))))
     (typecase use
@@ -1231,9 +1234,6 @@ function called with it - ARET's lowering passes the index through one."
 ;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
 ;;; for building a block here; there is no call to repoint, so this is the same
 ;;; surgery WITHOUT the lambda that the inline-expansion path uses.
-(defvar *vector-node-splice* nil
-  "When true, a loop the node analysis plans is replaced by what it emits.")
-
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (loop-head loop))
