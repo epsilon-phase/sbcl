@@ -1340,14 +1340,19 @@ guard covers the reads as well as the writes."
 ;;; lanes outside (safety 0).
 (defun vector-diagnose-types (arrays lexenv expression unchecked-p index)
   (let ((element-type nil)
+        (reads '())
         (unregistered '())
         (reasons '()))
+;;; the destination comes first: it is the element type the loop would run at, and
+;;; every array after it is read, possibly at a narrower width than the lanes hold
     (dolist (name arrays)
       (multiple-value-bind (kind type) (vector-variable-info name lexenv)
-        (cond ((and (eq kind :array) (null element-type))
-               (setf element-type (car type)))
-              ((null kind)
-               (push name unregistered)))))
+        (cond ((null kind)
+               (push name unregistered))
+              ((eq kind :array)
+               (if element-type
+                   (push (list name (car type) (cddr type)) reads)
+                   (setf element-type (car type)))))))
     (dolist (name (nreverse unregistered))
       (push (if element-type
                 (format nil "~s is not known to be an array; a (declare (type (simple-array ~a (*)) ~s)) ~
@@ -1360,18 +1365,41 @@ guard covers the reads as well as the writes."
     (let ((reason (vector-negative-offset-reason expression index)))
       (when reason (push reason reasons)))
     (when element-type
-      ;; the operator having a base is not the whole answer: the base names a
-      ;; primitive, and whether this build has it is the table's business.  pmulld
-      ;; needs sse4.1 where vpmulld needs avx2, so a loop can be available at one
-      ;; width and not the other, and 64-bit lanes have no multiply at either.
-      (flet ((available-p (base)
-               (or (vector-primitive base element-type 16)
-                   (vector-primitive base element-type 32))))
+;;; the operator having a base is not the whole answer: the base names a primitive,
+;;; and whether this build has it is the table's business.  pmulld needs sse4.1 where
+;;; vpmulld needs avx2, so a loop can be available at one width and not the other, and
+;;; 64-bit lanes have no multiply at either.
+      ;; LABELS, not FLET: widen-reasons asks available-p which primitives this
+      ;; build has
+      (labels ((available-p (base)
+                 (or (vector-primitive base element-type 16)
+                     (vector-primitive base element-type 32)))
+;;; and no packed load reads an array of another element type into these lanes
+;;; unless the backend has the widening one: nothing reads a 32-bit or 64-bit
+;;; integer array into float lanes at any width, nothing reads a double-float array
+;;; into single-float ones, and the widening loads take a simple array only.
+             (widen-reasons ()
+               (loop for (name source-type simple-p) in (nreverse reads)
+                     unless (equal source-type element-type)
+                       collect (let ((base (vector-widen-base source-type element-type)))
+                                 (cond ((null base)
+                                        (format nil "~s holds ~a, and no packed load reads ~a into ~a lanes"
+                                                name source-type source-type element-type))
+                                       ((not (available-p base))
+                                        (format nil "~s holds ~a, and this build has no packed load ~
+                                                     that reads ~a into ~a lanes"
+                                                name source-type source-type element-type))
+                                       ((not simple-p)
+                                        (format nil "~s holds ~a and is not a simple array, which the ~
+                                                     packed load into ~a lanes does not take"
+                                                name source-type element-type)))))))
         (dolist (operator (remove-duplicates (vector-shape-operators expression) :test #'eq))
           (let ((base (vector-operator-base operator element-type)))
             (unless (and base (available-p base))
               (push (format nil "~a is not available for ~a lanes" operator element-type)
-                    reasons)))))
+                    reasons))))
+        (dolist (reason (widen-reasons))
+          (when reason (push reason reasons))))
       (unless (or (vector-float-element-type-p element-type) unchecked-p
                   (vector-exact-expression-p expression))
         (push (format nil "~a lanes wrap where a checked loop would signal, so they are only ~

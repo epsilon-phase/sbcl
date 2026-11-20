@@ -1911,6 +1911,66 @@ a writer with a fixed color type ends up with."
                    (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
     (assert (vectorize-note-mentions notes "safety 0") () "no note: ~s" notes)))
 
+;;; a source the pass cannot widen, in a shape it otherwise takes
+(defun vectorize-u32-to-single (in out n)
+  (declare (type (simple-array (unsigned-byte 32) (*)) in)
+           (type (simple-array single-float (*)) out)
+           (type vectorize-index n) (optimize speed))
+  (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i)))))
+
+;;;; A loop that reads an array of another element type is a widening read, and no
+;;;; backend has all of them: x86-64 reads bytes and 16-bit values into float
+;;;; lanes, and single-floats into double ones, and nothing else.  A loop over the
+;;;; rest used to be left scalar with no note at all, since the operator and the
+;;;; declarations were both fine.
+
+(test-util:with-test (:name :vectorize-missed-widen-note :skipped-on (not :x86-64))
+  (flet ((notes-for (element-type source-type)
+           (vectorize-notes-for
+            `(lambda (in out n)
+               (declare (type (simple-array ,source-type (*)) in)
+                        (type (simple-array ,element-type (*)) out)
+                        (type fixnum n) (optimize speed))
+               (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i))))))))
+    ;; nothing reads a 32-bit integer array into float lanes at any width
+    (let ((notes (notes-for 'single-float '(unsigned-byte 32))))
+      (assert (vectorize-note-mentions notes "no packed load reads") () "no note: ~s" notes)
+      (assert (vectorize-note-mentions notes "(UNSIGNED-BYTE 32)") ()
+              "the note does not name the source type: ~s" notes)
+      (assert (vectorize-note-mentions notes "SINGLE-FLOAT lanes") ()
+              "the note does not name the lanes: ~s" notes))
+    ;; nor a 64-bit one, into either width
+    (dolist (element-type '(single-float double-float))
+      (let ((notes (notes-for element-type '(signed-byte 64))))
+        (assert (vectorize-note-mentions notes "no packed load reads") ()
+                "no note for ~a: ~s" element-type notes)))
+    ;; nothing narrows a double-float array into single-float lanes either
+    (let ((notes (notes-for 'single-float 'double-float)))
+      (assert (vectorize-note-mentions notes "no packed load reads") () "no note: ~s" notes))
+    ;; and byte and 16-bit sources do widen, so they say nothing of the sort
+    (dolist (source-type '((unsigned-byte 8) (signed-byte 8)
+                           (unsigned-byte 16) (signed-byte 16)))
+      (let ((notes (notes-for 'single-float source-type)))
+        (assert (not (vectorize-note-mentions notes "packed load reads")) ()
+                "~a was reported as having no widening load: ~s" source-type notes))))
+  ;; and the loop those notes are about stays scalar, computing what it always did
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (assert (notany (lambda (mnemonic)
+                      (search mnemonic (disassembly #'vectorize-u32-to-single)))
+                    *vectorize-packed-mnemonics*)
+            () "a loop with no widening load was packed:~%~A"
+            (disassembly #'vectorize-u32-to-single))
+    (loop for n in '(0 1 2 3 4 5 17)
+          for in = (vectorize-array '(unsigned-byte 32) '(0 1 4294967295 7 100) n)
+          for out = (vectorize-sentinel-array 'single-float (+ n 4))
+          do (vectorize-u32-to-single in out n)
+             (dotimes (i n)
+               (unless (eql (aref out i) (* 2.0 (aref in i)))
+                 (error "~@<u32 to single: element ~D of ~D is ~S, expected ~S.~:@>"
+                        i n (aref out i) (* 2.0 (aref in i))))))))
+
 (test-util:with-test (:name :vectorize-no-note-when-quiet :skipped-on (not :x86-64))
   ;; a loop the pass does vectorize gets the success note and no complaint
   (let ((notes (vectorize-notes-for
