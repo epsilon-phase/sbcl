@@ -1268,7 +1268,10 @@ function called with it - ARET's lowering passes the index through one."
   (let* ((blocks (vector-node-blocks loop))
          (head (loop-head loop)))
     (unless (eq (first blocks) head) (vector-node-fail :head-not-first))
-    (unless (= (length blocks) 2) (vector-node-fail (list :block-count (length blocks))))
+    ;; three blocks are as ordinary as two: after inlining, DOTIMES gives the
+    ;; increment a block of its own (test / body / increment), so the shape check
+    ;; below looks at every block rather than assuming the body is the second
+    (unless (<= (length blocks) 3) (vector-node-fail (list :block-count (length blocks))))
     (let* ((body (second blocks))
            (cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
            (test (and cif (lvar-uses (if-test cif))))
@@ -1279,7 +1282,7 @@ function called with it - ARET's lowering passes the index through one."
       (let* ((index-lvar (find-if (lambda (a) (vector-node-leaf-var a)) args))
              (index-var (and index-lvar (vector-node-leaf-var index-lvar)))
              (limit-lvar (and index-lvar (find-if (lambda (a) (not (eq a index-lvar))) args)))
-             (body-nodes (vector-node-nodes body))
+             (body-nodes (mapcan #'vector-node-nodes blocks))
              (increment (find-if (lambda (n) (and (typep n 'cset) (eq (set-var n) index-var)))
                                  body-nodes))
              (stores (remove-if-not (lambda (n) (vector-node-name-p n "DATA-VECTOR-SET-WITH-OFFSET"))
