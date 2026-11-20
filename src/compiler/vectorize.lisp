@@ -1251,17 +1251,6 @@ function called with it - ARET's lowering passes the index through one."
                 (= (length (combination-args use)) 2)
                 (vector-node-constant (second (combination-args use))))
            (vector-node-tree (first (combination-args use)) (1+ depth) index-var))
-          ;; a value built from the INDEX itself: (coerce i 'single-float) and the
-          ;; float primitives it lowers to.  The source pass calls this a ramp and
-          ;; only emits it at 16-byte width, which it checks itself
-          ((let ((op (and (basic-combination-p use) (vector-node-call-name use))))
-             (and op
-                  (member op '("COERCE" "FLOAT" "%SINGLE-FLOAT" "%DOUBLE-FLOAT"
-                               "COERCE-SINGLE-FLOAT" "COERCE-DOUBLE-FLOAT")
-                          :test #'string=)
-                  (some (lambda (a) (eq (vector-node-leaf-var a) index-var))
-                        (combination-args use))))
-           (list :ramp (type-specifier (lvar-type lvar))))
           (t (let ((op (vector-node-call-name use)))
                (unless (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
                  (push (list :tree-op op (type-specifier (lvar-type lvar)))
@@ -1390,7 +1379,6 @@ function called with it - ARET's lowering passes the index through one."
 (defun vector-node-print-tree (tree subst index)
   (case (car tree)
     (:const (second tree))
-    (:ramp (list 'coerce index (list 'quote (second tree))))
     (:var (second tree))
     (:load `(aref ,(or (cdr (assoc (second tree) subst :test #'equal))
                        (second tree))
