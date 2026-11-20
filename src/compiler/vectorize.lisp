@@ -1038,7 +1038,10 @@ guard covers the reads as well as the writes."
 
 (defun vector-node-component-pass (component)
   (when (and *vector-node-splice*
-             (not (gethash component *vector-node-spliced*)))
+             ;; several loops per function: the cap is what stops the pass from
+             ;; chasing its own output if the emitter ever declines the form we
+             ;; spliced in, which is the only way a new loop can appear here
+             (< (gethash component *vector-node-spliced* 0) 8))
     ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
     ;; COMPILE-COMPONENT has analysed this component, so the analysis the pass
     ;; needs is done here rather than assumed.  Running inside the fixpoint is
@@ -1064,7 +1067,7 @@ guard covers the reads as well as the writes."
                    ;; and reasons are keywords as often as lists
                    (when (and (consp plan) (getf plan :element-type))
                      (when (vector-node-splice-loop loop plan)
-                       (setf (gethash component *vector-node-spliced*) t)
+                       (incf (gethash component *vector-node-spliced* 0))
                        (return-from walk t)))))
                (dolist (inferior (loop-inferiors loop))
                  (when (walk inferior) (return-from walk t)))
@@ -1191,7 +1194,7 @@ function called with it - ARET's lowering passes the index through one."
                 (vector-node-constant (second (combination-args use))))
            (vector-node-tree (first (combination-args use)) (1+ depth) index-var))
           (t (let ((op (vector-node-call-name use)))
-               (unless (member op '("+" "-" "*" "/") :test #'string=)
+               (unless (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
                  (push (list :tree-op op (type-specifier (lvar-type lvar)))
                        *vector-node-refusals*))
                (when (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
