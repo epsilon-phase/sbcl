@@ -1024,14 +1024,16 @@ guard covers the reads as well as the writes."
     (format *error-output* "~&;~%")))
 
 ;;; ------------------------------------------------- recognition, on IR1
-;;; The loop analysis in src/compiler/loop.lisp hands every natural loop a CLOOP with
-;;; its blocks, and by then the body has been macroexpanded, inline-expanded and
-;;; let-converted: an inlined helper is the arithmetic it does, and ARET is already
-;;; lowered to DATA-VECTOR-REF/SET-WITH-OFFSET.  These read that, so that what the
-;;; source pass takes from declarations is taken here from the compiler's own types.
-
+;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
+;;; body has been macroexpanded, inline-expanded and let-converted: an inlined helper
+;;; is the arithmetic it does, AREF is lowered, and every lvar carries a derived type.
+;;; These read a loop into a plan, and print that plan back as source the existing
+;;; emitter takes - with the array types as (THE ...) casts, since they came from
+;;; LVAR-TYPE and there may be no declaration in the enclosing scope at all.
+;;;
+;;; (:element-type SINGLE-FLOAT :index I :limit N
+;;;  :stores ((C :op "+" ((:load A 0 SINGLE-FLOAT) (:load B 0 SINGLE-FLOAT)))))
 (defun vector-node-call-name (node)
-  "The name of what NODE calls, as a string, or NIL."
   (let ((use (lvar-uses (combination-fun node))))
     (when (ref-p use)
       (let* ((leaf (ref-leaf use))
@@ -1039,67 +1041,175 @@ guard covers the reads as well as the writes."
                      (global-var (leaf-source-name leaf))
                      (functional (functional-debug-name leaf))
                      (t nil))))
-        (when name
-          (typecase name
-            (string name)
-            (symbol (symbol-name name))
-            (t (prin1-to-string name))))))))
-
+        (when name (typecase name (string name) (symbol (symbol-name name))
+                                 (t (prin1-to-string name))))))))
 (defun vector-node-name-p (node name)
-  (let ((case (and (basic-combination-p node) (vector-node-call-name node))))
-    (and case (string= case name))))
-
-(defun vector-node-leaf-name (lvar)
-  "The name of the variable LVAR is a plain reference to, or NIL."
+  (let ((n (and (basic-combination-p node) (vector-node-call-name node))))
+    (and n (string= n name))))
+(defun vector-node-leaf-var (lvar)
   (let ((use (lvar-uses lvar)))
-    (when (ref-p use)
-      (let ((leaf (ref-leaf use)))
-        (and (lambda-var-p leaf) (leaf-source-name leaf))))))
-
+    (when (and (ref-p use) (lambda-var-p (ref-leaf use)))
+      (ref-leaf use))))
 (defun vector-node-constant (lvar)
   (let ((use (lvar-uses lvar)))
     (when (ref-p use)
       (let ((leaf (ref-leaf use)))
         (when (constant-p leaf) (constant-value leaf))))))
-
 (defun vector-node-blocks (loop)
-  (do ((block (loop-blocks loop) (block-loop-next block))
-       (blocks '() (cons block blocks)))
-      ((null block) (nreverse blocks))))
-
+  (do ((b (loop-blocks loop) (block-loop-next b)) (acc '() (cons b acc)))
+      ((null b) (nreverse acc))))
 (defun vector-node-nodes (block)
-  (let ((nodes '()) (ctran (block-start block)))
-    (loop while ctran
-          for node = (ctran-next ctran)
-          while node
-          do (push node nodes)
-             (setf ctran (node-next node)))
-    (nreverse nodes)))
+  (let ((acc '()) (ctran (block-start block)))
+    (loop while ctran for node = (ctran-next ctran) while node
+          do (push node acc) (setf ctran (node-next node)))
+    (nreverse acc)))
+(defun vector-node-index-p (lvar index-var depth)
+  "True when LVAR carries the loop index: I itself, or a parameter of an inline
+function called with it - ARET's lowering passes the index through one."
+  (when (> depth 12) (return-from vector-node-index-p nil))
+  (let ((leaf (vector-node-leaf-var lvar)))
+    (cond ((and leaf (eq leaf index-var)) t)
+          (leaf
+           (let ((home (lambda-var-home leaf)))
+             (when home
+               (let ((call (handler-case (let-combination home) (error () nil))))
+                 (when call
+                   (let ((pos (position leaf (lambda-vars home))))
+                     (and pos
+                          (vector-node-index-p (nth pos (combination-args call))
+                                      index-var (1+ depth)))))))))
+          (t nil))))
 
-;;; The value a store writes, as (:const V) / (:var NAME) / (:load ARRAY OFFSET TYPE)
-;;; / (:op NAME SUBTREES) - the same shapes the source pass builds from source forms,
-;;; read here from lvars instead.
-(defun vector-node-tree (lvar depth)
-  (when (> depth 8)
-    (return-from vector-node-tree nil))
+(defun vector-node-var-init (var)
+  "The value VAR is called with at its home lambda, when that is a constant."
+  (let* ((home (lambda-var-home var))
+         (call (and home (handler-case (let-combination home) (error () nil))))
+         (pos (and call (position var (lambda-vars home)))))
+    (and pos (vector-node-constant (nth pos (combination-args call))))))
+
+(defun vector-node-tree (lvar depth index-var)
+  (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
-    (cond ((vector-node-constant lvar)
-           (list :const (vector-node-constant lvar)))
+    (cond ((vector-node-constant lvar) (list :const (vector-node-constant lvar)))
           ((and (ref-p use) (lambda-var-p (ref-leaf use)))
            (list :var (leaf-source-name (ref-leaf use))))
           ((not (basic-combination-p use)) nil)
           ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
            (let* ((args (combination-args use))
-                  (array (vector-node-leaf-name (first args))))
+                  (array (vector-node-leaf-var (first args))))
              (and array
-                  (list :load array (vector-node-constant (third args))
+                  (eql (vector-node-constant (third args)) 0)
+                  (vector-node-index-p (second args) index-var 0)
+                  (list :load (leaf-source-name array)
+                        (vector-node-constant (third args))
                         (type-specifier (lvar-type (node-lvar use)))))))
           (t (let ((op (vector-node-call-name use)))
                (when (member op '("+" "-" "*" "/") :test #'string=)
-                 (let ((trees (mapcar (lambda (arg) (vector-node-tree arg (1+ depth)))
+                 (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
                                       (combination-args use))))
-                   (and (every #'identity trees)
-                        (list :op op trees)))))))))
+                   (and (every #'identity trees) (list :op op trees)))))))))
+
+;;; the whole loop, if it is one this pass understands
+(defmacro vector-node-fail (reason) `(return-from vector-node-plan ,reason))
+(defun vector-node-plan (loop)
+  (unless (and (eq (loop-kind loop) :natural) (null (loop-inferiors loop)))
+    (vector-node-fail :not-a-simple-loop))
+  (let* ((blocks (vector-node-blocks loop))
+         (head (loop-head loop)))
+    (unless (eq (first blocks) head) (vector-node-fail :head-not-first))
+    (unless (= (length blocks) 2) (vector-node-fail (list :block-count (length blocks))))
+    (let* ((body (second blocks))
+           (cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
+           (test (and cif (lvar-uses (if-test cif))))
+           (args (and (basic-combination-p test) (combination-args test))))
+      (unless cif (vector-node-fail :no-if-in-header))
+      (unless (and (basic-combination-p test) (string= (or (vector-node-call-name test) "") "<"))
+        (vector-node-fail (list :test-not-lessp (and (basic-combination-p test) (vector-node-call-name test)))))
+      (let* ((index-lvar (find-if (lambda (a) (vector-node-leaf-var a)) args))
+             (index-var (and index-lvar (vector-node-leaf-var index-lvar)))
+             (limit-lvar (and index-lvar (find-if (lambda (a) (not (eq a index-lvar))) args)))
+             (body-nodes (vector-node-nodes body))
+             (increment (find-if (lambda (n) (and (typep n 'cset) (eq (set-var n) index-var)))
+                                 body-nodes))
+             (stores (remove-if-not (lambda (n) (vector-node-name-p n "DATA-VECTOR-SET-WITH-OFFSET"))
+                                    body-nodes)))
+        (unless index-var (vector-node-fail :no-index))
+        (unless increment (vector-node-fail :no-increment))
+        (unless stores (vector-node-fail :no-store))
+        (let* ((step (lvar-uses (set-value increment)))
+               (step-args (and (basic-combination-p step) (combination-args step))))
+          (unless (and step-args (string= (or (vector-node-call-name step) "") "+"))
+            (vector-node-fail (list :increment-not-plus (and (basic-combination-p step) (vector-node-call-name step)))))
+          (unless (and (eq (vector-node-leaf-var (first step-args)) index-var)
+                       (eql (vector-node-constant (second step-args)) 1))
+            (vector-node-fail :increment-not-by-one)))
+        (unless (every (lambda (ref) (memq (ctran-block (node-prev ref)) blocks))
+                       (leaf-refs index-var))
+          (vector-node-fail :index-used-outside))
+        (let ((entries '()))
+          (dolist (store stores)
+            (let* ((sargs (combination-args store))
+                   (array (vector-node-leaf-var (first sargs)))
+                   (tree (vector-node-tree (fourth sargs) 0 index-var)))
+              (unless array (vector-node-fail :store-array-not-a-variable))
+              (unless (vector-node-index-p (second sargs) index-var 0)
+                (vector-node-fail :store-index-not-the-induction-variable))
+              (unless (eql (vector-node-constant (third sargs)) 0)
+                (vector-node-fail (list :store-offset (vector-node-constant (third sargs)))))
+              (unless tree (vector-node-fail :no-value-tree))
+              (push (list (leaf-source-name array) (type-specifier (lvar-type (fourth sargs))) tree)
+                    entries)))
+          (unless (eql (vector-node-var-init index-var) 0)
+            (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
+          (list :element-type (second (first entries))
+                :index (leaf-source-name index-var)
+                :limit (or (vector-node-constant limit-lvar)
+                           (let ((leaf (vector-node-leaf-var limit-lvar)))
+                             (and leaf (leaf-source-name leaf))))
+                :stores (mapcar (lambda (e) (cons (first e) (third e))) (nreverse entries))))))))
+
+
+;;; ---- from the plan back to source -----------------------------------------
+(defun vector-node-print-tree (tree subst index)
+  (case (car tree)
+    (:const (second tree))
+    (:var (second tree))
+    (:load `(aref ,(or (cdr (assoc (second tree) subst :test #'equal))
+                       (second tree))
+                  ,index))
+    (:op `(,(intern (second tree) "CL")
+           ,@(mapcar (lambda (sub) (vector-node-print-tree sub subst index))
+                     (third tree))))
+    (t (error "unexpected tree ~s" tree))))
+
+(defun vector-node-tree-arrays (tree acc)
+  (case (car tree)
+    (:load (adjoin (second tree) acc :test #'equal))
+    (:op (reduce (lambda (acc2 sub) (vector-node-tree-arrays sub acc2)) (third tree)
+                 :initial-value acc))
+    (t acc)))
+
+(defun vector-node-source-form (plan)
+  (let* ((stores (getf plan :stores))
+         (arrays (reduce (lambda (acc store) (vector-node-tree-arrays (cdr store) acc))
+                         stores
+                         :initial-value (remove-duplicates (mapcar #'car stores)
+                                                           :test #'equal)))
+         (index (make-symbol "VN-I"))
+         (subst (mapcar (lambda (name)
+                          (cons name (make-symbol (format nil "VN-~a" name))))
+                        arrays))
+         (type (getf plan :element-type)))
+    `(let (,@(mapcar (lambda (pair)
+                       `(,(cdr pair)
+                         (the (simple-array ,type (*)) ,(car pair))))
+                     subst))
+       (dotimes (,index ,(getf plan :limit))
+         ,@(mapcar (lambda (store)
+                     `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
+                            ,(vector-node-print-tree (cdr store) subst index)))
+                   stores)))))
+
 
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
