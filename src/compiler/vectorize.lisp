@@ -1207,6 +1207,10 @@ guard covers the reads as well as the writes."
          (narrow (vector-elementwise-plan loop 16 count-var end references)))
     (cond ((and wide narrow dispatch)
            (vector-emit-elementwise loop count-var end references wide narrow t))
+;;; only the 256-bit tables can express this loop, so it is still asked for at run
+;;; time: a machine without avx2 runs the element loop instead of trapping
+          ((and wide dispatch)
+           (vector-emit-elementwise loop count-var end references wide nil t))
           (wide (vector-emit-elementwise loop count-var end references wide nil nil))
           (narrow (vector-emit-elementwise loop count-var end references nil narrow nil))
           (t nil))))
