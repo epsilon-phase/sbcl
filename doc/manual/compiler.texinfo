@@ -1276,11 +1276,6 @@ with @code{+}, @code{-}, @code{logand}, @code{logior}, @code{logxor},
 @end itemize
 
 @noindent
-@code{min} and @code{max} are packed on arm64 for the 8-bit, 16-bit and 32-bit
-lanes as well, and multiplication covers the 8-bit lanes there, which is one
-more width than SSE2 has.
-
-@noindent
 Which of those a build can do depends on the instructions its backend has.
 @code{NEON} has a packed minimum and maximum for every lane width up to 32 bits,
 in both signednesses, so an arm64 build vectorizes all of them, and it
@@ -1312,15 +1307,15 @@ A float loop may read a narrow integer array, which is how a byte image or
 @code{double-float} lanes.  Four bytes at a time this is worth 2.6 times on a
 cache-resident image and 3.6 times streaming; the read is exact, so the loop does
 not need @code{(safety 0)}.
-@end itemize
 
 @noindent
 Integer arithmetic wraps around at the width of the element type, which is what
 a scalar loop storing into an array of that type does once the range check is
-off.  Multiplication is available for the float element types and, on x86-64, for the
-16-bit integer ones (8- and 16- and 32-bit lanes on arm64), where it produces the
-low bits of each product exactly as storing into such an element does; division is
-available for the floats only.
+off.  Multiplication is available for the float element types, for 16-bit integer
+lanes on both backends, for 8-bit lanes on arm64, and for 32-bit lanes where the
+backend has the instruction (@code{SSE4.1} on x86-64, always on arm64); it
+produces the low bits of each product exactly as storing into such an element
+does.  Division is available for the floats only.
 
 The loop may be written as a @code{dotimes}, as a @code{do} whose single binding
 counts from zero by one and whose end test is @code{(>= i n)} or @code{(= i n)},
