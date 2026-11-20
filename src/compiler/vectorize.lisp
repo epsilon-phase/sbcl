@@ -1311,7 +1311,11 @@ function called with it - ARET's lowering passes the index through one."
             ;; continuation block would crash JOIN-SUCCESSOR-IF-POSSIBLE on its
             ;; nil BLOCK-START-NODE (ir1opt.lisp:519 -> ir1util.lisp:1897,
             ;; block-start-node ir1util.lisp:931-933).
-            (ir1-convert start exit-ctran nil (vector-node-source-form plan))
+            (let ((*auto-vectorize* t))
+              ;; the form we splice in is a DOTIMES for the emitter, so the source
+              ;; pass has to be on while it is converted or the replacement runs
+              ;; scalar
+              (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
             ;; rewire the entry, then drop the loop.  Every block is flagged
             ;; before any is deleted: delete-block avers that no surviving
             ;; predecessor is left without a successor (ir1util.lisp:2430-2438;
