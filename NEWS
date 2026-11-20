@@ -1,6 +1,12 @@
 ;;;; -*- coding: utf-8; fill-column: 78 -*-
 
 changes in sbcl-2.6.10 relative to sbcl-2.6.9:
+  * enhancement: automatic vectorization of elementwise array loops on x86-64
+    and arm64: a loop of the shape (dotimes (i n) (setf (aref c i) (+ (aref a i)
+    (aref b i)))) over single-float, double-float, 8/16/32/64-bit integer arrays
+    is compiled to packed SIMD instructions with a scalar tail, for + - * /,
+    the bitwise operations, MIN and MAX, and unary minus.  Documented under
+    "Automatic Vectorization" in the manual; SB-C::*AUTO-VECTORIZE* turns it off.
   * minor incompatible change: testing for float equality using `=` is now a
     quiet operation, not signalling when given NaNs as input.
   * enhancement: Unicode support has been updated to support version 18.0.0 of
