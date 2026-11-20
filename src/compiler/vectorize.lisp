@@ -1038,10 +1038,6 @@ guard covers the reads as well as the writes."
 
 (defun vector-node-component-pass (component)
   (when (and *vector-node-splice*
-             ;; the same policy gate the source pass uses: at low speed the lvars
-             ;; carry no useful types, and the emitted (THE ...) casts become
-             ;; nonsense like (SIMPLE-ARRAY (INTEGER 0 0) (*))
-             (>= (policy-quality (component-policy component) 'speed) 2)
              (not (gethash component *vector-node-spliced*)))
     ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
     ;; COMPILE-COMPONENT has analysed this component, so the analysis the pass
@@ -1057,7 +1053,12 @@ guard covers the reads as well as the writes."
     ;; Every case this hides is a rule still to be written.
     (handler-case
     (labels ((walk (loop)
-               (when (eq (loop-kind loop) :natural)
+               ;; the same policy gate the source pass uses (see the manual's
+               ;; "Automatic Vectorization"): at low speed the lvars carry no useful
+               ;; types and the emitted casts become nonsense like
+               ;; (SIMPLE-ARRAY (INTEGER 0 0) (*))
+               (when (and (eq (loop-kind loop) :natural)
+                          (policy (block-last (loop-head loop)) (>= speed 2)))
                  (let ((plan (vector-node-plan loop)))
                    ;; VECTOR-NODE-PLAN returns a plan plist or a failure reason,
                    ;; and reasons are keywords as often as lists
