@@ -1146,10 +1146,10 @@ function called with it - ARET's lowering passes the index through one."
 (defun vector-node-var-init (var)
   "The value VAR is called with at its home lambda, when that is a constant."
   (let* ((home (lambda-var-home var))
-         (call (and home (handler-case (let-combination home) (error () nil))))
-         (_ (unless (basic-combination-p call) (return-from vector-node-var-init nil)))
-         (pos (and call (position var (lambda-vars home)))))
-    (and pos (vector-node-constant (nth pos (combination-args call))))))
+         (call (and home (handler-case (let-combination home) (error () nil)))))
+    (unless (basic-combination-p call) (return-from vector-node-var-init nil))
+    (let ((pos (position var (lambda-vars home))))
+      (and pos (vector-node-constant (nth pos (combination-args call)))))))
 
 ;;; why a shape declined, for the differential harness to report: the recogniser's
 ;;; answers are only useful if the reasons are visible
