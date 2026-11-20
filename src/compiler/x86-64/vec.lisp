@@ -1006,19 +1006,25 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-ub8)
   (:generator 8
+    ;; the arguments are copied first, and the high half is unpacked from those
+    ;; copies BEFORE the low half is unpacked in place: operands are modelled as
+    ;; read at vop start, so a temporary packed onto an argument register would
+    ;; otherwise destroy the input (the harness caught this as element 8 of 16
+    ;; being 253 instead of 9)
+    (move lo-a a)
+    (move lo-b b)
     (inst pxor zero zero)
     (inst pcmpeqd mask mask)
     (inst psrlw mask 8)
-    (move lo-a a)
-    (inst punpcklbw lo-a zero)
-    (move lo-b b)
-    (inst punpcklbw lo-b zero)
-    (move hi-a a)
+    (move hi-a lo-a)
     (inst punpckhbw hi-a zero)
-    (move hi-b b)
+    (move hi-b lo-b)
     (inst punpckhbw hi-b zero)
+    (inst punpcklbw lo-a zero)
+    (inst punpcklbw lo-b zero)
     (inst pmullw lo-a lo-b)
     (inst pmullw hi-a hi-b)
+    ;; keep the low byte so the product WRAPS: PACKUSWB alone saturates
     (inst pand lo-a mask)
     (inst pand hi-a mask)
     (inst packuswb lo-a hi-a)
@@ -1039,19 +1045,25 @@
   (:results (result :scs (int-sse-reg)))
   (:result-types simd-pack-sb8)
   (:generator 8
+    ;; the arguments are copied first, and the high half is unpacked from those
+    ;; copies BEFORE the low half is unpacked in place: operands are modelled as
+    ;; read at vop start, so a temporary packed onto an argument register would
+    ;; otherwise destroy the input (the harness caught this as element 8 of 16
+    ;; being 253 instead of 9)
+    (move lo-a a)
+    (move lo-b b)
     (inst pxor zero zero)
     (inst pcmpeqd mask mask)
     (inst psrlw mask 8)
-    (move lo-a a)
-    (inst punpcklbw lo-a zero)
-    (move lo-b b)
-    (inst punpcklbw lo-b zero)
-    (move hi-a a)
+    (move hi-a lo-a)
     (inst punpckhbw hi-a zero)
-    (move hi-b b)
+    (move hi-b lo-b)
     (inst punpckhbw hi-b zero)
+    (inst punpcklbw lo-a zero)
+    (inst punpcklbw lo-b zero)
     (inst pmullw lo-a lo-b)
     (inst pmullw hi-a hi-b)
+    ;; keep the low byte so the product WRAPS: PACKUSWB alone saturates
     (inst pand lo-a mask)
     (inst pand hi-a mask)
     (inst packuswb lo-a hi-a)
