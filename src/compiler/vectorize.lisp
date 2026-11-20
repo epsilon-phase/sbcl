@@ -1314,6 +1314,13 @@ function called with it - ARET's lowering passes the index through one."
           (vector-node-fail :not-a-simple-array))
         (let* ((step (lvar-uses (set-value increment)))
                (step-args (and (basic-combination-p step) (combination-args step))))
+          ;; the increment's value can arrive through a cast, as every other value
+          ;; in this pass can
+          (loop repeat 4
+                while (cast-p step)
+                do (setf step (lvar-uses (cast-value step))
+                         step-args (and (basic-combination-p step)
+                                        (combination-args step))))
           ;; (1+ i) is as common as (+ i 1), and DOTIMES expands to either
           (let ((name (and (basic-combination-p step) (vector-node-call-name step))))
             (unless (and step-args (member name '("+" "1+") :test #'string=))
