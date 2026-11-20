@@ -1315,11 +1315,17 @@ function called with it - ARET's lowering passes the index through one."
             ;; IR1-PHASES binds *constraint-universe* and *delayed-ir1-transforms*
             ;; itself (main.lisp:549-552); binding them lexically here would be
             ;; fatal in make-host-2.
-            (ir1-phases component)
+            ;; re-running IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE*
+            ;; while the component's lvars still index the old one, and constraint
+            ;; propagation dies on that; local call analysis is what drains the new
+            ;; functionals, and the flags let the phases still ahead of us redo the
+            ;; optimization and the DFO that the new code needs
+            (locall-analyze-component component)
+            (setf (component-reoptimize component) t)
+            (setf (component-reanalyze component) t)
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
             ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
             ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).
-            (setf (component-reanalyze component) t)
             t))))))
 
 (defun vector-expand-loop (loop)
