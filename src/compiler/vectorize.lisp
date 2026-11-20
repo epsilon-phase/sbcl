@@ -972,7 +972,7 @@ guard covers the reads as well as the writes."
 ;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
 ;;; only exists after inlining, which the source pass cannot see, but converting
 ;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
-(defvar *vector-node-splice* nil
+(defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1509,14 +1509,20 @@ increment and the stores gives the set of nodes the replacement reproduces."
     (t acc)))
 
 (defun vector-node-source-form (plan)
-  "The loop the plan describes, as a call to a fresh lambda.
+  "The loop the plan describes, as a call to a fresh local function.
 
 The replacement is converted in place, and a bare DOTIMES there registers its
 ENTRY nodes on the lambda that surrounds the loop, which in-place conversion does
 not reconcile with the LET merges that follow: see
-doc/internals-notes/vectorizer-ir1-pass.txt.  Wrapping the loop in a lambda makes
-the conversion top-down into a fresh function, the shape IR1 expects, and LOCAL
-call analysis can inline the result back into the caller.
+doc/internals-notes/vectorizer-ir1-pass.txt.  A function of its own makes the
+conversion top-down into a fresh lambda, the shape IR1 expects.
+
+LABELS rather than (FUNCALL (LAMBDA ...)): the latter is let-converted while it is
+being converted, and DOTIMES contains a BLOCK whose RETURN then targets the ctran
+that let-conversion deleted ("attempt to THROW to a tag that does not exist:
+SB-C::LOCALL-ALREADY-LET-CONVERTED").  A local function is analysed by
+LOCALL-ANALYZE-COMPONENT after its body is converted, which is the order IR1
+expects, and it can be inlined back into the caller.
 
 The parameters are declared because a fresh lambda's variables have no types of
 their own and the source-form pass reads the array types from declarations; the
@@ -1525,18 +1531,18 @@ inherit."
   (let* ((stores (getf plan :stores))          ; (array-name . value-tree) pairs
          (names (remove-duplicates (mapcar #'car stores) :test #'equal))
          (type (getf plan :element-type))
+         (function (make-symbol "VN-VLOOP"))
          (index (make-symbol "VN-I"))
          (limit (make-symbol "VN-N")))
-    `(funcall
-      (lambda (,@names ,limit)
-        (declare (type (simple-array ,type (*)) ,@names)
-                 (type fixnum ,limit))
-        (dotimes (,index ,limit)
-          ,@(mapcar (lambda (store)
-                      `(setf (aref ,(car store) ,index)
-                             ,(vector-node-print-tree (cdr store) nil index)))
-                    stores)))
-      ,@names ,(getf plan :limit))))
+    `(labels ((,function (,@names ,limit)
+                (declare (type (simple-array ,type (*)) ,@names)
+                         (type fixnum ,limit))
+                (dotimes (,index ,limit)
+                  ,@(mapcar (lambda (store)
+                              `(setf (aref ,(car store) ,index)
+                                     ,(vector-node-print-tree (cdr store) nil index)))
+                            stores))))
+       (,function ,@names ,(getf plan :limit)))))
 
 
 ;;; Put the replacement where the loop was: convert it into a fresh block between
