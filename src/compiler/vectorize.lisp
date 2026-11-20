@@ -1037,11 +1037,11 @@ guard covers the reads as well as the writes."
             indent
             (and (functional-p fun) (functional-debug-name fun))
             (and (functional-p fun) (functional-kind fun))
-            (and (clambda-p fun)
+            (and (typep fun 'clambda)
                  (mapcar (lambda (v) (and (lambda-var-p v) (leaf-source-name v)))
                          (lambda-vars fun)))
-            (and (clambda-p fun) (length (lambda-blocks fun))))
-    (when (clambda-p fun)
+            (and (typep fun 'clambda) (length (lambda-blocks fun))))
+    (when (typep fun 'clambda)
       (dolist (b (lambda-blocks fun))
         (format *error-output* "~&;~a    b~a -> ~a~%"
                 indent (block-number b) (mapcar #'block-number (block-succ b)))
