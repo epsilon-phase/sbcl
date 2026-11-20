@@ -952,7 +952,7 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
-(defvar *vector-node-splice* t
+(defvar *vector-node-splice* nil
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
