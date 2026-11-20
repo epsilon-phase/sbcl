@@ -1531,7 +1531,9 @@ entry created inside a lambda that a LET merge or a transform later detached is
 registered with one lambda and found through another.  ENVIRONMENT-ANALYZE
 iterates LAMBDA-ENTRIES (envanal.lisp:277), so a mismatch loses that entry's
 cleanup."
-  (dolist (block (component-blocks component))
+  ;; the component's blocks are a chain from its head, not a slot
+  (do ((block (component-head component) (block-next block)))
+      ((null block))
     (unless (block-delete-p block)
       (do-nodes (node nil block)
         (when (and (typep node 'entry)
@@ -1540,7 +1542,7 @@ cleanup."
           (error "stale ENTRY ~s in live block ~a: home lambda ~s kind ~a, entries registered on ~s"
                  node (block-number (node-block node))
                  (node-home-lambda node) (functional-kind (node-home-lambda node))
-                 (lambda-entries (node-home-lambda node))))))))
+                 (lambda-entries (node-home-lambda node)))))))))
 
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
