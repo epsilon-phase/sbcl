@@ -1032,8 +1032,14 @@ guard covers the reads as well as the writes."
 ;; second visit would vectorize the vectorized loop, and then that one, forever.
 ;; (The table is emptied per compilation unit, see VECTOR-NODE-COMPONENT-PASS.)
 (defvar *vector-node-spliced* (make-hash-table :test 'eq))
+(defvar *vector-node-last-component* nil)
 
 (defun vector-node-component-pass (component)
+  ;; the table only ever describes the component being compiled, so it is emptied
+  ;; when a different one arrives
+  (unless (eq component *vector-node-last-component*)
+    (clrhash *vector-node-spliced*)
+    (setf *vector-node-last-component* component))
   (when (and *vector-node-splice*
              (not (gethash component *vector-node-spliced*)))
     ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
