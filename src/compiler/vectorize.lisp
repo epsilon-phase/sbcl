@@ -1262,7 +1262,7 @@ function called with it - ARET's lowering passes the index through one."
       (return-from vector-node-splice-loop nil))
     (let ((preheader (first outside-in))
           (exit (first outside-out))
-          (component (loop-component loop)))
+          (component (block-component head)))
       (with-ir1-environment-from-node (vector-node-last-node preheader)
         (let* ((start (make-ctran))
                (next (make-ctran))
