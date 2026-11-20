@@ -1393,7 +1393,8 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (let ((consumed (make-hash-table :test 'eq)))
             (dolist (store stores)
               (vector-node-mark-consumed store consumed))
-            (mapc (lambda (n) (vector-node-mark-consumed n consumed)) (list test step-node))
+            (mapc (lambda (n) (vector-node-mark-consumed n consumed))
+                  (list test step-node increment))
             ;; only nodes that do work matter: a combination or a set.  The
             ;; structural nodes (block starts, exits) go with the blocks
             (dolist (node (mapcan #'vector-node-nodes blocks))
