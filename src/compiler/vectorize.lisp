@@ -1329,12 +1329,12 @@ increment and the stores gives the set of nodes the replacement reproduces."
     ;; increment a block of its own (test / body / increment), so the shape check
     ;; below looks at every block rather than assuming the body is the second
     (unless (<= (length blocks) 3) (vector-node-fail (list :block-count (length blocks))))
-    ;; the splice's deletion needs bookkeeping for flow nodes the pass does not
-    ;; model: a BIND means a lambda lives inside the region, and deleting its block
-    ;; queues the lambda's blocks outside the region, where an ENTRY then reports
-    ;; the caller as its home and the consistency check barfs
+    ;; what the pass cannot carry through the splice: a closure, a return or a
+    ;; dispatch inside the loop.  ENTRY and BIND are NOT in this list -- an
+    ;; ordinary DOTIMES has both (its BLOCK and TAGBODY) and the sweep retires them
+    ;; with the region; refusing them refused the shape the pass exists for
     (dolist (node (mapcan #'vector-node-nodes blocks))
-      (when (typep node '(or entry enclose creturn jump-table))
+      (when (typep node '(or enclose creturn jump-table))
         (vector-node-fail (list :structural-node (type-of node)))))
     (let* ((cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
            (test (and cif (lvar-uses (if-test cif))))
