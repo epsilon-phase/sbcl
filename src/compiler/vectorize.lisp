@@ -1416,10 +1416,15 @@ function called with it - ARET's lowering passes the index through one."
                           (cons name (make-symbol (format nil "VN-~a" name))))
                         arrays))
          (type (getf plan :element-type)))
+    ;; a declaration rather than a THE cast on each binding: the source-form pass
+    ;; reads array types out of the lexenv, and the declaration is what ordinary
+    ;; code with a LET-bound array looks like, which is the form it is known to
+    ;; accept
     `(let (,@(mapcar (lambda (pair)
-                       `(,(cdr pair)
-                         (the (simple-array ,type (*)) ,(car pair))))
+                       `(,(cdr pair) ,(car pair)))
                      subst))
+       (declare (type (simple-array ,type (*))
+                      ,@(mapcar #'cdr subst)))
        (dotimes (,index ,(getf plan :limit))
          ,@(mapcar (lambda (store)
                      `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
