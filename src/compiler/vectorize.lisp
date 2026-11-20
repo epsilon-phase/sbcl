@@ -1253,6 +1253,10 @@ function called with it - ARET's lowering passes the index through one."
                (middle (ctran-starts-block start))
                (after (ctran-starts-block next)))
           (ir1-convert-progn-body start next nil (list (vector-node-source-form plan)))
+          ;; the code just converted brought its own lambdas (the LET it binds and the
+          ;; loop it runs); they are new functionals in this component, and nothing
+          ;; will fold them unless local call analysis runs again
+          (locall-analyze-component *current-component*)
           ;; the code runs after the preheader and before the loop's exit; the old
           ;; edge has to come out through UNLINK-BLOCKS, or the loop head keeps a
           ;; predecessor that no longer branches to it
