@@ -1189,7 +1189,7 @@ function called with it - ARET's lowering passes the index through one."
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
                                       (combination-args use))))
                    (and (every #'identity trees)
-                        (list :op (if (string= op "%NEGATE") "-" op) trees))))))))))
+                        (list :op (if (string= op "%NEGATE") "-" op) trees)))))))))
 
 ;;; the whole loop, if it is one this pass understands
 (defmacro vector-node-fail (reason)
