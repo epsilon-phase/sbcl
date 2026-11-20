@@ -1065,7 +1065,9 @@ guard covers the reads as well as the writes."
                  (when (walk inferior) (return-from walk t)))
                nil))
       (walk (component-outer-loop component)))
-      (error () nil))))
+      ;; only the readers' own type confusions are declined: an error of any
+      ;; other kind is a bug in the pass and must not be swallowed
+      (type-error () nil))))
 
 ;;; ------------------------------------------------- recognition, on IR1
 ;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
