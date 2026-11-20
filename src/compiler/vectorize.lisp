@@ -988,8 +988,10 @@ guard covers the reads as well as the writes."
 ;;;
 ;;; (values :width N :guard (CONJUNCT ...) :pack-type SYMBOL :bindings (LET* ...)
 ;;;         :packed <do> :pick-end (- COUNT-VAR (MOD COUNT-VAR N)))
-;;; COUNT-VAR and END belong to the emitter, which shares them between the two plans
-(defun vector-elementwise-plan (loop bytes count-var end)
+;;; COUNT-VAR, END and the data-vector names belong to the emitter, which shares
+;;; them between the two plans: a fresh set of names would leave the packed loop
+;;; reading a vector nothing bound.
+(defun vector-elementwise-plan (loop bytes count-var end references)
   (let* ((*vector-lane-bytes* bytes)
          (element-type (vloop-element-type loop))
          (width (vector-width element-type))
@@ -1005,7 +1007,6 @@ guard covers the reads as well as the writes."
                           (remove-duplicates (mapcan #'vector-collect-scalars expressions)
                                              :test #'equal)))
          (arrays (vector-loop-arrays loop))
-         (references (vector-data-references loop))
 ;;; a read at (- i 1) leaves the array on the first packed iteration, and the scalar
 ;;; loop it replaces faults at i = 0 too; only a literal can be known negative here.
          (negative-literals
@@ -1130,7 +1131,7 @@ guard covers the reads as well as the writes."
 ;;; Emit an elementwise loop from one or two plans: one packed loop, or both with
 ;;; the machine choosing at run time.  The guard, the hand-off point END and the
 ;;; scalar tail are written once for either shape.
-(defun vector-emit-elementwise (loop count-var end wide narrow dispatch)
+(defun vector-emit-elementwise (loop count-var end references wide narrow dispatch)
   (let ((element-type (vloop-element-type loop))
         (index (vloop-index loop))
         (count (vloop-count loop))
@@ -1156,7 +1157,7 @@ guard covers the reads as well as the writes."
       (let* ((guard (if dispatch (getf narrow :guard) (getf (or wide narrow) :guard)))
              (body
                (vector-with-data-vectors
-                (vector-data-references loop)
+                references
                 (if dispatch
                     `(let* ((,ok (and (typep ,count-var 'index) ,@guard))
                             (,wide-p (and ,ok (,*vector-wide-predicate*)))
@@ -1184,16 +1185,17 @@ guard covers the reads as well as the writes."
   (let* ((element-type (vloop-element-type loop))
          (count-var (make-symbol "COUNT"))
          (end (make-symbol "VECTOR-END"))
+         (references (vector-data-references loop))
          (dispatch (and *vector-wide-predicate*
                         (vector-wide-available-p element-type)
                         t))
          (wide (and (vector-wide-available-p element-type)
-                    (vector-elementwise-plan loop 32 count-var end)))
-         (narrow (vector-elementwise-plan loop 16 count-var end)))
+                    (vector-elementwise-plan loop 32 count-var end references)))
+         (narrow (vector-elementwise-plan loop 16 count-var end references)))
     (cond ((and wide narrow dispatch)
-           (vector-emit-elementwise loop count-var end wide narrow t))
-          (wide (vector-emit-elementwise loop count-var end wide nil nil))
-          (narrow (vector-emit-elementwise loop count-var end nil narrow nil))
+           (vector-emit-elementwise loop count-var end references wide narrow t))
+          (wide (vector-emit-elementwise loop count-var end references wide nil nil))
+          (narrow (vector-emit-elementwise loop count-var end references nil narrow nil))
           (t nil))))
 
 ;;; expand a reduction: accumulate the elementwise expression in a vector, run it
