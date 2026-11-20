@@ -1028,8 +1028,14 @@ guard covers the reads as well as the writes."
 
 ;;; The pass: after LOOP-ANALYZE, every natural loop is looked at, and one the node
 ;;; analysis can describe is replaced by what it emits.
+;;; one splice per component: the replacement contains a DOTIMES of its own, so a
+;; second visit would vectorize the vectorized loop, and then that one, forever.
+;; (The table is emptied per compilation unit, see VECTOR-NODE-COMPONENT-PASS.)
+(defvar *vector-node-spliced* (make-hash-table :test 'eq))
+
 (defun vector-node-component-pass (component)
-  (when *vector-node-splice*
+  (when (and *vector-node-splice*
+             (not (gethash component *vector-node-spliced*)))
     ;; called from inside IR1-PHASES, i.e. before the pipeline at the end of
     ;; COMPILE-COMPONENT has analysed this component, so the analysis the pass
     ;; needs is done here rather than assumed.  Running inside the fixpoint is
@@ -1044,6 +1050,7 @@ guard covers the reads as well as the writes."
                  (let ((plan (vector-node-plan loop)))
                    (when (and plan (not (stringp plan)))
                      (when (vector-node-splice-loop loop plan)
+                       (setf (gethash component *vector-node-spliced*) t)
                        (return-from walk t)))))
                (dolist (inferior (loop-inferiors loop))
                  (when (walk inferior) (return-from walk t)))
