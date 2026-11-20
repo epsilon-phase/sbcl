@@ -1892,15 +1892,16 @@ a writer with a fixed color type ends up with."
                             (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))))))
     (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes))
-  ;; 32-bit multiply exists on sse4.1 and later, and where it does not the note is
-  ;; the same one; where it does, the loop declines at default safety instead,
-  ;; because the lanes would wrap where a checked loop signals
+  ;; 32-bit multiply is in the 256-bit table of every x86-64 build now - the width
+  ;; is chosen when the loop runs - so what stops this one is the policy, not a
+  ;; missing instruction, unless no width has it
   (let ((notes (vectorize-notes-for
                 '(lambda (a b c n)
                    (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
                             (type fixnum n) (optimize speed))
                    (dotimes (i n) (setf (aref c i) (* (aref a i) (aref b i))))))))
-    (if (member :sse4 sb-c:*backend-subfeatures*)
+    (if (or (sb-c::vector-primitive "MUL" '(unsigned-byte 32) 16)
+            (sb-c::vector-primitive "MUL" '(unsigned-byte 32) 32))
         (assert (vectorize-note-mentions notes "safety 0") () "no note: ~s" notes)
         (assert (vectorize-note-mentions notes "not available for") () "no note: ~s" notes)))
   ;; byte lanes outside (safety 0)

@@ -943,23 +943,25 @@ guard covers the reads as well as the writes."
     (funcall expander loop)))
 
 (defun vector-expand-loop (loop)
-  (let* ((expander (if (vloop-accumulator loop)
-                       #'vector-expand-reduction
-                       #'vector-expand-elementwise-loop))
-         (element-type (vloop-element-type loop))
-;;; a backend that hands over a predicate wants one image to run on machines with
-;;; and without the wider instruction set, so both loops go in and the machine
-;;; picks at run time: the wide one costs text, and nothing else where it cannot
-;;; be reached
+  (if (vloop-accumulator loop)
+      (vector-expand-reduction-loop loop)
+      (vector-expand-elementwise-loop loop)))
+
+;;; A reduction keeps the accumulator in lanes and adds them to the variable at the
+;;; end, so the two widths share nothing worth hoisting: each attempt is a whole
+;;; expansion, and the machine picks between them when the loop runs.
+(defun vector-expand-reduction-loop (loop)
+  (let* ((element-type (vloop-element-type loop))
          (dispatch (and *vector-wide-predicate*
                         (vector-wide-available-p element-type)
                         t))
 ;;; both attempts are silent here: which note to print depends on what the pair
 ;;; of them produced, and only one note should be printed
          (wide (let ((*auto-vectorize-notes* nil))
-                 (and (vector-wide-available-p element-type) (attempt-expansion expander loop 32))))
+                 (and (vector-wide-available-p element-type)
+                      (vector-elementwise-attempt #'vector-expand-reduction loop 32))))
          (narrow (let ((*auto-vectorize-notes* nil))
-                   (attempt-expansion expander loop 16))))
+                   (vector-elementwise-attempt #'vector-expand-reduction loop 16))))
     (cond ((not (or wide narrow)) nil)
           (t (when *auto-vectorize-notes*
                (if (and wide narrow dispatch)
@@ -974,8 +976,21 @@ guard covers the reads as well as the writes."
                  `(if (,*vector-wide-predicate*) ,wide ,narrow)
                  (or wide narrow))))))
 
-(defun vector-expand-elementwise-loop (loop)
-  (let* ((element-type (vloop-element-type loop))
+(defun vector-elementwise-attempt (expander loop bytes)
+  (let ((*vector-lane-bytes* bytes))
+    (funcall expander loop)))
+
+;;; What one width would emit for an elementwise loop, or NIL when this backend
+;;; cannot express it at that width.  The pieces are separate because a build that
+;;; hands over a predicate puts the loops for two widths in one function: only the
+;;; packed loop and the lane bindings differ between them, while the length guard,
+;;; the hand-off point and the scalar tail are the same code either way.
+;;;
+;;; (values :width N :guard (CONJUNCT ...) :pack-type SYMBOL :bindings (LET* ...)
+;;;         :packed <do> :pick-end (- COUNT-VAR (MOD COUNT-VAR N)))
+(defun vector-elementwise-plan (loop bytes)
+  (let* ((*vector-lane-bytes* bytes)
+         (element-type (vloop-element-type loop))
          (width (vector-width element-type))
          (index (vloop-index loop))
          (count (vloop-count loop))
@@ -991,9 +1006,6 @@ guard covers the reads as well as the writes."
                                              :test #'equal)))
          (arrays (vector-loop-arrays loop))
          (references (vector-data-references loop))
-         (end (make-symbol "VECTOR-END"))
-;;; count is a form: bind it once, so that it runs as often as dotimes runs it.
-         (count-var (make-symbol "COUNT"))
 ;;; a read at (- i 1) leaves the array on the first packed iteration, and the scalar
 ;;; loop it replaces faults at i = 0 too; only a literal can be known negative here.
          (negative-literals
@@ -1042,9 +1054,6 @@ guard covers the reads as well as the writes."
                    (every #'vector-exact-expression-p expressions))
                (not negative-literals)
                (vector-stores-safe-p stores (vloop-sources loop)))
-      (when *auto-vectorize-notes*
-        (compiler-notify "vectorized loop over ~a, ~a elements at a time"
-                         element-type width))
       (labels ((reference (name) (or (cadr (assoc name references)) name))
                ;; the pack a LET* binding stood for, or the name it was given
                (emit (expression offset)
@@ -1068,70 +1077,124 @@ guard covers the reads as well as the writes."
                                    (loop for offset in offsets
                                          unless (typep offset '(integer 0 *))
                                            collect `(>= ,offset 0)))))
-              (body
-                (vector-with-data-vectors
-                 references
-                 `(progn
-                    ;; the vector body
-                    (do ((,index 0 (+ ,index ,width)))
-                        ((>= ,index ,end))
-                      (declare (type index ,index))
-                      ,(let* ((stores-form
-                                `(progn ,@(mapcar (lambda (entry)
-                                                    (store-form entry offset))
-                                                  stores)))
-                              ;; the intermediates a body binds and its stores share
-                              ;; are computed once here, in the order it bound them
-                              (stores-form
-                                (if intermediates
-                                    `(let* ,(loop for (var tree) in intermediates
-                                                  collect `(,var ,(emit tree offset)))
-                                       (declare (type ,pack-type
-                                                      ,@(mapcar #'first intermediates)))
-                                       ,stores-form)
-                                    stores-form)))
-                         ;; a backend that addresses by a byte offset computes it
-                         ;; once for the whole iteration
-                         (if offset
-                             `(let* ((,offset (,(vector-primitive "OFFSET" element-type)
-                                               ,index)))
-                                (declare (type (unsigned-byte 64) ,offset))
-                                ,stores-form)
-                             stores-form))
-                      ,@(when indexed
-                          ;; leave the pack holding the offsets for the next
-                          ;; iteration
-                          (let ((lanes (cdr (assoc :index scalars)))
-                                (stride (cdr (assoc :stride scalars))))
-                            `((setf ,lanes
-                                    (,(vector-primitive "ADD" element-type)
-                                     ,lanes ,stride))))))
-                    ;; the tail, element by element, exactly as written
-                    (do ((,index ,end (1+ ,index)))
-                        ((>= ,index ,count-var))
-                      (declare (type index ,index))
-                      ,@(vloop-body loop))))))
+              (bindings
+                (mapcar (lambda (scalar)
+                          (case (car scalar)
+                            (:stride `(,(cdr scalar)
+                                       (,(vector-primitive "STRIDE" element-type))))
+                            (:index `(,(cdr scalar) (,ramp)))
+                            (t `(,(cdr scalar) (,splat ,(second (car scalar)))))))
+                        scalars))
+              (packed
+                `(do ((,index 0 (+ ,index ,width)))
+                     ((>= ,index ,end))
+                   (declare (type index ,index))
+                   ,(let* ((stores-form
+                             `(progn ,@(mapcar (lambda (entry)
+                                                 (store-form entry offset))
+                                               stores)))
+                           ;; the intermediates a body binds and its stores share
+                           ;; are computed once here, in the order it bound them
+                           (stores-form
+                             (if intermediates
+                                 `(let* ,(loop for (var tree) in intermediates
+                                               collect `(,var ,(emit tree offset)))
+                                    (declare (type ,pack-type
+                                                   ,@(mapcar #'first intermediates)))
+                                    ,stores-form)
+                                 stores-form)))
+                      ;; a backend that addresses by a byte offset computes it
+                      ;; once for the whole iteration
+                      (if offset
+                          `(let* ((,offset (,(vector-primitive "OFFSET" element-type)
+                                            ,index)))
+                             (declare (type (unsigned-byte 64) ,offset))
+                             ,stores-form)
+                          stores-form))
+                   ,@(when indexed
+                       ;; leave the pack holding the offsets for the next iteration
+                       (let ((lanes (cdr (assoc :index scalars)))
+                             (stride (cdr (assoc :stride scalars))))
+                         `((setf ,lanes
+                                 (,(vector-primitive "ADD" element-type)
+                                  ,lanes ,stride))))))))
+          (list :width width
+                :element-type element-type
+                :names (mapcar #'cdr scalars)
+                :guard guard
+                :pack-type pack-type
+                :bindings bindings
+                :packed packed
+                :pick-end `(- ,count-var (mod ,count-var ,width))))))))
+
+;;; Emit an elementwise loop from one or two plans: one packed loop, or both with
+;;; the machine choosing at run time.  The guard, the hand-off point END and the
+;;; scalar tail are written once for either shape.
+(defun vector-emit-elementwise (loop wide narrow dispatch)
+  (let ((element-type (vloop-element-type loop))
+        (index (vloop-index loop))
+        (count (vloop-count loop))
+        (count-var (make-symbol "COUNT"))
+        (end (make-symbol "VECTOR-END"))
+        (ok (make-symbol "PACKED-RUNS"))
+        (wide-p (make-symbol "WIDE")))
+    (when *auto-vectorize-notes*
+      (if dispatch
+          (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
+                            the machine has avx2 and ~a where it does not"
+                           element-type (getf wide :width) (getf narrow :width))
+          (compiler-notify "vectorized loop over ~a, ~a elements at a time"
+                           element-type (getf (or wide narrow) :width))))
+    (flet ((packed-branch (plan)
+             `(let* ,(getf plan :bindings)
+                (declare (type ,(getf plan :pack-type) ,@(getf plan :names)))
+                ,(getf plan :packed)))
+           (tail ()
+             ;; the tail, element by element, exactly as written
+             `(do ((,index ,end (1+ ,index)))
+                  ((>= ,index ,count-var))
+                (declare (type index ,index))
+                ,@(vloop-body loop))))
+      (let* ((guard (if dispatch (getf narrow :guard) (getf (or wide narrow) :guard)))
+             (body
+               (vector-with-data-vectors
+                (vector-data-references loop)
+                (if dispatch
+                    `(let* ((,ok (and (typep ,count-var 'index) ,@guard))
+                            (,wide-p (and ,ok (,*vector-wide-predicate*)))
+                            (,end (if ,wide-p
+                                      ,(getf wide :pick-end)
+                                      (if ,ok ,(getf narrow :pick-end) 0))))
+                       (declare (type index ,end))
+                       (if ,wide-p
+                           ,(packed-branch wide)
+                           (when ,ok ,(packed-branch narrow)))
+                       ,(tail))
+                    `(let* ((,end (if (and (typep ,count-var 'index) ,@guard)
+                                      ,(getf (or wide narrow) :pick-end)
+                                      0)))
+                       (declare (type index ,end))
+                       ,(packed-branch (or wide narrow))
+                       ,(tail))))))
 ;;; the guard chooses END instead of branching between two copies of the loop.  When
 ;;; it fails, END is 0, the packed loop does not run, and the tail does all the
 ;;; work: it is the original loop, written once.
-          `(let ((,count-var ,count))
-             (let* (,@(mapcar (lambda (scalar)
-                                (case (car scalar)
-                                  (:stride `(,(cdr scalar)
-                                             (,(vector-primitive "STRIDE" element-type))))
-                                  (:index `(,(cdr scalar) (,ramp)))
-                                  (t `(,(cdr scalar)
-                                       (,splat ,(second (car scalar)))))))
-                              scalars)
-                     (,end (if (and (typep ,count-var 'index) ,@guard)
-                               (- ,count-var (mod ,count-var ,width))
-                               0)))
-               (declare (type index ,end)
-                        ,@(mapcar (lambda (scalar)
-                                    `(type ,pack-type ,(cdr scalar)))
-                                  scalars))
-               ,body)))))))
+        `(let ((,count-var ,count))
+           ,body)))))
 
+(defun vector-expand-elementwise-loop (loop)
+  (let* ((element-type (vloop-element-type loop))
+         (dispatch (and *vector-wide-predicate*
+                        (vector-wide-available-p element-type)
+                        t))
+         (wide (and (vector-wide-available-p element-type)
+                    (vector-elementwise-plan loop 32)))
+         (narrow (vector-elementwise-plan loop 16)))
+    (cond ((and wide narrow dispatch)
+           (vector-emit-elementwise loop wide narrow t))
+          (wide (vector-emit-elementwise loop wide nil nil))
+          (narrow (vector-emit-elementwise loop nil narrow nil))
+          (t nil))))
 
 ;;; expand a reduction: accumulate the elementwise expression in a vector, run it
 ;;; over the tail one element at a time, then add the accumulator's lanes to the
