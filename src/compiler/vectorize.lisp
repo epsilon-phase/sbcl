@@ -1509,26 +1509,39 @@ increment and the stores gives the set of nodes the replacement reproduces."
     (t acc)))
 
 (defun vector-node-source-form (plan)
-  "The loop the plan describes, as source for the existing emitter.
+  "The loop the plan describes, as a call to a fresh lambda.
 
-The arrays are the variables the loop already uses, and their types are the ones
-the recogniser read - from a declaration, a cast or the lvar - so the form is a
-bare DOTIMES with no wrapper.  That matters: the source-form pass is entered from
-IR1-CONVERT-LAMBDA-BODY and matches the body's own forms, so a replacement nested
-inside a LET is a loop it never looks at, which means the splice would leave
-scalar code and the recogniser would find it again and splice it again."
+The replacement is converted in place, and a bare DOTIMES there registers its
+ENTRY nodes on the lambda that surrounds the loop, which in-place conversion does
+not reconcile with the LET merges that follow: see
+doc/internals-notes/vectorizer-ir1-pass.txt.  Wrapping the loop in a lambda makes
+the conversion top-down into a fresh function, the shape IR1 expects, and LOCAL
+call analysis can inline the result back into the caller.
+
+The parameters are declared because a fresh lambda's variables have no types of
+their own and the source-form pass reads the array types from declarations; the
+recogniser took them from the original lexenv, which the new lambda does not
+inherit."
   (let* ((stores (getf plan :stores))
+         (names (remove-duplicates (mapcar #'first stores) :test #'equal))
+         (types (mapcar (lambda (name)
+                          (second (find name stores :key #'first :test #'equal)))
+                        names))
          (index (make-symbol "VN-I"))
-         (subst (mapcar (lambda (name) (cons name name))
-                        (reduce (lambda (acc store) (vector-node-tree-arrays (cdr store) acc))
-                                stores
-                                :initial-value (remove-duplicates (mapcar #'car stores)
-                                                                  :test #'equal)))))
-    `(dotimes (,index ,(getf plan :limit))
-       ,@(mapcar (lambda (store)
-                   `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
-                          ,(vector-node-print-tree (cdr store) subst index)))
-                 stores))))
+         (limit (make-symbol "VN-N")))
+    `(funcall
+      (lambda (,@names ,limit)
+        (declare ,@(mapcar (lambda (name type)
+                             `(type (simple-array ,type (*)) ,name))
+                           names types)
+                 (type fixnum ,limit))
+        (dotimes (,index ,limit)
+          ,@(mapcar (lambda (store)
+                      `(setf (aref ,(first store) ,index)
+                             ,(vector-node-print-tree (third store) nil index)))
+                    stores)))
+      ,@names ,(getf plan :limit))))
+
 
 ;;; Put the replacement where the loop was: convert it into a fresh block between
 ;;; the loop's preheader and its exit, relink those two edges, and delete the two
