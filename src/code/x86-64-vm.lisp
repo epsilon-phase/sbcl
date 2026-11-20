@@ -341,7 +341,9 @@
 ;;; the code runs, and this is what they test.  It is recomputed whenever the
 ;;; image starts, so dumping on an AVX2 machine and resuming on one without it
 ;;; takes the 128-bit loop (SB-EXT:*INIT-HOOKS*, as the SB-SIMD dispatch does).
-(define-load-time-global *avx2-available* nil)
+;;; DEFVAR, not DEFINE-LOAD-TIME-GLOBAL: the emitted loops test it, and a global
+;;; lexical cannot be rebound around a call
+(defvar *avx2-available* nil)
 (declaim (inline avx2-available-p))
 (defun avx2-available-p ()
   "True when the machine running this image has AVX2, which decides at run time
