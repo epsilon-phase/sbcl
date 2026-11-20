@@ -2972,3 +2972,56 @@ loops the pass puts in one function: the build no longer has to know."
                     *vectorize-packed-mnemonics*)
             () "~A should have stayed scalar:~%~A"
             'vectorize-let-adjustable (text 'vectorize-let-adjustable))))
+
+
+;;; The IR1 pass recognises a loop after inlining, so arithmetic that is a call to
+;;; a declared-inline helper is still `+` by the time it looks.  The source-form
+;;; pass cannot see through the call, which is the reason the IR1 pass exists:
+;;; this test asserts BOTH halves of that claim, so it fails if either the
+;;; source-form pass starts seeing through calls or the IR1 pass stops.
+
+(declaim (inline vectorize-inlined-add))
+(defun vectorize-inlined-add (x y) (+ x y))
+
+(defun %vectorize-inlined-call (a b c n)
+  (declare (type (simple-array single-float (*)) a b c)
+           (type vectorize-index n)
+           (optimize speed))
+  (dotimes (i n)
+    (setf (aref c i) (vectorize-inlined-add (aref a i) (aref b i))))
+  c)
+
+(with-test (:name :ir1-vectorizes-an-inlined-call)
+  (flet ((packed-p (splice)
+           (let ((text (string-downcase
+                        (with-output-to-string (stream)
+                          (let ((sb-c::*vector-node-splice* splice))
+                            (disassemble
+                             (compile nil
+                                      '(lambda (a b c n)
+                                         (declare (type (simple-array single-float (*)) a b c)
+                                                  (type vectorize-index n)
+                                                  (optimize speed))
+                                         (dotimes (i n)
+                                           (setf (aref c i)
+                                                 (vectorize-inlined-add (aref a i) (aref b i))))))
+                             :stream stream))))))
+             (values (and (or (search "addps" text) (search "vaddps" text)) t)
+                     text))))
+    (multiple-value-bind (source-packed source-text) (packed-p nil)
+      (declare (ignore source-text))
+      (declare (ignorable source-packed))
+      (multiple-value-bind (ir1-packed ir1-text) (packed-p t)
+        (assert (not source-packed) ()
+                "~@<the source-form pass now sees through the call, so this test no ~
+                 longer proves anything about the IR1 pass~:@>")
+        (assert ir1-packed) ()
+                "~@<the IR1 pass did not vectorize a loop whose arithmetic is an ~
+                 inlined call: ~2I~_~A~:@>" ir1-text))))
+  (let ((a (make-array 37 :element-type 'single-float :initial-element 1.5))
+        (b (make-array 37 :element-type 'single-float :initial-element 2.25))
+        (c (make-array 37 :element-type 'single-float)))
+    (%vectorize-inlined-call a b c 37)
+    (dotimes (i 37)
+      (unless (= (aref c i) 3.75)
+        (error "~@<inlined call: element ~D is ~S, expected 3.75~:@>" i (aref c i))))))
