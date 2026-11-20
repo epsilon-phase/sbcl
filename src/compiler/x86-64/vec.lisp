@@ -1058,82 +1058,6 @@
     (move result lo-a)))
 
 
-(defknown (%vec-mul-ub8) ((simd-pack (unsigned-byte 8)) (simd-pack (unsigned-byte 8))) (simd-pack (unsigned-byte 8)) (flushable movable))
-
-(define-vop (%vec-mul-ub8)
-  (:translate %vec-mul-ub8)
-  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
-  (:arg-types simd-pack-ub8 simd-pack-ub8)
-  (:temporary (:sc int-sse-reg :from (:argument 0)) lo-a)
-  (:temporary (:sc int-sse-reg :from (:argument 1)) lo-b)
-  (:temporary (:sc int-sse-reg) hi-a)
-  (:temporary (:sc int-sse-reg) hi-b)
-  (:temporary (:sc int-sse-reg) zero)
-  (:temporary (:sc int-sse-reg) mask)
-  (:results (result :scs (int-sse-reg)))
-  (:result-types simd-pack-ub8)
-  (:generator 8
-    ;; the arguments are copied FIRST: operands are modelled as read at the start of
-    ;; the vop, so a temporary written before the copy can be packed onto an
-    ;; argument register and destroy it (cost a build and a wrong-values report
-    ;; from the harness: element 8 was 253 instead of 9)
-    (move lo-a a)
-    (move lo-b b)
-    (inst pxor zero zero)
-    (inst pcmpeqd mask mask)
-    (inst psrlw mask 8)
-    (move hi-a lo-a)
-    (inst punpckhbw hi-a zero)
-    (inst punpcklbw lo-a zero)
-    (move hi-b lo-b)
-    (inst punpckhbw hi-b zero)
-    (inst punpcklbw lo-b zero)
-    (inst pmullw lo-a lo-b)
-    (inst pmullw hi-a hi-b)
-    ;; keep the low byte so the result WRAPS: PACKUSWB on its own saturates
-    (inst pand lo-a mask)
-    (inst pand hi-a mask)
-    (inst packuswb lo-a hi-a)
-    (move result lo-a)))
-
-(defknown (%vec-mul-sb8) ((simd-pack (signed-byte 8)) (simd-pack (signed-byte 8))) (simd-pack (signed-byte 8)) (flushable movable))
-
-(define-vop (%vec-mul-sb8)
-  (:translate %vec-mul-sb8)
-  (:args (a :scs (int-sse-reg)) (b :scs (int-sse-reg)))
-  (:arg-types simd-pack-sb8 simd-pack-sb8)
-  (:temporary (:sc int-sse-reg :from (:argument 0)) lo-a)
-  (:temporary (:sc int-sse-reg :from (:argument 1)) lo-b)
-  (:temporary (:sc int-sse-reg) hi-a)
-  (:temporary (:sc int-sse-reg) hi-b)
-  (:temporary (:sc int-sse-reg) zero)
-  (:temporary (:sc int-sse-reg) mask)
-  (:results (result :scs (int-sse-reg)))
-  (:result-types simd-pack-sb8)
-  (:generator 8
-    ;; the arguments are copied FIRST: operands are modelled as read at the start of
-    ;; the vop, so a temporary written before the copy can be packed onto an
-    ;; argument register and destroy it (cost a build and a wrong-values report
-    ;; from the harness: element 8 was 253 instead of 9)
-    (move lo-a a)
-    (move lo-b b)
-    (inst pxor zero zero)
-    (inst pcmpeqd mask mask)
-    (inst psrlw mask 8)
-    (move hi-a lo-a)
-    (inst punpckhbw hi-a zero)
-    (inst punpcklbw lo-a zero)
-    (move hi-b lo-b)
-    (inst punpckhbw hi-b zero)
-    (inst punpcklbw lo-b zero)
-    (inst pmullw lo-a lo-b)
-    (inst pmullw hi-a hi-b)
-    ;; keep the low byte so the result WRAPS: PACKUSWB on its own saturates
-    (inst pand lo-a mask)
-    (inst pand hi-a mask)
-    (inst packuswb lo-a hi-a)
-    (move result lo-a)))
-
 ;;; 32-bit multiplication is PMULLD, which is SSE4.1 rather than SSE2, so both the
 ;;; vop and its entry in the table are published only by a build that has the
 ;;; instruction: a table entry with no vop behind it is worse than no entry, since
@@ -1576,9 +1500,7 @@
     (publish "MUL" double-float %vec-mul-double)
     (publish "MUL" (unsigned-byte 8) %vec-mul-ub8)
     (publish "MUL" (signed-byte 8) %vec-mul-sb8)
-    (publish "MUL" (unsigned-byte 8) %vec-mul-ub8)
-    (publish "MUL" (signed-byte 8) %vec-mul-sb8)
-    (publish "DIV" single-float %vec-div-single)
+            (publish "DIV" single-float %vec-div-single)
     (publish "DIV" double-float %vec-div-double)
     (publish "NEG" single-float %vec-negate-single)
     (publish "NEG" double-float %vec-negate-double)
