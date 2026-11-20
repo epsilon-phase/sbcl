@@ -1270,6 +1270,21 @@ function called with it - ARET's lowering passes the index through one."
 (defmacro vector-node-fail (reason)
   `(progn (push ,reason *vector-node-refusals*)
           (return-from vector-node-plan ,reason)))
+(defun vector-node-redundant-call-p (node blocks)
+  "True when NODE is a call whose value is unused and whose callee is bound inside
+BLOCKS.  TRANSFORM-CALL leaves such a node behind for every source-transformed
+AREF: the transform's body is converted in its place and the original combination
+stays in the ctran chain with no lvar, which FLUSHABLE-COMBINATION-P does not
+answer for (it only answers for :KNOWN calls).  Its body is accounted for node by
+node anyway, so the call itself adds nothing and may go with the blocks."
+  (and (basic-combination-p node)
+       (null (node-lvar node))
+       (eq (basic-combination-kind node) :local)
+       (let* ((use (lvar-uses (combination-fun node)))
+              (fun (and (ref-p use) (ref-leaf use)))
+              (bind (and (typep fun 'clambda) (lambda-bind fun))))
+         (and bind (memq (node-block bind) blocks)))))
+
 (defun vector-node-mark-consumed (node table)
   "Mark NODE and everything its arguments are computed from in TABLE.
 
@@ -1297,6 +1312,13 @@ increment and the stores gives the set of nodes the replacement reproduces."
     ;; increment a block of its own (test / body / increment), so the shape check
     ;; below looks at every block rather than assuming the body is the second
     (unless (<= (length blocks) 3) (vector-node-fail (list :block-count (length blocks))))
+    ;; the splice's deletion needs bookkeeping for flow nodes the pass does not
+    ;; model: a BIND means a lambda lives inside the region, and deleting its block
+    ;; queues the lambda's blocks outside the region, where an ENTRY then reports
+    ;; the caller as its home and the consistency check barfs
+    (dolist (node (mapcan #'vector-node-nodes blocks))
+      (when (typep node '(or entry bind enclose creturn jump-table))
+        (vector-node-fail (list :structural-node (type-of node)))))
     (let* ((cif (find-if (lambda (n) (typep n 'cif)) (vector-node-nodes head)))
            (test (and cif (lvar-uses (if-test cif))))
            (args (and (basic-combination-p test) (combination-args test))))
@@ -1413,6 +1435,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
             (dolist (node (mapcan #'vector-node-nodes blocks))
               (unless (or (gethash node consumed)
                           (not (basic-combination-p node))
+                          (vector-node-redundant-call-p node blocks)
                           ;; the value is consumed inside the loop: the stores
                           ;; reproduce it
                           (let ((res (node-lvar node)))
