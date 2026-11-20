@@ -988,7 +988,8 @@ guard covers the reads as well as the writes."
 ;;;
 ;;; (values :width N :guard (CONJUNCT ...) :pack-type SYMBOL :bindings (LET* ...)
 ;;;         :packed <do> :pick-end (- COUNT-VAR (MOD COUNT-VAR N)))
-(defun vector-elementwise-plan (loop bytes)
+;;; COUNT-VAR and END belong to the emitter, which shares them between the two plans
+(defun vector-elementwise-plan (loop bytes count-var end)
   (let* ((*vector-lane-bytes* bytes)
          (element-type (vloop-element-type loop))
          (width (vector-width element-type))
@@ -1130,12 +1131,10 @@ guard covers the reads as well as the writes."
 ;;; Emit an elementwise loop from one or two plans: one packed loop, or both with
 ;;; the machine choosing at run time.  The guard, the hand-off point END and the
 ;;; scalar tail are written once for either shape.
-(defun vector-emit-elementwise (loop wide narrow dispatch)
+(defun vector-emit-elementwise (loop count-var end wide narrow dispatch)
   (let ((element-type (vloop-element-type loop))
         (index (vloop-index loop))
         (count (vloop-count loop))
-        (count-var (make-symbol "COUNT"))
-        (end (make-symbol "VECTOR-END"))
         (ok (make-symbol "PACKED-RUNS"))
         (wide-p (make-symbol "WIDE")))
     (when *auto-vectorize-notes*
@@ -1184,16 +1183,18 @@ guard covers the reads as well as the writes."
 
 (defun vector-expand-elementwise-loop (loop)
   (let* ((element-type (vloop-element-type loop))
+         (count-var (make-symbol "COUNT"))
+         (end (make-symbol "VECTOR-END"))
          (dispatch (and *vector-wide-predicate*
                         (vector-wide-available-p element-type)
                         t))
          (wide (and (vector-wide-available-p element-type)
-                    (vector-elementwise-plan loop 32)))
-         (narrow (vector-elementwise-plan loop 16)))
+                    (vector-elementwise-plan loop 32 count-var end)))
+         (narrow (vector-elementwise-plan loop 16 count-var end)))
     (cond ((and wide narrow dispatch)
-           (vector-emit-elementwise loop wide narrow t))
-          (wide (vector-emit-elementwise loop wide nil nil))
-          (narrow (vector-emit-elementwise loop nil narrow nil))
+           (vector-emit-elementwise loop count-var end wide narrow t))
+          (wide (vector-emit-elementwise loop count-var end wide nil nil))
+          (narrow (vector-emit-elementwise loop count-var end nil narrow nil))
           (t nil))))
 
 ;;; expand a reduction: accumulate the elementwise expression in a vector, run it
