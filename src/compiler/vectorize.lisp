@@ -1132,7 +1132,10 @@ function called with it - ARET's lowering passes the index through one."
           (leaf
            (let ((home (lambda-var-home leaf)))
              (when home
+               ;; a WITH-ARRAY-DATA store gives the home lambda an MV-COMBINATION,
+               ;; which COMBINATION-ARGS refuses
                (let ((call (handler-case (let-combination home) (error () nil))))
+                 (unless (basic-combination-p call) (return-from vector-node-index-p nil))
                  (when call
                    (let ((pos (position leaf (lambda-vars home))))
                      (and pos
@@ -1144,6 +1147,7 @@ function called with it - ARET's lowering passes the index through one."
   "The value VAR is called with at its home lambda, when that is a constant."
   (let* ((home (lambda-var-home var))
          (call (and home (handler-case (let-combination home) (error () nil))))
+         (_ (unless (basic-combination-p call) (return-from vector-node-var-init nil)))
          (pos (and call (position var (lambda-vars home)))))
     (and pos (vector-node-constant (nth pos (combination-args call))))))
 
