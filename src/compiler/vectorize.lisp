@@ -31,6 +31,10 @@
 
 ;;; the width the expansion in progress is emitting for, 16 or 32 bytes
 (defvar *vector-lane-bytes* 16)
+;;; the function a backend defines when the width should be chosen by the machine
+;;; rather than by the build: NIL means the build fixed it, and the pass then emits
+;;; only the widest loop the build published
+(defvar *vector-wide-predicate* nil)
 
 ;;;; decoding types
 
@@ -941,8 +945,29 @@ guard covers the reads as well as the writes."
     (flet ((attempt (bytes)
              (let ((*vector-lane-bytes* bytes))
                (funcall expander loop))))
-      (or (and (vector-wide-available-p (vloop-element-type loop)) (attempt 32))
-          (attempt 16)))))
+      (let* ((element-type (vloop-element-type loop))
+             (dispatch (and *vector-wide-predicate*
+                            (vector-wide-available-p element-type)
+                            t))
+             (wide (and (vector-wide-available-p element-type)
+                        (let ((*auto-vectorize-notes* (and *auto-vectorize-notes*
+                                                           (not dispatch))))
+                          (attempt 32))))
+             (narrow (let ((*auto-vectorize-notes* (and *auto-vectorize-notes*
+                                                        (not dispatch))))
+                       (attempt 16))))
+;;; a backend that hands over a predicate wants one image to run on machines with
+;;; and without the wider instruction set, so both loops go in and the machine
+;;; picks: the wide one costs text and nothing else where it cannot be reached.
+        (if (and wide narrow dispatch)
+            (progn
+              (when *auto-vectorize-notes*
+                (compiler-notify "vectorized loop over ~a, ~a elements at a time where ~
+                                  the machine has avx2 and ~a where it does not"
+                                 element-type (vector-width element-type 32)
+                                 (vector-width element-type 16)))
+              `(if (,*vector-wide-predicate*) ,wide ,narrow))
+            (or wide narrow))))))
 
 (defun vector-expand-elementwise-loop (loop)
   (let* ((element-type (vloop-element-type loop))

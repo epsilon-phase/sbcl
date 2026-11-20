@@ -617,14 +617,18 @@
 
 ;;;; handing the primitives to SB-C
 ;;;
-;;; Only when the build enables :AVX2.  The pass asks for a 256-bit primitive by
-;;; trying this table first, so leaving it empty is what keeps a build without
-;;; the subfeature on the 128-bit loops: no VOP here is reachable otherwise.
+;;; Every x86-64 core compiles this file and the encoders it needs, so the pass
+;;; always gets the table.  What a build without :AVX2 does not do is promise
+;;; that the machine running the image has the instructions: SB-C then emits both
+;;; the 256-bit loop and the 128-bit one and tests *AVX2-AVAILABLE-P between
+;;; them, and that flag is recomputed whenever the image starts (see the hook in
+;;; src/code/x86-64-vm.lisp).  An image built on an AVX2 machine therefore still
+;;; runs - four elements at a time - on one without it.
 
 (macrolet ((publish (base element-type name)
              `(push (cons (list ,base ',element-type) ',name) primitives)))
   (let ((primitives nil))
-    (when (member :avx2 *backend-subfeatures*)
+    (progn
       (publish "LOAD" single-float %vec-load-single-256)
       (publish "LOAD" double-float %vec-load-double-256)
       (publish "STORE" single-float %vec-store-single-256)
@@ -725,6 +729,9 @@
       (publish "SUB" (signed-byte 64) %vec-sub-sb64-256)
       (publish "AND" (signed-byte 64) %vec-and-sb64-256)
       (publish "OR" (signed-byte 64) %vec-or-sb64-256)
-      (publish "XOR" (signed-byte 64) %vec-xor-sb64-256)
-      )
-    (setf sb-c::*vector-primitives-256* (nreverse primitives))))
+      (publish "XOR" (signed-byte 64) %vec-xor-sb64-256))
+    (setf sb-c::*vector-primitives-256* (nreverse primitives))
+;;; a build that requires :AVX2 emits the wide loop alone; one that does not asks
+;;; the machine
+    (unless (member :avx2 *backend-subfeatures*)
+      (setf sb-c::*vector-wide-predicate* 'sb-vm::avx2-available-p))))

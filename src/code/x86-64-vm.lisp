@@ -336,6 +336,23 @@
 (def-cpu-feature :avx2
     (plusp (sb-alien:extern-alien "avx2_supported" int)))
 
+;;; The code generator may emit 256-bit instructions into an image that will run
+;;; on a machine without AVX2, so the two loops it emits are chosen between when
+;;; the code runs, and this is what they test.  It is recomputed whenever the
+;;; image starts, so dumping on an AVX2 machine and resuming on one without it
+;;; takes the 128-bit loop (SB-EXT:*INIT-HOOKS*, as the SB-SIMD dispatch does).
+(define-load-time-global *avx2-available* nil)
+(declaim (inline avx2-available-p))
+(defun avx2-available-p ()
+  "True when the machine running this image has AVX2, which decides at run time
+between the 256-bit loop the vectorizer emits and the 128-bit one beside it."
+  *avx2-available*)
+
+(defun note-avx2-availability ()
+  (setf *avx2-available* (plusp (sb-alien:extern-alien "avx2_supported" int))))
+(pushnew 'note-avx2-availability sb-ext:*init-hooks*)
+(note-avx2-availability)
+
 (def-cpu-feature :ssse3+popcnt
     (when (>= (sb-vm::%cpu-identification 0 0) 1)
       (multiple-value-bind (eax ebx ecx) (sb-vm::%cpu-identification 1 0)
