@@ -1140,6 +1140,10 @@ function called with it - ARET's lowering passes the index through one."
          (pos (and call (position var (lambda-vars home)))))
     (and pos (vector-node-constant (nth pos (combination-args call))))))
 
+;;; why a shape declined, for the differential harness to report: the recogniser's
+;;; answers are only useful if the reasons are visible
+(defvar *vector-node-refusals* nil)
+
 (defun vector-node-tree (lvar depth index-var)
   (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
@@ -1177,9 +1181,6 @@ function called with it - ARET's lowering passes the index through one."
                    (and (every #'identity trees) (list :op op trees)))))))))
 
 ;;; the whole loop, if it is one this pass understands
-;;; why the last shapes declined, for the differential harness to report: the
-;;; recogniser's answers are only useful if the reasons are visible
-(defvar *vector-node-refusals* nil)
 (defmacro vector-node-fail (reason)
   `(progn (push ,reason *vector-node-refusals*)
           (return-from vector-node-plan ,reason)))
