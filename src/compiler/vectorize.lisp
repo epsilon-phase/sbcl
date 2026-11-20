@@ -1446,6 +1446,12 @@ increment and the stores gives the set of nodes the replacement reproduces."
                           ;; machinery rather than a call that can have an effect
                           (let ((use (lvar-uses (combination-fun node))))
                             (and (ref-p use) (functional-p (ref-leaf use))))
+                          ;; the bounds check an AREF brings: the loop the emitter
+                          ;; produces keeps it (the scalar tail still signals), so
+                          ;; dropping this one does not lose the check
+                          (let ((name (and (basic-combination-p node)
+                                           (vector-node-call-name node))))
+                            (and name (search "%CHECK-BOUND" name)))
                           (flushable-combination-p node))
                 (vector-node-fail (list :endangers (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
