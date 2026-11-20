@@ -3013,14 +3013,13 @@ loops the pass puts in one function: the build no longer has to know."
                      text))))
     (multiple-value-bind (source-packed source-text) (packed-p nil)
       (declare (ignore source-text))
-      (declare (ignorable source-packed))
       (multiple-value-bind (ir1-packed ir1-text) (packed-p t)
         (assert (not source-packed) ()
                 "~@<the source-form pass now sees through the call, so this test no ~
                  longer proves anything about the IR1 pass~:@>")
         (assert ir1-packed) ()
                 "~@<the IR1 pass did not vectorize a loop whose arithmetic is an ~
-                 inlined call: ~2I~_~A~:@>" ir1-text))))
+                 inlined call: ~2I~_~A~:@>" ir1-text)))
   (let ((a (make-array 37 :element-type 'single-float :initial-element 1.5))
         (b (make-array 37 :element-type 'single-float :initial-element 2.25))
         (c (make-array 37 :element-type 'single-float)))
