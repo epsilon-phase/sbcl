@@ -1747,6 +1747,18 @@ guard covers the reads as well as the writes."
 ;;; same form with those types declared, so that the loop is vectorized.  Adding the
 ;;; declarations is all this does.
 (defun vector-let-form (form lexenv)
+;;; (locally (declare ...) (dotimes ...)) arrives as a LET with no bindings: the
+;;; declarations still apply to whatever the loop becomes, so rewrite it in place
+  (when (and (consp form)
+             (memq (car form) '(let let*))
+             (null (second form))
+             (vector-standard-loop-form-p form lexenv))
+    (let ((body (copy-list (cddr form))))
+      (loop for tail on body
+            for rewritten = (vectorize-loop-form (car tail) lexenv)
+            when rewritten
+              do (return `(,(car form) nil ,@(ldiff body tail) ,rewritten ,@(cdr tail)))
+            finally (return nil))))
   (when (and (consp form)
              (memq (car form) '(let let*))
              (listp (second form))
