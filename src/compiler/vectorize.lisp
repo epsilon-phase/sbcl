@@ -1051,10 +1051,6 @@ guard covers the reads as well as the writes."
     (find-dfo component)
     (find-dominators component)
     (loop-analyze component)
-    ;; TEMPORARY: the readers below are not total yet, and a shape the pass
-    ;; cannot read must decline rather than take the compiler down with it.
-    ;; Every case this hides is a rule still to be written.
-    (handler-case
     (labels ((walk (loop)
                ;; the same policy gate the source pass uses (see the manual's
                ;; "Automatic Vectorization"): at low speed the lvars carry no useful
@@ -1072,10 +1068,7 @@ guard covers the reads as well as the writes."
                (dolist (inferior (loop-inferiors loop))
                  (when (walk inferior) (return-from walk t)))
                nil))
-      (walk (component-outer-loop component)))
-      ;; only the readers' own type confusions are declined: an error of any
-      ;; other kind is a bug in the pass and must not be swallowed
-      (type-error () nil))))
+      (walk (component-outer-loop component))))
 
 ;;; ------------------------------------------------- recognition, on IR1
 ;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
@@ -1108,11 +1101,13 @@ guard covers the reads as well as the writes."
   (let ((n (and (basic-combination-p node) (vector-node-call-name node))))
     (and n (string= n name))))
 (defun vector-node-leaf-var (lvar)
-  (let ((use (lvar-uses lvar)))
+  ;; every reader here is total: a shape the pass does not understand must come
+  ;; back as NIL, never as an error out of the compiler
+  (let ((use (and (lvar-p lvar) (lvar-uses lvar))))
     (when (and (ref-p use) (lambda-var-p (ref-leaf use)))
       (ref-leaf use))))
 (defun vector-node-constant (lvar)
-  (let ((use (lvar-uses lvar)))
+  (let ((use (and (lvar-p lvar) (lvar-uses lvar))))
     (when (ref-p use)
       (let ((leaf (ref-leaf use)))
         (when (constant-p leaf) (constant-value leaf))))))
@@ -1153,6 +1148,7 @@ function called with it - ARET's lowering passes the index through one."
 (defvar *vector-node-refusals* nil)
 
 (defun vector-node-tree (lvar depth index-var)
+  (unless (lvar-p lvar) (return-from vector-node-tree nil))
   (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
     (cond ((vector-node-constant lvar) (list :const (vector-node-constant lvar)))
