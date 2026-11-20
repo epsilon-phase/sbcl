@@ -1150,6 +1150,10 @@ function called with it - ARET's lowering passes the index through one."
     (cond ((vector-node-constant lvar) (list :const (vector-node-constant lvar)))
           ((and (ref-p use) (lambda-var-p (ref-leaf use)))
            (list :var (leaf-source-name (ref-leaf use))))
+          ;; an integer store narrows its value through a CAST node (the type
+          ;; check's knowledge that the sum needs the lane width); the emitter
+          ;; re-derives that from the array's element type
+          ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var))
           ((not (basic-combination-p use))
            (push (list :tree-use (type-of use) (type-specifier (lvar-type lvar)))
                  *vector-node-refusals*)
