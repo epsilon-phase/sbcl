@@ -1157,6 +1157,16 @@ function called with it - ARET's lowering passes the index through one."
           ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
            (let* ((args (combination-args use))
                   (array (vector-node-leaf-var (first args))))
+             (unless (and array
+                          (eql (vector-node-constant (third args)) 0)
+                          (vector-node-index-p (second args) index-var 0))
+               (push (list :load-stop
+                           (and array t)
+                           (vector-node-constant (third args))
+                           (let ((v (vector-node-leaf-var (second args))))
+                             (and v (leaf-source-name v)))
+                           (vector-node-constant (second args)))
+                     *vector-node-refusals*))
              (and array
                   (eql (vector-node-constant (third args)) 0)
                   (vector-node-index-p (second args) index-var 0)
@@ -1175,10 +1185,11 @@ function called with it - ARET's lowering passes the index through one."
                (unless (member op '("+" "-" "*" "/") :test #'string=)
                  (push (list :tree-op op (type-specifier (lvar-type lvar)))
                        *vector-node-refusals*))
-               (when (member op '("+" "-" "*" "/") :test #'string=)
+               (when (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
                                       (combination-args use))))
-                   (and (every #'identity trees) (list :op op trees)))))))))
+                   (and (every #'identity trees)
+                        (list :op (if (string= op "%NEGATE") "-" op) trees))))))))))
 
 ;;; the whole loop, if it is one this pass understands
 (defmacro vector-node-fail (reason)
