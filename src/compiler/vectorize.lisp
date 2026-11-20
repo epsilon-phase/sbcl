@@ -994,7 +994,6 @@ guard covers the reads as well as the writes."
          (element-type (vloop-element-type loop))
          (width (vector-width element-type))
          (index (vloop-index loop))
-         (count (vloop-count loop))
          (stores (vloop-stores loop))
          (intermediates (vloop-intermediates loop))
          ;; the analysis below sees what the loop really computes; the emitted
