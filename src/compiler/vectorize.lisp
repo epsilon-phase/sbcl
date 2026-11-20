@@ -1,25 +1,39 @@
 ;;;; automatic vectorization of elementwise array loops
 ;;;;
-;;;; This file rewrites the classic elementwise array loop
+;;;; This file holds two passes.  The one that ships is a source-form rewrite: it
+;;;; rewrites the classic elementwise loop
 ;;;;
 ;;;;   (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))
 ;;;;
 ;;;; into a loop over SIMD packs plus a scalar tail, keeping the original loop as
 ;;;; the fallback when an array is shorter than the count.  It runs inside IR1
 ;;;; conversion, before macroexpansion, on the DOTIMES, DO and LOOP forms it
-;;;; recognizes by name, so a loop that a macro expands to is not rewritten.  The
-;;;; types are the compiler's own: the ctype of each variable's leaf in the lexenv
-;;;; the form is converted in.  What it produces is a replacement form, which IR1
-;;;; converts like any other.
+;;;; recognizes by name, so a loop a macro expands to is not rewritten.  The types
+;;;; are the compiler's own: the ctype of each variable's leaf in the lexenv the
+;;;; form is converted in.  What it produces is a replacement form, which IR1
+;;;; converts like any other.  It is on by default; *AUTO-VECTORIZE* turns it off
+;;;; and the manual's "Automatic Vectorization" node documents it.
 ;;;;
-;;;; This software is part of the SBCL system. See the README file for
-;;;; more information.
+;;;; The second pass is a demonstration, and is off: *VECTOR-NODE-SPLICE* is NIL and
+;;;; should stay NIL until the blocker below is fixed.  It recognizes a loop on IR1
+;;;; after LOOP-ANALYZE, so it can see arithmetic that exists only after inlining (a
+;;;; DECLAIM INLINE helper called in the body), which the source pass cannot see.
+;;;; It reads the loop into a plan, prints the plan back as a DOTIMES, and lets the
+;;;; source pass rewrite that -- it adds a recognizer, not an emitter.
 ;;;;
-;;;; This software is derived from the CMUCL system, which was
-;;;; written at Carnegie Mellon University and released into the
-;;;; public domain. The software is in the public domain and is
-;;;; provided with absolutely no warranty. See the COPYING and CREDITS
-;;;; files for more information.
+;;;; The blocker: the replacement is converted in place, inside a live component, and
+;;;; IR1 registers an ENTRY on (LEXENV-LAMBDA *LEXENV*) at creation
+;;;; (ir1-translators.lisp:199-208) while everything else finds it through
+;;;; (NODE-HOME-LAMBDA ...) (ir1util.lisp:1382-1389), which walks out of a :DELETED or
+;;;; :ZOMBIE lambda.  A LET merge or a LET-converted transform between the two leaves
+;;;; an ENTRY registered with one lambda and found through another; a self-build with
+;;;; the pass on stops in MAKE-WEAK-VECTOR with "ENTRY is not in ENTRIES for its home
+;;;; LAMBDA", and ENVIRONMENT-ANALYZE (envanal.lisp:277) would lose that entry's
+;;;; cleanup.  *VECTOR-NODE-CHECK-ENTRIES* asserts it at the splice.
+;;;;
+;;;; The differential harness that measures both passes (54 shapes, both dispatch
+;;;; paths, a scalar reference) is not in this tree yet; until it is, the numbers in
+;;;; the commit messages are not reproducible from the branch.
 
 (in-package "SB-C")
 
@@ -952,6 +966,9 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
+;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
+;;; only exists after inlining, which the source pass cannot see, but converting
+;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
 (defvar *vector-node-splice* nil
   "When true, replace each loop the node analysis plans with what it emits.")
 
@@ -1609,14 +1626,11 @@ cleanup."
               ;; pass has to be on while it is converted or the replacement runs
               ;; scalar
               (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
-            ;; rewire the entry and let the sweep delete the loop: the blocks are
-            ;; unreachable now, so FIND-DFO -> CLEAN-COMPONENT retires them
-            ;; together with everything only reachable through them -- including
-            ;; the blocks of a lambda that DELETE-BLOCK marks :deleted on the way
-            ;; (ir1util.lisp:2191-2194 leaves those queued on purpose).  Hand
-            ;; deletion breaks ENTRY/EXIT bookkeeping: an ENTRY left in a
-            ;; surviving region reports its home through the :deleted lambda and
-            ;; the consistency check barfs.  Do not flag the blocks first either:
+            ;; rewire the entry and leave the deletion to the pipeline.  Do not
+            ;; call DELETE-BLOCK on the loop's blocks by hand: DELETE-LAMBDA
+            ;; deliberately leaves a deleted lambda's blocks queued
+            ;; (ir1util.lisp:2191-2194), so hand deletion leaves ENTRY/EXIT
+            ;; bookkeeping inconsistent.  Do not flag the blocks first either --
             ;; DELETE-BLOCK-LAZILY skips a flagged block (ir1util.lisp:2402-2406)
             ;; and MARK-FOR-DELETION stops walking predecessors at one.
             (unlink-blocks preheader head)
@@ -1636,8 +1650,6 @@ cleanup."
             ;; asks about does not list them.  ENVIRONMENT-ANALYZE iterates
             ;; LAMBDA-ENTRIES, so such an entry loses its cleanup.  This asserts
             ;; it at the splice, where the component is still intact.
-            (when *vector-node-check-entries*
-              (check-entries-after-splice component))
             ;; The replacement brought a fresh lambda, entries and local exits;
             ;; put them through the same fixpoint the rest of the component ran.
             ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
@@ -1653,6 +1665,11 @@ cleanup."
             ;; functionals, and the flags let the phases still ahead of us redo the
             ;; optimization and the DFO that the new code needs
             (locall-analyze-component component)
+      ;; after LOCALL: a LET merge is one of the steps that can detach an ENTRY
+      ;; from the lambda that registered it, so checking before it would miss a
+      ;; violation this very splice introduced
+      (when *vector-node-check-entries*
+        (check-entries-after-splice component))
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
             ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
             ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).
