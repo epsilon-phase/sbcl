@@ -1298,7 +1298,8 @@ increment and the stores gives the set of nodes the replacement reproduces."
       (unless cif (vector-node-fail :no-if-in-header))
       (unless (and (basic-combination-p test) (string= (or (vector-node-call-name test) "") "<"))
         (vector-node-fail (list :test-not-lessp (and (basic-combination-p test) (vector-node-call-name test)))))
-      (let* ((index-lvar (find-if (lambda (a) (vector-node-leaf-var a)) args))
+      (let* ((step-node nil)
+             (index-lvar (find-if (lambda (a) (vector-node-leaf-var a)) args))
              (index-var (and index-lvar (vector-node-leaf-var index-lvar)))
              (limit-lvar (and index-lvar (find-if (lambda (a) (not (eq a index-lvar))) args)))
              (body-nodes (mapcan #'vector-node-nodes blocks))
@@ -1336,8 +1337,9 @@ increment and the stores gives the set of nodes the replacement reproduces."
                                 (not (array-type-complexp ty)))))
                        stores)
           (vector-node-fail :not-a-simple-array))
-        (let* ((step (lvar-uses (set-value increment)))
-               (step-args (and (basic-combination-p step) (combination-args step))))
+        (let* ((step (lvar-uses (set-value increment))))
+          (setf step-node step)
+          (let* ((step-args (and (basic-combination-p step) (combination-args step))))
           ;; the increment's value can arrive through a cast, as every other value
           ;; in this pass can
           (loop repeat 4
@@ -1349,11 +1351,11 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (let ((name (and (basic-combination-p step) (vector-node-call-name step))))
             (unless (and step-args (member name '("+" "1+") :test #'string=))
               (vector-node-fail (list :increment-not-plus name))))
-          (unless (and (eq (vector-node-leaf-var (first step-args)) index-var)
-                       (or (and (string= (or (vector-node-call-name step) "") "1+")
-                                (= (length step-args) 1))
-                           (eql (vector-node-constant (second step-args)) 1)))
-            (vector-node-fail :increment-not-by-one)))
+            (unless (and (eq (vector-node-leaf-var (first step-args)) index-var)
+                         (or (and (string= (or (vector-node-call-name step) "") "1+")
+                                  (= (length step-args) 1))
+                             (eql (vector-node-constant (second step-args)) 1)))
+              (vector-node-fail :increment-not-by-one))))
         (unless (every (lambda (ref) (memq (ctran-block (node-prev ref)) blocks))
                        (leaf-refs index-var))
           (vector-node-fail :index-used-outside))
@@ -1393,7 +1395,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (let ((consumed (make-hash-table :test 'eq)))
             (dolist (store stores)
               (vector-node-mark-consumed store consumed))
-            (mapc (lambda (n) (vector-node-mark-consumed n consumed)) (list test step))
+            (mapc (lambda (n) (vector-node-mark-consumed n consumed)) (list test step-node))
             ;; only nodes that do work matter: a combination or a set.  The
             ;; structural nodes (block starts, exits) go with the blocks
             (dolist (node (mapcan #'vector-node-nodes blocks))
