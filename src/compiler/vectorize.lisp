@@ -952,7 +952,7 @@ guard covers the reads as well as the writes."
 (defvar *vector-node-probe* nil
   "When true, print the IR1 of every loop in each compiled component.")
 
-(defvar *vector-node-splice* nil
+(defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1406,31 +1406,26 @@ function called with it - ARET's lowering passes the index through one."
     (t acc)))
 
 (defun vector-node-source-form (plan)
-  (let* ((stores (getf plan :stores))
-         (arrays (reduce (lambda (acc store) (vector-node-tree-arrays (cdr store) acc))
-                         stores
-                         :initial-value (remove-duplicates (mapcar #'car stores)
-                                                           :test #'equal)))
-         (index (make-symbol "VN-I"))
-         (subst (mapcar (lambda (name)
-                          (cons name (make-symbol (format nil "VN-~a" name))))
-                        arrays))
-         (type (getf plan :element-type)))
-    ;; a declaration rather than a THE cast on each binding: the source-form pass
-    ;; reads array types out of the lexenv, and the declaration is what ordinary
-    ;; code with a LET-bound array looks like, which is the form it is known to
-    ;; accept
-    `(let (,@(mapcar (lambda (pair)
-                       `(,(cdr pair) ,(car pair)))
-                     subst))
-       (declare (type (simple-array ,type (*))
-                      ,@(mapcar #'cdr subst)))
-       (dotimes (,index ,(getf plan :limit))
-         ,@(mapcar (lambda (store)
-                     `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
-                            ,(vector-node-print-tree (cdr store) subst index)))
-                   stores)))))
+  "The loop the plan describes, as source for the existing emitter.
 
+The arrays are the variables the loop already uses, and their types are the ones
+the recogniser read - from a declaration, a cast or the lvar - so the form is a
+bare DOTIMES with no wrapper.  That matters: the source-form pass is entered from
+IR1-CONVERT-LAMBDA-BODY and matches the body's own forms, so a replacement nested
+inside a LET is a loop it never looks at, which means the splice would leave
+scalar code and the recogniser would find it again and splice it again."
+  (let* ((stores (getf plan :stores))
+         (index (make-symbol "VN-I"))
+         (subst (mapcar (lambda (name) (cons name name))
+                        (reduce (lambda (acc store) (vector-node-tree-arrays (cdr store) acc))
+                                stores
+                                :initial-value (remove-duplicates (mapcar #'car stores)
+                                                                  :test #'equal)))))
+    `(dotimes (,index ,(getf plan :limit))
+       ,@(mapcar (lambda (store)
+                   `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
+                          ,(vector-node-print-tree (cdr store) subst index)))
+                 stores))))
 
 ;;; Put the replacement where the loop was: convert it into a fresh block between
 ;;; the loop's preheader and its exit, relink those two edges, and delete the two
