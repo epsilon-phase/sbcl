@@ -258,8 +258,9 @@
     (setf (aref out i) (max -1000 (min 1000 (aref in i)))))
   :packed ("pminsw" "pmaxsw"))
 
-;;;; 11. signed-byte image clamp, same story with the biased unsigned
-;;;;     instructions, since SSE2 has no signed byte minimum.
+;;;; 11. signed-byte image clamp.  SSE2 has no signed byte minimum, so the
+;;;;     128-bit loop biases the lanes and uses the unsigned one; SSE4.1 and
+;;;;     AVX2 have PMINSB, so the evidence accepts either spelling.
 
 (define-kernel clamp-s8
     (out in n)
@@ -268,7 +269,7 @@
             (optimize (speed 3))))
   (dotimes (i n)
     (setf (aref out i) (min 100 (aref in i))))
-  :packed ("pminub" "pxor"))
+  :packed ("pminsb" "pminub" "pxor"))
 
 ;;;; 12. masking: a bitwise operation on n-bit values has an n-bit result, so
 ;;;;     this is exact too, and it vectorizes at the default policy.
