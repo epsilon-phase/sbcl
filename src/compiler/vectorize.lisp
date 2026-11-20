@@ -1023,6 +1023,84 @@ guard covers the reads as well as the writes."
     (vector-probe-loop (component-outer-loop component) 2)
     (format *error-output* "~&;~%")))
 
+;;; ------------------------------------------------- recognition, on IR1
+;;; The loop analysis in src/compiler/loop.lisp hands every natural loop a CLOOP with
+;;; its blocks, and by then the body has been macroexpanded, inline-expanded and
+;;; let-converted: an inlined helper is the arithmetic it does, and ARET is already
+;;; lowered to DATA-VECTOR-REF/SET-WITH-OFFSET.  These read that, so that what the
+;;; source pass takes from declarations is taken here from the compiler's own types.
+
+(defun vector-node-call-name (node)
+  "The name of what NODE calls, as a string, or NIL."
+  (let ((use (lvar-uses (combination-fun node))))
+    (when (ref-p use)
+      (let* ((leaf (ref-leaf use))
+             (name (typecase leaf
+                     (global-var (leaf-source-name leaf))
+                     (functional (functional-debug-name leaf))
+                     (t nil))))
+        (when name
+          (typecase name
+            (string name)
+            (symbol (symbol-name name))
+            (t (prin1-to-string name))))))))
+
+(defun vector-node-name-p (node name)
+  (let ((case (and (basic-combination-p node) (vector-node-call-name node))))
+    (and case (string= case name))))
+
+(defun vector-node-leaf-name (lvar)
+  "The name of the variable LVAR is a plain reference to, or NIL."
+  (let ((use (lvar-uses lvar)))
+    (when (ref-p use)
+      (let ((leaf (ref-leaf use)))
+        (and (lambda-var-p leaf) (leaf-source-name leaf))))))
+
+(defun vector-node-constant (lvar)
+  (let ((use (lvar-uses lvar)))
+    (when (ref-p use)
+      (let ((leaf (ref-leaf use)))
+        (when (constant-p leaf) (constant-value leaf))))))
+
+(defun vector-node-blocks (loop)
+  (do ((block (loop-blocks loop) (block-loop-next block))
+       (blocks '() (cons block blocks)))
+      ((null block) (nreverse blocks))))
+
+(defun vector-node-nodes (block)
+  (let ((nodes '()) (ctran (block-start block)))
+    (loop while ctran
+          for node = (ctran-next ctran)
+          while node
+          do (push node nodes)
+             (setf ctran (node-next node)))
+    (nreverse nodes)))
+
+;;; The value a store writes, as (:const V) / (:var NAME) / (:load ARRAY OFFSET TYPE)
+;;; / (:op NAME SUBTREES) - the same shapes the source pass builds from source forms,
+;;; read here from lvars instead.
+(defun vector-node-tree (lvar depth)
+  (when (> depth 8)
+    (return-from vector-node-tree nil))
+  (let ((use (lvar-uses lvar)))
+    (cond ((vector-node-constant lvar)
+           (list :const (vector-node-constant lvar)))
+          ((and (ref-p use) (lambda-var-p (ref-leaf use)))
+           (list :var (leaf-source-name (ref-leaf use))))
+          ((not (basic-combination-p use)) nil)
+          ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
+           (let* ((args (combination-args use))
+                  (array (vector-node-leaf-name (first args))))
+             (and array
+                  (list :load array (vector-node-constant (third args))
+                        (type-specifier (lvar-type (node-lvar use)))))))
+          (t (let ((op (vector-node-call-name use)))
+               (when (member op '("+" "-" "*" "/") :test #'string=)
+                 (let ((trees (mapcar (lambda (arg) (vector-node-tree arg (1+ depth)))
+                                      (combination-args use))))
+                   (and (every #'identity trees)
+                        (list :op op trees)))))))))
+
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
       (vector-expand-reduction-loop loop)
