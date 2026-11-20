@@ -1253,6 +1253,18 @@ function called with it - ARET's lowering passes the index through one."
               (unless (eql (vector-node-constant (third sargs)) 0)
                 (vector-node-fail (list :store-offset (vector-node-constant (third sargs)))))
               (unless tree (vector-node-fail :no-value-tree))
+              ;; -x on an unsigned lane has to wrap, and the emitter's negate does
+              ;; not: the scalar reference and the packed loop disagree (the harness
+              ;; catches it as a wrong value, which is how this was found)
+              ;; -x on an unsigned lane has to wrap; the emitter's negate does not,
+              ;; so the packed loop and the scalar reference disagree on the value
+              ;; (the harness found this the moment casts were looked through)
+              (when (and (consp tree) (eq (first tree) :op) (string= (second tree) "-")
+                         (= (length (third tree)) 1)
+                         (let ((et (type-specifier (lvar-type (fourth sargs)))))
+                           (and (consp et) (string= (symbol-name (first et))
+                                                    "UNSIGNED-BYTE"))))
+                (vector-node-fail :unary-minus-on-unsigned))
               (push (list (leaf-source-name array) (type-specifier (lvar-type (fourth sargs))) tree)
                     entries)))
           (unless (eql (vector-node-var-init index-var) 0)
