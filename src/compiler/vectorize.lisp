@@ -1073,15 +1073,22 @@ guard covers the reads as well as the writes."
 ;;; (:element-type SINGLE-FLOAT :index I :limit N
 ;;;  :stores ((C :op "+" ((:load A 0 SINGLE-FLOAT) (:load B 0 SINGLE-FLOAT)))))
 (defun vector-node-call-name (node)
-  (let ((use (lvar-uses (combination-fun node))))
-    (when (ref-p use)
-      (let* ((leaf (ref-leaf use))
-             (name (typecase leaf
-                     (global-var (leaf-source-name leaf))
-                     (functional (functional-debug-name leaf))
-                     (t nil))))
-        (when name (typecase name (string name) (symbol (symbol-name name))
-                                 (t (prin1-to-string name))))))))
+  ;; callers pass whatever they found in a block, and an INLINE-expanded AREF on a
+  ;; non-simple array is not a COMBINATION at all: not recognising it is the right
+  ;; answer, signalling is not
+  (when (basic-combination-p node)
+    (let ((use (lvar-uses (combination-fun node))))
+      (when (ref-p use)
+        (let* ((leaf (ref-leaf use))
+               (name (typecase leaf
+                       (global-var (leaf-source-name leaf))
+                       (functional (functional-debug-name leaf))
+                       (t nil))))
+          (when name
+            (typecase name
+              (string name)
+              (symbol (symbol-name name))
+              (t (prin1-to-string name)))))))))
 (defun vector-node-name-p (node name)
   (let ((n (and (basic-combination-p node) (vector-node-call-name node))))
     (and n (string= n name))))
