@@ -1068,7 +1068,7 @@ guard covers the reads as well as the writes."
                (dolist (inferior (loop-inferiors loop))
                  (when (walk inferior) (return-from walk t)))
                nil))
-      (walk (component-outer-loop component))))
+      (walk (component-outer-loop component)))))
 
 ;;; ------------------------------------------------- recognition, on IR1
 ;;; After LOOP-ANALYZE every natural loop is a CLOOP with its blocks, and by then the
