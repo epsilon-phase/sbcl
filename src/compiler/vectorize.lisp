@@ -1269,7 +1269,7 @@ function called with it - ARET's lowering passes the index through one."
                (middle (ctran-starts-block start))
                (after (ctran-starts-block next))
                (fun (ir1-convert-lambda `(lambda () ,(vector-node-source-form plan))
-                                        :debug-name 'vector-replacement))
+                                        :debug-name (debug-name 'vector-replacement nil)))
                (fun-lvar (make-lvar))
                (call-ctran (make-ctran)))
           (reference-leaf start call-ctran fun-lvar fun)
