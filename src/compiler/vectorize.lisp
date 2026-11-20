@@ -1051,7 +1051,9 @@ guard covers the reads as well as the writes."
     (labels ((walk (loop)
                (when (eq (loop-kind loop) :natural)
                  (let ((plan (vector-node-plan loop)))
-                   (when (and plan (not (stringp plan)))
+                   ;; VECTOR-NODE-PLAN returns a plan plist or a failure reason,
+                   ;; and reasons are keywords as often as lists
+                   (when (and (consp plan) (getf plan :element-type))
                      (when (vector-node-splice-loop loop plan)
                        (setf (gethash component *vector-node-spliced*) t)
                        (return-from walk t)))))
