@@ -141,3 +141,37 @@ Which leaves the option the note started with: build the lambda with
 IR1-CONVERT-LAMBDA and splice a DIRECT LOCAL CALL, so no LABELS/FUNCALL form is
 converted in a live component at all.  That is the next thing to try; everything
 else in attempt 2 (declared parameters, fresh lambda, ENTRY bookkeeping) can stay.
+
+Attempt 4: the emission form is not the cause
+---------------------------------------------
+
+Three emission variants were tried and all three hit the same throw in
+src/code/weak.lisp:
+
+  (LABELS ((f (arrays limit) (declare types) (dotimes ...))) (f ...))
+  (FUNCALL (LAMBDA (arrays limit) (declare types) (dotimes ...)) ...)
+  (LET ((f (LAMBDA ...))) (FUNCALL f ...))
+
+and in all three the differential harness still packs 50 of 54 shapes with correct
+values and the inlined-call shape still vectorizes, so the wrapper is not costing
+anything else.  The throw therefore does not come from the block/tagbody of the
+form we emit, which was the working hypothesis.
+
+Next diagnostic, and it is the only one left that cannot corrupt the component:
+print at the two THROW sites instead of catching it.  In
+ir1-translators.lisp, before (throw 'locall-already-let-converted ...) at :231
+(RETURN-FROM, the block's deleted exit ctran) and :335 (GO, the tagbody's deleted
+tag ctran), print the ctran, its block number, whether that block is in
+COMPONENT-DELETE-BLOCKS, and the ctran's next/prev node.  Then a self-build with the
+pass on names the construct without leaving a half-converted component behind, and
+with the form we emit already excluded, the answer is about the loop that is being
+replaced rather than about its replacement.
+
+A thought worth testing at the same time: the loop being spliced in MAKE-WEAK-VECTOR
+is (dotimes (i length) (setf (weak-vector-ref v i) (elt initial-contents i))) --
+WEAK-VECTOR-REF and ELT are both inline/transform expanded, so the nodes the
+recogniser sees come from a transform, and a transform's lambda is exactly the kind
+of functional that LET conversion can retire while other code still refers to its
+tags.  If that is the mechanism, the pass must refuse any loop whose body contains a
+node produced by a source transform (which the accounting check could identify: the
+no-lvar :LOCAL call whose callee is bound inside the region).
