@@ -1144,11 +1144,6 @@ guard covers the reads as well as the writes."
 ;;;
 ;;; (:element-type SINGLE-FLOAT :index I :limit N
 ;;;  :stores ((C :op "+" ((:load A 0 SINGLE-FLOAT) (:load B 0 SINGLE-FLOAT)))))
-;;; why a shape declined, for the differential harness to report: the recogniser's
-;;; answers are only useful if the reasons are visible.  Defined above the readers
-;;; that push to it, because make-host-2 treats a forward reference as fatal.
-(defvar *vector-node-refusals* nil)
-
 ;;; FIXME: FLUSHABLE-COMBINATION-P is in ir1util.lisp, which this file precedes in
 ;;; build-order, so the reference is forward.  The node pass belongs in a file
 ;;; after ir1util/loop/dfo; until it moves, the type is declared here.
@@ -1229,9 +1224,7 @@ function called with it - ARET's lowering passes the index through one."
     (let* ((pos (position var (lambda-vars home)))
            (value (and pos (vector-node-constant (nth pos (combination-args call))))))
       (unless value
-        (push (list :var-init :home (and home t) :call (and call t) :pos pos
-                    :value value :args (length (combination-args call)))
-              *vector-node-refusals*))
+        )
       value)))
 
 (defun vector-node-tree (lvar depth index-var)
@@ -1246,8 +1239,7 @@ function called with it - ARET's lowering passes the index through one."
           ;; re-derives that from the array's element type
           ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var))
           ((not (basic-combination-p use))
-           (push (list :tree-use (type-of use) (type-specifier (lvar-type lvar)))
-                 *vector-node-refusals*)
+           
            nil)
           ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
            (let* ((args (combination-args use))
@@ -1255,13 +1247,7 @@ function called with it - ARET's lowering passes the index through one."
              (unless (and array
                           (eql (vector-node-constant (third args)) 0)
                           (vector-node-index-p (second args) index-var 0))
-               (push (list :load-stop
-                           (and array t)
-                           (vector-node-constant (third args))
-                           (let ((v (vector-node-leaf-var (second args))))
-                             (and v (leaf-source-name v)))
-                           (vector-node-constant (second args)))
-                     *vector-node-refusals*))
+               )
              (and array
                   (eql (vector-node-constant (third args)) 0)
                   (vector-node-index-p (second args) index-var 0)
@@ -1278,8 +1264,7 @@ function called with it - ARET's lowering passes the index through one."
            (vector-node-tree (first (combination-args use)) (1+ depth) index-var))
           (t (let ((op (vector-node-call-name use)))
                (unless (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
-                 (push (list :tree-op op (type-specifier (lvar-type lvar)))
-                       *vector-node-refusals*))
+                 )
                (when (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
                                       (combination-args use))))
@@ -1287,9 +1272,11 @@ function called with it - ARET's lowering passes the index through one."
                         (list :op (if (string= op "%NEGATE") "-" op) trees)))))))))
 
 ;;; the whole loop, if it is one this pass understands
+;;; VECTOR-NODE-PLAN answers with a plan plist or with a reason; the reason is what
+;;; names the rule that refused a shape when a probe is printed, and it is how every
+;;; rule in this pass was found.
 (defmacro vector-node-fail (reason)
-  `(progn (push ,reason *vector-node-refusals*)
-          (return-from vector-node-plan ,reason)))
+  `(return-from vector-node-plan ,reason))
 (defun vector-node-redundant-call-p (node blocks)
   "True when NODE is a call whose value is unused and whose callee is bound inside
 BLOCKS.  TRANSFORM-CALL leaves such a node behind for every source-transformed
