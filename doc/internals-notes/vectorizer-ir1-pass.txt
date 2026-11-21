@@ -232,3 +232,54 @@ SB-C::*VECTOR-NODE-SPLICE* at run time, and compile a lambda with the shape from
 MAKE-WEAK-VECTOR (two DOTIMES in the two branches of an IF, inside a LET that binds
 the destination).  That reproduces in seconds instead of two minutes and gives a
 backtrace.
+
+Option 1 in detail: what building the replacement as IR1 means
+---------------------------------------------------------------
+
+Everything the source pass does after recognition is in VECTOR-EXPAND-ELEMENTWISE-LOOP
+(vectorize.lisp): guards, the 256/128 dispatch, the scalar tail, the alias check, and the
+non-simple-array hoisting.  Option 1 does not reimplement that logic; it emits the SAME
+constructs as IR1 nodes instead of as forms, so the logic stays where it is and only the
+materialiser changes.
+
+Order of work, smallest first:
+
+1. Read VECTOR-EMIT-ELEMENTWISE and list the forms it produces: a LET that binds the data
+   vectors and the count, an IF on the guard, the packed LOOP, and the scalar tail LOOP.
+   Each of those has a direct IR1 analogue, and the template to copy is
+   INSERT-CLEANUP-CODE (ir1util.lisp), which builds blocks and nodes in the middle of a
+   component and is the one place in SBCL that does this on purpose.
+
+2. Build the block chain first, with no nodes: preheader -> guard block -> {wide, narrow,
+   tail, done}.  MAKE-CTRAN, CTRAN-STARTS-BLOCK, LINK-BLOCKS and UNLINK-BLOCKS are all
+   available; the parts that bit us are that BLOCK-START must not be left nil on a block
+   that something will join to (JOIN-SUCCESSOR-IF-POSSIBLE dies on it, ir1opt.lisp:519 ->
+   ir1util.lisp:1897), and that deleting the loop's blocks must go through the DFO sweep,
+   not DELETE-BLOCK.
+
+3. Fill the packed loop body with VOPs, not forms: a VOP node per primitive the emitter
+   would have called (%VEC-LOAD-*, %VEC-ADD-*, %VEC-STORE-*, the splat, the ramp).  This is
+   the part that is genuinely new work and the part most likely to be wrong, because the
+   primitive table's TYPE the emitter handles (SIMD-PACK types, the 128/256 split) has to
+   be threaded through by hand.
+
+4. The scalar tail can stay a form: it is plain scalar code with no vector constructs, so
+   converting it with IR1-CONVERT into its own block is safe and is what the pass does
+   today for the whole loop.
+
+5. The guard needs the array bounds and the count, which are LVARs the recogniser already
+   has; the alias check needs the arrays' leaves.
+
+Two cheaper things worth doing BEFORE step 3, because they shrink it:
+
+- option 3 (share the VLOOP): build the (DEFSTRUCT VECTOR-LOOP) the source pass uses and
+  read the element type, index, count, stores and expressions out of it instead of the
+  plan plist.  That deletes VECTOR-NODE-SOURCE-FORM and the second set of shape rules.
+- keep a form-based fallback: build the skeleton in IR1 (steps 1, 2, 4, 5) and convert the
+  packed body as a form into its block.  That gets the structural fix -- no conversion in
+  the live component's own flow -- without writing step 3 at all, and it is worth trying
+  first precisely because every failure so far has been structural, not arithmetic.
+
+That last option is the one this session's evidence points at: convert the *packed body*
+into a block of its own, constructed by hand, rather than converting the whole replacement
+into the loop's place.  If it works it is option 1's benefit for a fraction of its cost.
