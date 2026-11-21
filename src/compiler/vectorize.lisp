@@ -972,7 +972,7 @@ guard covers the reads as well as the writes."
 ;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
 ;;; only exists after inlining, which the source pass cannot see, but converting
 ;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
-(defvar *vector-node-splice* nil
+(defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1601,6 +1601,12 @@ cleanup."
       ;; (envanal.lisp:200-225 runs later).  BLOCK-HOME-LAMBDA on an empty
       ;; block would read (block-last block) = nil (ir1util.lisp:1437-1439),
       ;; hence BLOCK-HOME-LAMBDA-OR-NULL (ir1util.lisp:1405-1433).
+      ;; the replacement is converted INTO EXIT's start ctran, so if that ctran has
+      ;; been deleted (a merge upstream of the loop retired it) the emitted lambda's
+      ;; return throws LOCALL-ALREADY-LET-CONVERTED out of RETURN-FROM
+      ;; (ir1-translators.lisp:231).  Decline rather than guess.
+      (when (ctran-deleted-p exit-ctran)
+        (return-from vector-node-splice-loop nil))
       (unless (and head-home exit-ctran
                    (eq exit-home head-home)
                    (or (null (block-last preheader))   ; the component head
