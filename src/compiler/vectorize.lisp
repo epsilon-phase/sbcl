@@ -1509,20 +1509,20 @@ increment and the stores gives the set of nodes the replacement reproduces."
     (t acc)))
 
 (defun vector-node-source-form (plan)
-  "The loop the plan describes, as a call to a fresh local function.
+  "The loop the plan describes, as a call to a fresh function.
 
-The replacement is converted in place, and a bare DOTIMES there registers its
-ENTRY nodes on the lambda that surrounds the loop, which in-place conversion does
-not reconcile with the LET merges that follow: see
+The replacement is converted in place, and a bare DOTIMES there registers its ENTRY
+nodes on the lambda that surrounds the loop, which in-place conversion does not
+reconcile with the LET merges that follow: see
 doc/internals-notes/vectorizer-ir1-pass.txt.  A function of its own makes the
 conversion top-down into a fresh lambda, the shape IR1 expects.
 
-LABELS rather than (FUNCALL (LAMBDA ...)): the latter is let-converted while it is
-being converted, and DOTIMES contains a BLOCK whose RETURN then targets the ctran
-that let-conversion deleted, which surfaces as a THROW to
-SB-C::LOCALL-ALREADY-LET-CONVERTED and an abort.  A local function is analysed by
-LOCALL-ANALYZE-COMPONENT after its body is converted, which is the order IR1
-expects, and it can be inlined back into the caller.
+The lambda is bound to a variable before it is called.  A direct
+(FUNCALL (LAMBDA ...) ...) is let-converted WHILE it is being converted, and then
+DOTIMES' BLOCK and TAGBODY refer to ctrans that let-conversion deleted, which
+surfaces as a THROW to SB-C::LOCALL-ALREADY-LET-CONVERTED out of RETURN-FROM
+(ir1-translators.lisp:231) or GO (:335).  Bound first, the body is converted while
+the function is still fresh, and LOCAL call analysis may inline it back later.
 
 The parameters are declared because a fresh lambda's variables have no types of
 their own and the source-form pass reads the array types from declarations; the
@@ -1534,15 +1534,15 @@ inherit."
          (function (make-symbol "VN-VLOOP"))
          (index (make-symbol "VN-I"))
          (limit (make-symbol "VN-N")))
-    `(labels ((,function (,@names ,limit)
-                (declare (type (simple-array ,type (*)) ,@names)
-                         (type fixnum ,limit))
-                (dotimes (,index ,limit)
-                  ,@(mapcar (lambda (store)
-                              `(setf (aref ,(car store) ,index)
-                                     ,(vector-node-print-tree (cdr store) nil index)))
-                            stores))))
-       (,function ,@names ,(getf plan :limit)))))
+    `(let ((,function (lambda (,@names ,limit)
+                        (declare (type (simple-array ,type (*)) ,@names)
+                                 (type fixnum ,limit))
+                        (dotimes (,index ,limit)
+                          ,@(mapcar (lambda (store)
+                                      `(setf (aref ,(car store) ,index)
+                                             ,(vector-node-print-tree (cdr store) nil index)))
+                                    stores)))))
+       (funcall ,function ,@names ,(getf plan :limit)))))
 
 
 ;;; Put the replacement where the loop was: convert it into a fresh block between
