@@ -2995,10 +2995,7 @@ loops the pass puts in one function: the build no longer has to know."
   (flet ((packed-p (splice)
            (let ((text (string-downcase
                         (with-output-to-string (stream)
-                          ;; the refusals list is diagnostic state the pass
-                          ;; accumulates; bind it so the test leaves no trace
-                          (let ((sb-c::*vector-node-splice* splice)
-                                (sb-c::*vector-node-refusals* nil))
+                          (let ((sb-c::*vector-node-splice* splice))
                             (disassemble
                              (compile nil
                                       '(lambda (a b c n)

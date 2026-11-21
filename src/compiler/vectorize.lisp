@@ -1239,7 +1239,7 @@ function called with it - ARET's lowering passes the index through one."
           ;; re-derives that from the array's element type
           ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var))
           ((not (basic-combination-p use))
-           
+
            nil)
           ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
            (let* ((args (combination-args use))
