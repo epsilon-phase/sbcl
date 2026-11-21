@@ -1658,7 +1658,7 @@ cleanup."
                           "~&; vectorizer: splice of ~a threw locall-already-let-converted~%"
                           (getf plan :element-type))
                   (sb-debug:print-backtrace :stream *error-output* :count 24)
-                  (return-from vector-node-splice-loop nil)))))
+                  (return-from vector-node-splice-loop nil))))
             ;; rewire the entry and leave the deletion to the pipeline.  Do not
             ;; call DELETE-BLOCK on the loop's blocks by hand: DELETE-LAMBDA
             ;; deliberately leaves a deleted lambda's blocks queued
