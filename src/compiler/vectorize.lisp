@@ -1653,11 +1653,15 @@ cleanup."
                       (catch 'locall-already-let-converted
                         (ir1-convert start exit-ctran nil (vector-node-source-form plan))
                         t)))
-                (unless spliced
+                ;; the tag maps to the ctran the translator found deleted, which is
+                ;; the only handle on where this comes from in a build log
+                (unless (eq spliced t)
                   (format *error-output*
-                          "~&; vectorizer: splice of ~a threw locall-already-let-converted~%"
-                          (getf plan :element-type))
-                  (sb-debug:print-backtrace :stream *error-output* :count 24)
+                          "~&; vectorizer: splice of ~a declined: deleted ctran ~s~@[ in block b~a~], next ~s, loop blocks ~a~%"
+                          (getf plan :element-type) spliced
+                          (and (ctran-block spliced) (block-number (ctran-block spliced)))
+                          (ignore-errors (ctran-next spliced))
+                          (mapcar #'block-number blocks))
                   (return-from vector-node-splice-loop nil))))
             ;; rewire the entry and leave the deletion to the pipeline.  Do not
             ;; call DELETE-BLOCK on the loop's blocks by hand: DELETE-LAMBDA
