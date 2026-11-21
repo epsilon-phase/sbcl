@@ -175,3 +175,33 @@ of functional that LET conversion can retire while other code still refers to it
 tags.  If that is the mechanism, the pass must refuse any loop whose body contains a
 node produced by a source transform (which the accounting check could identify: the
 no-lvar :LOCAL call whose callee is bound inside the region).
+
+Attempt 5: the throw site, found by instrumenting and getting nothing
+--------------------------------------------------------------------
+
+Prints added at the two THROW sites in ir1-translators.lisp (RETURN-FROM :231, GO
+:335) produced no output while the weak.lisp compile still aborted, so the throw
+comes from one of the other throwers.  It is IR1-CONVERT-LOCAL-COMBINATION
+(ir1tran.lisp:1255-1257): converting a call to a function that has ALREADY been
+let-converted throws, unless the function has an inline expansion to fall back on.
+
+That explains all four emission variants at once.  LABELS, (FUNCALL (LAMBDA ...)),
+and a LET-bound lambda all emit a CALL TO A LOCAL FUNCTION, and SBCL let-converts a
+local function eagerly when it is called with suitable policy, so by the time the
+call is converted the functional is :LET and the throw is unconditional.
+
+So: a wrapper is the wrong shape.  The options left are
+
+  (a) the bare DOTIMES (what the pass emits now) and repair the ENTRY bookkeeping
+      afterwards.  A first attempt at that -- walking the new block and doing
+      (PUSHNEW entry (LAMBDA-ENTRIES (NODE-HOME-LAMBDA entry))) -- aborted the
+      weak.lisp compile with "The value NIL is not of type SB-C::CTRAN", so the walk
+      over the freshly converted block needs care: the block's ctran chain is not
+      in the state DO-NODES expects until the conversion's block is linked.
+  (b) IR1-CONVERT-LAMBDA plus a call node built by hand (not converted from a form),
+      and only after the functional is known not to be let-converted.  This avoids
+      the form-conversion path entirely but has to build the combination and its
+      arguments itself.
+
+Option (a) is closer: the ENTRY repair is a few lines once the walk is right, and it
+is the same fix-up MERGE-LETS performs (locall.lisp:1130-1140).
