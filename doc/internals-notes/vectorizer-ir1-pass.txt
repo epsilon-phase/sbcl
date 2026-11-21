@@ -118,3 +118,26 @@ converting a LABELS form, are the two next things to try.
 So option 2 is one step from working and one hurdle from working: the ENTRY problem
 is gone, the new problem is a conversion-destination problem, in the splice rather
 than in the emitted form.
+
+Attempt 3, and the trap to avoid
+--------------------------------
+
+Catching the throw is not a way out.  Catching 'LOCALL-ALREADY-LET-CONVERTED around
+the IR1-CONVERT of the replacement and declining leaves the component half
+converted, and the next error is
+  The value #<SB-C::LAMBDA-VAR ... :FLAGS (DELETED)> is not of type SB-C::CTRAN.
+The throw must be prevented, not caught: the offending form has to be recognized
+and refused before any conversion happens.
+
+What the throw actually is, now that it has been read twice: GO throws when the
+TAGBODY tag's ctran has been deleted (ir1-translators.lisp:335-336) and RETURN-FROM
+when the BLOCK's exit ctran has (ir1-translators.lisp:231-232).  Both mean the
+enclosing construct was let-converted out from under the code being converted.  A
+LABELS body converted in place can hit this because the local function is
+let-converted while its own body is still being converted -- SBCL only protects the
+two places that expect it (locall.lisp:488, ir1tran-lambda.lisp:892).
+
+Which leaves the option the note started with: build the lambda with
+IR1-CONVERT-LAMBDA and splice a DIRECT LOCAL CALL, so no LABELS/FUNCALL form is
+converted in a live component at all.  That is the next thing to try; everything
+else in attempt 2 (declared parameters, fresh lambda, ENTRY bookkeeping) can stay.

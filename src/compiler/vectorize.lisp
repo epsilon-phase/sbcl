@@ -972,7 +972,7 @@ guard covers the reads as well as the writes."
 ;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
 ;;; only exists after inlining, which the source pass cannot see, but converting
 ;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
-(defvar *vector-node-splice* t
+(defvar *vector-node-splice* nil
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1648,21 +1648,10 @@ cleanup."
             ;; continuation block would crash JOIN-SUCCESSOR-IF-POSSIBLE on its
             ;; nil BLOCK-START-NODE (ir1opt.lisp:519 -> ir1util.lisp:1897,
             ;; block-start-node ir1util.lisp:931-933).
+            ;; the form we splice in is a LABELS for the emitter, so the source pass
+            ;; has to be on while it is converted or the replacement runs scalar
             (let ((*auto-vectorize* t))
-              (let ((spliced
-                      (catch 'locall-already-let-converted
-                        (ir1-convert start exit-ctran nil (vector-node-source-form plan))
-                        t)))
-                ;; the tag maps to the ctran the translator found deleted, which is
-                ;; the only handle on where this comes from in a build log
-                (unless (eq spliced t)
-                  (format *error-output*
-                          "~&; vectorizer: splice of ~a declined: deleted ctran ~s~@[ in block b~a~], next ~s, loop blocks ~a~%"
-                          (getf plan :element-type) spliced
-                          (and (ctran-block spliced) (block-number (ctran-block spliced)))
-                          (ignore-errors (ctran-next spliced))
-                          (mapcar #'block-number blocks))
-                  (return-from vector-node-splice-loop nil))))
+              (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
             ;; rewire the entry and leave the deletion to the pipeline.  Do not
             ;; call DELETE-BLOCK on the loop's blocks by hand: DELETE-LAMBDA
             ;; deliberately leaves a deleted lambda's blocks queued
