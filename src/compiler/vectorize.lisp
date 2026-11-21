@@ -14,29 +14,25 @@
 ;;;; converts like any other.  It is on by default; *AUTO-VECTORIZE* turns it off
 ;;;; and the manual's "Automatic Vectorization" node documents it.
 ;;;;
-;;;; The second pass is a demonstration, and is off: *VECTOR-NODE-SPLICE* is NIL and
-;;;; should stay NIL until the blocker below is fixed.  It recognizes a loop on IR1
-;;;; after LOOP-ANALYZE, so it can see arithmetic that exists only after inlining (a
-;;;; DECLAIM INLINE helper called in the body), which the source pass cannot see.
-;;;; It reads the loop into a plan, prints the plan back as a DOTIMES, and lets the
+;;;; The second pass, *VECTOR-NODE-SPLICE*, recognizes a loop on IR1 after
+;;;; LOOP-ANALYZE, so it can see arithmetic that exists only after inlining (a
+;;;; DECLAIM INLINE helper called in the body), which the source pass cannot.  It
+;;;; reads the loop into a plan, prints the plan back as a DOTIMES, and lets the
 ;;;; source pass rewrite that -- it adds a recognizer, not an emitter.
 ;;;;
-;;;; The blocker: the replacement is converted in place, inside a live component, and
-;;;; IR1 registers an ENTRY on (LEXENV-LAMBDA *LEXENV*) at creation
-;;;; (ir1-translators.lisp:199-208) while everything else finds it through
-;;;; (NODE-HOME-LAMBDA ...) (ir1util.lisp:1382-1389), which walks out of a :DELETED or
-;;;; :ZOMBIE lambda.  A LET merge or a LET-converted transform between the two leaves
-;;;; an ENTRY registered with one lambda and found through another; a self-build with
-;;;; the pass on stops in MAKE-WEAK-VECTOR with "ENTRY is not in ENTRIES for its home
-;;;; LAMBDA", and ENVIRONMENT-ANALYZE (envanal.lisp:277) would lose that entry's
-;;;; cleanup.  *VECTOR-NODE-CHECK-ENTRIES* asserts it at the splice.
+;;;; It is still off, and the reason is no longer structural.  doc/internals-notes/
+;;;; vectorizer-ir1-pass.txt records five attempts that blamed the conversion of
+;;;; the replacement in place for IR1's ENTRY bookkeeping; a working entry check
+;;;; (walk every live block after LOCALL) reports no mismatch at all, over the 54
+;;;; shapes of tests/auto-vectorize-differential.pure.lisp.  What actually failed
+;;;; was the plan: it accepted a loop over SIMPLE-VECTOR, whose element type is T,
+;;;; printed a DOTIMES the source pass declines to rewrite, and so replaced two
+;;;; loops in MAKE-WEAK-VECTOR with themselves.  The plan now refuses an element
+;;;; type the backend publishes no load and store for.
 ;;;;
-;;;; doc/internals-notes/vectorizer-ir1-pass.txt records the blocker in full, the two
-;;;; deletion rules the splice must follow, and the three routes to finishing it.
-;;;;
-;;;; The differential harness that measures both passes (54 shapes, both dispatch
-;;;; paths, a scalar reference) is not in this tree yet; until it is, the numbers in
-;;;; the commit messages are not reproducible from the branch.
+;;;; What is left before it can be on: the differential test measures 50 of 54
+;;;; shapes packed through this pass alone, and a switch-on self-build has to
+;;;; stay up on every file.
 
 (in-package "SB-C")
 
@@ -1463,6 +1459,22 @@ increment and the stores gives the set of nodes the replacement reproduces."
                 (vector-node-fail (list :endangers (vector-probe-node node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
+          ;; the element type has to be one this backend can load and store a
+          ;; pack of, and every store has to agree: the emitter reads ONE element
+          ;; type for the whole loop (VLOOP holds one), and the splice takes it
+          ;; from the first store.  Without this the pass plans a loop over
+          ;; SIMPLE-VECTOR -- whose element type is T -- prints a DOTIMES the
+          ;; source pass then declines to rewrite, and has replaced a loop with
+          ;; itself: two such loops in MAKE-WEAK-VECTOR were the first thing a
+          ;; switch-on self-build spliced.
+          (let ((*vector-lane-bytes* 16)
+                (element-type (second (first entries))))
+            (unless (every (lambda (entry) (equal (second entry) element-type)) entries)
+              (vector-node-fail (list :mixed-element-types
+                                      (mapcar #'second entries))))
+            (unless (and (vector-primitive "LOAD" element-type)
+                         (vector-primitive "STORE" element-type))
+              (vector-node-fail (list :no-lane-for element-type))))
           (list :element-type (second (first entries))
                 :index (leaf-source-name index-var)
                 ;; the limit has to be a name or a literal: an expression would
@@ -1496,40 +1508,34 @@ increment and the stores gives the set of nodes the replacement reproduces."
     (t acc)))
 
 (defun vector-node-source-form (plan)
-  "The loop the plan describes, as a call to a fresh function.
+  "The loop the plan describes, as the DOTIMES the source-form pass rewrites.
 
-The replacement is converted in place, and a bare DOTIMES there registers its ENTRY
-nodes on the lambda that surrounds the loop, which in-place conversion does not
-reconcile with the LET merges that follow: see
-doc/internals-notes/vectorizer-ir1-pass.txt.  A function of its own makes the
-conversion top-down into a fresh lambda, the shape IR1 expects.
+  It is the loop and nothing else.  The arrays carry their element types as THE
+  casts, because the recogniser read them from LVAR-TYPE and the scope the loop
+  sits in may declare none of them; the index and the count are bound by the
+  DOTIMES, so nothing in the form refers to a binding of the loop it replaces.
 
-The lambda is bound to a variable before it is called.  A direct
-(FUNCALL (LAMBDA ...) ...) is let-converted WHILE it is being converted, and then
-DOTIMES' BLOCK and TAGBODY refer to ctrans that let-conversion deleted, which
-surfaces as a THROW to SB-C::LOCALL-ALREADY-LET-CONVERTED out of RETURN-FROM
-(ir1-translators.lisp:231) or GO (:335).  Bound first, the body is converted while
-the function is still fresh, and LOCAL call analysis may inline it back later.
-
-The parameters are declared because a fresh lambda's variables have no types of
-their own and the source-form pass reads the array types from declarations; the
-recogniser took them from the original lexenv, which the new lambda does not
-inherit."
+  An earlier version wrapped this in a fresh local function and called it, to
+  hand IR1 a top-down conversion.  A call to a local function is exactly what
+  IR1-CONVERT-LOCAL-COMBINATION refuses once the callee has been LET converted
+  (ir1tran.lisp:1255-1262), and that is what aborted a switch-on self-build in
+  src/code/weak.lisp.  The wrapper is not needed: the loop is converted into a
+  block of its own (VECTOR-NODE-SPLICE-LOOP), which is the shape IR1 expects,
+  and the note in doc/internals-notes records what the wrapper was for."
   (let* ((stores (getf plan :stores))          ; (array-name . value-tree) pairs
-         (names (remove-duplicates (mapcar #'car stores) :test #'equal))
          (type (getf plan :element-type))
-         (function (make-symbol "VN-VLOOP"))
+         (array-type `(simple-array ,type (*)))
          (index (make-symbol "VN-I"))
-         (limit (make-symbol "VN-N")))
-    `(let ((,function (lambda (,@names ,limit)
-                        (declare (type (simple-array ,type (*)) ,@names)
-                                 (type fixnum ,limit))
-                        (dotimes (,index ,limit)
-                          ,@(mapcar (lambda (store)
-                                      `(setf (aref ,(car store) ,index)
-                                             ,(vector-node-print-tree (cdr store) nil index)))
-                                    stores)))))
-       (funcall ,function ,@names ,(getf plan :limit)))))
+         ;; every reference to an array says what it holds: a load's value type and
+         ;; the store's element type both come from here, not from the scope
+         (subst (mapcar (lambda (store)
+                          (cons (car store) `(the ,array-type ,(car store))))
+                        stores)))
+    `(dotimes (,index ,(getf plan :limit))
+       ,@(mapcar (lambda (store)
+                   `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
+                          ,(vector-node-print-tree (cdr store) subst index)))
+                 stores))))
 
 
 ;;; Put the replacement where the loop was: convert it into a fresh block between
@@ -1545,6 +1551,10 @@ inherit."
 (defvar *vector-node-check-entries* nil
   "When true, assert at the splice that every live ENTRY is listed by its home lambda.")
 
+;;; When true, report each loop the splice replaces, with the form it converts.
+(defvar *vector-node-trace* nil
+  "When true, print the component and the form of every splice.")
+
 (defun check-entries-after-splice (component)
   "Report an ENTRY that its home lambda does not list.
 
@@ -1556,10 +1566,14 @@ entry created inside a lambda that a LET merge or a transform later detached is
 registered with one lambda and found through another.  ENVIRONMENT-ANALYZE
 iterates LAMBDA-ENTRIES (envanal.lisp:277), so a mismatch loses that entry's
 cleanup."
-  ;; the component's blocks are a chain from its head, not a slot
+  ;; the component's blocks are a chain from its head, not a slot.  The head and
+  ;; tail blocks have no start ctran, and DO-NODES begins with (CTRAN-NEXT
+  ;; (BLOCK-START block)): walking them signals "The value NIL is not of type
+  ;; SB-C::CTRAN", which is what a first version of this checker reported instead
+  ;; of any stale entry.
   (do ((block (component-head component) (block-next block)))
       ((null block))
-    (unless (block-delete-p block)
+    (unless (or (block-delete-p block) (null (block-start block)))
       (do-nodes (node nil block)
         (when (typep node 'entry)
           (let ((home (node-home-lambda node)))
@@ -1589,9 +1603,8 @@ cleanup."
       ;; block would read (block-last block) = nil (ir1util.lisp:1437-1439),
       ;; hence BLOCK-HOME-LAMBDA-OR-NULL (ir1util.lisp:1405-1433).
       ;; the replacement is converted INTO EXIT's start ctran, so if that ctran has
-      ;; been deleted (a merge upstream of the loop retired it) the emitted lambda's
-      ;; return throws LOCALL-ALREADY-LET-CONVERTED out of RETURN-FROM
-      ;; (ir1-translators.lisp:231).  Decline rather than guess.
+      ;; been deleted (a merge upstream of the loop retired it) RETURN-FROM would
+      ;; throw LOCALL-ALREADY-LET-CONVERTED (ir1-translators.lisp:231).  Decline.
       (when (ctran-deleted-p exit-ctran)
         (return-from vector-node-splice-loop nil))
       (unless (and head-home exit-ctran
@@ -1609,34 +1622,40 @@ cleanup."
       ;; loop would inherit cleanups of code that is about to be deleted
       ;; (merge-lets stores this lexenv as the call's LAMBDA-CALL-LEXENV,
       ;; locall.lisp:1081, and node-enclosing-cleanup walks it, ir1util.lisp:23).
+      ;;
+      ;; The lexenv is the anchor's, unchanged: it is the scope the loop runs in,
+      ;; and the ENTRY nodes the emitted DOTIMES creates must be registered
+      ;; against the same lambda its blocks resolve to.  Both come from this one
+      ;; lexenv -- registration from (LEXENV-LAMBDA *LEXENV*)
+      ;; (ir1-translators.lisp:201, 296, 298), home from (NODE-HOME-LAMBDA ...)
+      ;; (ir1util.lisp:1377-1389) -- so a merge that retires that lambda fixes
+      ;; both at once, which is what MERGE-LETS does (locall.lisp:1130-1140).
+      (when *vector-node-trace*
+        (format *error-output* "~&; splice in ~a: ~a block~:p, plan ~s~%;;  form ~s~%"
+                (component-name component) (length blocks) plan
+                (vector-node-source-form plan)))
       (let ((anchor (or (let ((cleanup (and (block-last head)
                                             (lexenv-cleanup (node-lexenv (block-last head))))))
                           (and cleanup (cleanup-mess-up cleanup)))
                         (block-last preheader)
                         (lambda-bind head-home))))
         (with-ir1-environment-from-node anchor
+          ;; Build the replacement's block by hand and convert the form into it.
+          ;; WRAP-PREDICATE (ir1tran.lisp:1200-1221) is the model: MAKE-CTRAN,
+          ;; CTRAN-STARTS-BLOCK, IR1-CONVERT, then LINK-BLOCKS.  Nothing is
+          ;; converted into a live block: the form starts at a ctran this block
+          ;; owns and continues into EXIT's start ctran, which is where any
+          ;; conversion continuing into an existing block delivers.  That leaves
+          ;; EXIT's own start ctran and BLOCK-LAST untouched, which is the whole
+          ;; reason the replacement gets a block of its own: JOIN-SUCCESSOR-IF-
+          ;; POSSIBLE and the LET merges of the next round both read the block
+          ;; they are joining, and a conversion that put its nodes in the middle
+          ;; of EXIT would leave them reading code that is about to be deleted.
           (let* ((start (make-ctran))
                  (middle (ctran-starts-block start)))
-            ;; Convert the replacement IN PLACE, in the loop's own lexical
-            ;; environment.  The emitted form is (LET ((VN-A (THE ... A)) ...)
-            ;; (DOTIMES ...)): the LET translator converts the binding values --
-            ;; the casts -- right here, where the loop's variables are bound,
-            ;; and moves the dotimes into a fresh lambda that it also calls,
-            ;; pushing the lambda on COMPONENT-NEW-FUNCTIONALS
-            ;; (ir1-translators.lisp:898-911; ir1tran-lambda.lisp:301-302).
-            ;; Converting `(lambda () ,form) directly loses the loop's
-            ;; variables: the body is converted in a fresh lexenv that binds
-            ;; only the lambda's own vars (ir1tran-lambda.lisp:256-258), so
-            ;; the original names arrive as free symbols.  The conversion goes
-            ;; through the vectorize-form hook like any other form
-            ;; (ir1tran.lisp:641-652).
-            ;;
-            ;; The form is delivered straight into EXIT's block: an extra empty
-            ;; continuation block would crash JOIN-SUCCESSOR-IF-POSSIBLE on its
-            ;; nil BLOCK-START-NODE (ir1opt.lisp:519 -> ir1util.lisp:1897,
-            ;; block-start-node ir1util.lisp:931-933).
-            ;; the form we splice in is a LABELS for the emitter, so the source pass
-            ;; has to be on while it is converted or the replacement runs scalar
+            ;; the emitted DOTIMES is what the source-form pass rewrites into the
+            ;; packed loop, so that pass has to be on while it is converted: this
+            ;; one recognizes a loop and emits one, it does not emit packs.
             (let ((*auto-vectorize* t))
               (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
             ;; rewire the entry and leave the deletion to the pipeline.  Do not
@@ -1648,45 +1667,32 @@ cleanup."
             ;; and MARK-FOR-DELETION stops walking predecessors at one.
             (unlink-blocks preheader head)
             (link-blocks preheader middle)
-            ;; Do NOT sweep here.  The replacement's own functionals are queued in
-            ;; COMPONENT-NEW-FUNCTIONALS and only become reachable once
-            ;; LOCALL-ANALYZE-COMPONENT runs, which happens after this: a sweep now
-            ;; can delete the replacement as unreachable, leaving an ENTRY whose
-            ;; home lambda no longer lists it.  Flagging the component makes the
-            ;; next round's dfo-as-needed (dfo.lisp:51-69 -> ir1util.lisp:2826)
-            ;; sweep the old region transitively, by which time locall has run.
+            ;; Do NOT sweep here.  The replacement's own functionals (the LETs a
+            ;; DOTIMES expands to) are queued in COMPONENT-NEW-FUNCTIONALS and only
+            ;; become reachable once LOCALL-ANALYZE-COMPONENT runs, which happens
+            ;; after this: a sweep now can delete the replacement as unreachable.
+            ;; Flagging the component makes the next round's dfo-as-needed
+            ;; (dfo.lisp:51-69 -> ir1util.lisp:2826) sweep the old region
+            ;; transitively, by which time locall has run.
             (setf (component-reanalyze component) t)
-            ;; Converting a FORM in place inside a live component collides with
-            ;; IR1 entry bookkeeping: inline-expansion and transform machinery
-            ;; creates ENTRY nodes whose home lambda resolves through
-            ;; LAMBDA-CALL-LEXENV after LET merging, and the lambda the checker
-            ;; asks about does not list them.  ENVIRONMENT-ANALYZE iterates
-            ;; LAMBDA-ENTRIES, so such an entry loses its cleanup.  This asserts
-            ;; it at the splice, where the component is still intact.
-            ;; The replacement brought a fresh lambda, entries and local exits;
-            ;; put them through the same fixpoint the rest of the component ran.
-            ;; locall-analyze-component drains COMPONENT-NEW-FUNCTIONALS and
-            ;; let-converts the call (main.lisp:503-506; locall.lisp:1411,
-            ;; 1044-1136), and the next ir1-optimize round deletes the now
-            ;; local exits with MAYBE-DELETE-EXIT (ir1opt.lisp:516 and 1239).
-            ;; IR1-PHASES binds *constraint-universe* and *delayed-ir1-transforms*
-            ;; itself (main.lisp:549-552); binding them lexically here would be
-            ;; fatal in make-host-2.
-            ;; re-running IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE*
-            ;; while the component's lvars still index the old one, and constraint
-            ;; propagation dies on that; local call analysis is what drains the new
-            ;; functionals, and the flags let the phases still ahead of us redo the
-            ;; optimization and the DFO that the new code needs
+            ;; Put the replacement through the fixpoint the rest of the component
+            ;; already ran: locall-analyze-component drains
+            ;; COMPONENT-NEW-FUNCTIONALS and LET converts what the DOTIMES
+            ;; expanded to (main.lisp:503-506; locall.lisp:1411, 1044-1136), and
+            ;; the next ir1-optimize round deletes the exits that creates
+            ;; with MAYBE-DELETE-EXIT (ir1opt.lisp:516, 1239).  Re-running
+            ;; IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE* while the
+            ;; component's lvars still index the old one (main.lisp:549-552).
             (locall-analyze-component component)
-      ;; after LOCALL: a LET merge is one of the steps that can detach an ENTRY
-      ;; from the lambda that registered it, so checking before it would miss a
-      ;; violation this very splice introduced
-      (when *vector-node-check-entries*
-        (check-entries-after-splice component))
+            ;; after LOCALL, because a LET merge is one of the steps that can
+            ;; detach an ENTRY from the lambda that registered it
+            (when *vector-node-check-entries*
+              (check-entries-after-splice component))
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
             ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
             ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).
             t))))))
+
 
 (defun vector-expand-loop (loop)
   (if (vloop-accumulator loop)
