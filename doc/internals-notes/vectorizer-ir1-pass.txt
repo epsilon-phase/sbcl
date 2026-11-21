@@ -205,3 +205,30 @@ So: a wrapper is the wrong shape.  The options left are
 
 Option (a) is closer: the ENTRY repair is a few lines once the walk is right, and it
 is the same fix-up MERGE-LETS performs (locall.lisp:1130-1140).
+
+Attempt 6: the bare DOTIMES with an ENTRY repair, and the NEXT error to chase
+------------------------------------------------------------------------------
+
+Dropped the wrapper (attempt 5 explains why) and repaired the ENTRY bookkeeping
+after LOCALL-ANALYZE-COMPONENT instead: walk the component's live blocks and
+PUSHNEW every ENTRY onto (LAMBDA-ENTRIES (NODE-HOME-LAMBDA entry)), which is the
+nconc MERGE-LETS already does for the same reason.
+
+That aborts the weak.lisp compile with a different error:
+
+  The value NIL is not of type SB-C::CTRAN
+
+so the repair is not the only thing to fix: something in the splice path itself
+reaches a NIL ctran for that loop.  Candidates, in the order worth checking:
+
+- UNLINK-BLOCKS/LINK-BLOCKS when the loop's exit block has been merged, so the
+  successor's ctran is nil;
+- the conversion delivering into an exit ctran that is no longer the block's start
+  ctran after a merge;
+- the loop's blocks not being contiguous in the block chain at that point.
+
+The way to find it without a build: take a core built with the switch OFF, set
+SB-C::*VECTOR-NODE-SPLICE* at run time, and compile a lambda with the shape from
+MAKE-WEAK-VECTOR (two DOTIMES in the two branches of an IF, inside a LET that binds
+the destination).  That reproduces in seconds instead of two minutes and gives a
+backtrace.
