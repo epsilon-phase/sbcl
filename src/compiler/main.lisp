@@ -552,9 +552,14 @@ necessary, since type inference may take arbitrarily long to converge.")
                                            :fill-pointer 0 :adjustable t))
         (*delayed-ir1-transforms* nil))
     (declare (special *constraint-universe* *delayed-ir1-transforms*))
-    ;; the vectorizer splices into components that have been optimised, and the
-    ;; round after each splice is what cleans up what it inserted, so it runs
-    ;; here rather than in COMPILE-COMPONENT after the fixpoint is over
+    ;; The vectorizer's IR1 half (src/compiler/vectorize-ir1.lisp) is a sibling of
+    ;; the optimize phase rather than a step inside it, for one reason: it splices
+    ;; code into the component, and the round after a splice is what the pipeline
+    ;; needs to LET convert, optimize and finally sweep what the splice retired.
+    ;; It runs here, inside IR1-PHASES, because the replacement needs the live
+    ;; constraint universe and environment; re-entering IR1-PHASES from the pass
+    ;; would build a fresh *CONSTRAINT-UNIVERSE* while the component's lvars still
+    ;; index the old one (main.lisp:549-552).
     (loop
       (ir1-optimize-phase-1 component)
       (unless (vector-node-component-pass component)

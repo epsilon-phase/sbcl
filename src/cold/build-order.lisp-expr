@@ -385,6 +385,10 @@
  ("src/compiler/bitops-derive-type")
 
  ("src/compiler/dfo")
+ ;; the IR1 half of automatic vectorization: it reads loops out of optimized IR1, so
+ ;; it comes after the analysis it reads (ir1util, locall, ir1opt, loop, dfo) and
+ ;; after the source-form half whose primitive table it checks against
+ ("src/compiler/vectorize-ir1")
  ("src/compiler/checkgen")
 
  ("src/compiler/tn")
