@@ -432,9 +432,13 @@ increment and the stores gives the set of nodes the replacement reproduces."
                                      (string= name "%VEC" :end1 4 :end2 4)))))
                        (mapcan #'vector-node-nodes blocks))
           (vector-node-fail :already-vector-code))
-        ;; a non-simple array is not supported yet: its AREF inlines to data-vector
-        ;; access behind WITH-ARRAY-DATA, and the data vector has to be hoisted out
-        ;; of the loop.  Refuse it here, before walking nodes the pass cannot read
+        ;; A non-simple array is out of scope HERE, and that is a scope decision
+        ;; rather than a gap: its AREF inlines to data-vector access behind
+        ;; WITH-ARRAY-DATA, which the source-form pass already handles (it hoists the
+        ;; data vector and the start index itself, see VECTOR-WITH-DATA-VECTORS).
+        ;; This pass exists for loops the source pass CANNOT see -- arithmetic that
+        ;; only exists after inlining -- so a shape the source pass covers is left to
+        ;; it rather than duplicated here.  Same for a ramp built from the index.
         (unless (every (lambda (store)
                          (let ((ty (vector-node-lvar-type (first (combination-args store)))))
                            (and (array-type-p ty)
