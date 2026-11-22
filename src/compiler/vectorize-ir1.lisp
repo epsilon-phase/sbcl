@@ -563,6 +563,8 @@ increment and the stores gives the set of nodes the replacement reproduces."
                          (vector-primitive "STORE" element-type))
               (vector-node-fail (list :no-lane-for element-type))))
           (list :element-type (second (first entries))
+                ;; an integer lane may only be vectorized where it cannot signal
+                :unchecked-p (policy (block-last head) (= safety 0))
                 :index (leaf-source-name index-var)
                 ;; the leaves the IR1 path emits: the index variable, the limit (a
                 ;; leaf, or the constant it is), and every array the plan touches
@@ -732,14 +734,18 @@ increment and the stores gives the set of nodes the replacement reproduces."
 Division is not here yet -- it takes float lanes only, and its family lands with the
 rest.")
 
-(defun vector-node-ir1-family-p (element-type operator arity)
+(defun vector-node-ir1-family-p (element-type operator arity unchecked-p)
   "True when this element type, operator and arity are a family the IR1 path emits.
 
 Rung C widens this one family at a time, and what it does not cover keeps the printed
 path: a missing primitive is a decline here, never a VOP that is not there.  Arity 1
 is a sign flip (the recogniser turns %NEGATE into a one-operand -), which is a XOR on
 the sign bit and not a subtraction."
-  (and (member element-type '(single-float double-float))
+  (and (if (member element-type '(single-float double-float))
+           t
+           ;; an integer lane wraps where a checked loop would signal, so it is
+           ;; only vectorized at (safety 0) -- the same rule the source pass applies
+           unchecked-p)
        (case arity
          (1 (eq operator '-))
          (2 (member operator +vector-node-ir1-operators+)))))
@@ -756,10 +762,11 @@ Everything else keeps the printed path, so a mistake here is one family wide."
                          (eq (car tree) :op)
                          (member (length (third tree)) '(1 2))
                          (vector-node-ir1-family-p type (second tree)
-                                                   (length (third tree)))
+                                                   (length (third tree))
+                                                   (getf plan :unchecked-p))
                          (every (lambda (sub)
                                   (and (eq (car sub) :load)
-                                       (eq (fourth sub) type)
+                                       (equal (fourth sub) type)
                                        (fifth sub)))
                                 (third tree)))))
                 (getf plan :stores)))))
