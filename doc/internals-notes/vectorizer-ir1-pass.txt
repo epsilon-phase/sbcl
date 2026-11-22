@@ -834,3 +834,73 @@ predicate, the ramp for an index value, splats for a scalar operand), and each f
 needs its operand forms -- (%VEC-SPLAT-* for a constant or an invariant leaf, a
 %VEC-RAMP for the index as a value), after which the printed path has no client left
 and VECTOR-NODE-PACKED-FORM, VECTOR-NODE-GUARD-FORM and VECTOR-NODE-PRINT-TREE can go.
+
+Rung C: where it stops, and the two traps that cost the most
+------------------------------------------------------------
+
+The IR1 path is emitted for the FLOAT lanes only.  Rung C -- integer lanes -- was
+attempted twice and is not in the tree; the printed path still covers every integer
+family, which is the honest endpoint the design allows for: the harness measures the
+same 50 of 54 through this pass alone, with the printed path doing integers.
+
+Two traps, both cases of the test or the gate being wrong while the pass was right:
+
+1. Compare element type specifiers with EQUAL, never EQ.  A float lane's type is a
+   symbol, so EQ happened to work; an integer lane's is a LIST -- (UNSIGNED-BYTE 32) --
+   and two equal lists are never EQ, so every integer family declined at the operand
+   check while the plan and the primitive table were perfectly happy.  One character.
+
+2. A test that asserts "this was not vectorized" can be wrong about its own evidence.
+   :IR1-PACKED-PREFIX-IS-IR1 searched *VECTORIZE-PACKED-MNEMONICS*, whose list is
+   ("addps" "addpd" "mulps" "movups" "shufps"): no subpd, no subps, no mulpd.  Two
+   rungs' worth of "the pass declined - and * on doubles" was the test being unable to
+   see them.  Extend the search list in the test that needs it rather than the shared
+   list, which other tests use to assert the negative.
+
+And the technique that found both, worth reaching for first: VECTOR-NODE-PACKED-IR1-P,
+VECTOR-NODE-IR1-FAMILY-P and the emitter are ordinary defuns in SB-C, so redefining them
+in a live core --
+  (in-package "SB-C")
+  (setf (symbol-function 'vector-node-packed-ir1-p) (lambda (plan) (print plan) nil))
+-- turns "why did the pass decline" into a print instead of a two-minute build.
+
+Where the second attempt stopped.  The plan field the source pass's integer rule needs
+is now understood and small:
+
+  :unchecked-p (policy (block-last head) (= safety 0))
+
+in the plan, with VECTOR-NODE-IR1-FAMILY-P consulting it and VECTOR-EXACT-EXPRESSION-P
+for the exact-tree case.  With that in place the field reads T for a lambda compiled at
+(safety 0), and the primitive table answers for every integer family
+(%VEC-ADD-UB32 and friends, and no %VEC-MUL-UB32 or %VEC-MUL-UB8, which is why those
+two must decline).  What still answered NIL was VECTOR-NODE-IR1-FAMILY-P itself, for
+(unsigned-byte 32) + -- every input to it was right and the predicate still said no --
+and the next session should print its five sub-checks the same way, because that is
+five seconds of work and it is the last thing between here and integer lanes.
+
+The structural hazard that came with it, and the shape of the fix.  With integers
+reaching the emitter, the compiler crashed with the empty-block signature again ("The
+value NIL is not of type SB-C::NODE", from BLOCK-HOME-LAMBDA via NOTE-BLOCK-DELETION
+out of CLEAN-COMPONENT).  The test form the emitter converts was
+(<= (+ I W) (MIN LIMIT (LENGTH A) ...)).  MIN over LENGTHs and multi-argument <= expand
+to conditionals, so how many blocks the conversion creates, and which of them the join
+is, depends on the element type and the number of stores -- which is precisely the
+fragility.  The remedy, not yet tried:
+
+  (if (%VECTOR-NODE-ROOM-P I W LIMIT A B C) T NIL)
+
+with %VECTOR-NODE-ROOM-P an ordinary function taking the index, the width, the limit and
+up to three arrays, doing the MIN and the length checks inside itself and returning a
+boolean.  ONE call has ONE block structure for every element type and every number of
+stores, the IF translator then always produces the same arms and join, and the length
+reads move into the callee where the optimizer handles them as it likes.  It also
+removes the per-iteration MIN from the emitted IR1, which is the cost rung B noted.
+
+Order for the next attempt: (1) EQUAL everywhere element types are compared, and audit
+the node pass for other EQ-on-type-specifier uses; (2) %VECTOR-NODE-ROOM-P as the test;
+(3) the structural check in the only place it can be a real fallback -- after the test
+conversion and BEFORE the preheader is relinked, so declining leaves the component as it
+was; note that a conversion cannot be withdrawn, so the invariant has to be that the
+emission cannot leave an empty block, and the check only names the failure; (4) then the
+integer families, one width at a time, with values that overflow the lane so a missing
+mask is a wrong number.
