@@ -650,3 +650,53 @@ What is left for upstream:
    build under make-host-2's fail-on-warnings.  The gate on *VECTOR-NODE-CROSS-COMPILING*
    is right for this pass, but the same trap is waiting for anything else that
    vectorizes compiler code during a build.
+
+Rungs: making the pass build IR1 instead of printing source
+-----------------------------------------------------------
+
+The pass recognized at IR1 and emitted at the source layer -- it printed a DOTIMES and
+let the source-form pass rewrite it.  No other optimizer in SBCL reaches back into
+IR1-CONVERT from inside the optimizer, and the plan is to take that away in rungs so
+that each one is reviewable on its own:
+
+  A. structure: guard block + the loop kept as the scalar tail, packed body still a
+     converted form.  Behaviour and numbers identical.
+  B. the packed body as IR1 + VOP nodes, for one element type and one operator
+     (single-float +), every other shape refused meanwhile.
+  C. widen to the rest of the table (double-float, integer lanes, the 128/256 split,
+     the ramp), one family at a time.
+  D. delete VECTOR-NODE-PACKED-FORM and any remaining printed source, and move the
+     pass into IR1-OPTIMIZE-UNTIL-DONE if it no longer needs a following round.
+
+Rung A is landed.  The pass no longer replaces anything: it inserts a guard block on
+the edge into the loop, and hangs the packed prefix off the guard's true edge; the
+loop the pass found stays where it was and becomes the scalar tail, entered with its
+own index variable already set to the first element the packed loop did not do.  The
+printed form is now
+
+  (WHEN <guard>  (PROGN (SETQ <loop's index> (- <count> (MOD <count> <width>)))
+                        (DOTIMES (<k> <index>) <the stores at k>)))
+
+where the guard is (AND (TYPEP <count> 'INDEX) (>= (LENGTH <array>) <count>) ...) for
+every array the plan touches.  That is the source-form emitter's own shape -- guard,
+packed loop, scalar tail -- with the original loop as the tail.
+
+What rung A removed, and why it stays removed:
+
+- the requirement that the loop have one way in AND one way out, and the delivery
+  into the loop's exit ctran;
+- UNLINK-BLOCKS on the loop's entry and the LINK-BLOCKS that replaced it;
+- the whole class of problems that came from deleting blocks: the ENTRY repair, the
+  DFO sweep timing, the "do not call DELETE-BLOCK here" rules.  The insertion uses
+  CHANGE-BLOCK-SUCCESSOR, exactly as INSERT-CLEANUP-CODE does (ir1util.lisp:36-55),
+  so an IF between the preheader and the loop is repointed for free;
+- the dependency on the loop's exit block existing at all.
+
+What it did not remove: the weak table.  The pass still has to stop itself after one
+insertion per component, because the loop it leaves behind is the same loop it would
+find again next round.
+
+Numbers after rung A, unchanged from before it: 87 of 87 tests,
+auto-vectorize-differential 1 of 1, the differential harness 54 of 54 packed through
+both passes and 50 of 54 through the IR1 pass alone, values passing in both, and a
+serial switch-on self-build completing.

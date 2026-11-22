@@ -578,142 +578,144 @@ increment and the stores gives the set of nodes the replacement reproduces."
                      (third tree))))
     (t (error "unexpected tree ~s" tree))))
 
-(defun vector-node-source-form (plan)
-  "The loop the plan describes, as the DOTIMES the source-form pass rewrites.
+;;; Every array the plan touches, as a THE cast that names its element type: a
+;;; load's type is the one the recogniser read from its lvar, and a store's is the
+;;; loop's, which is the same by construction.  Carrying the casts rather than
+;;; relying on declarations is what lets the printed form work in a scope that
+;;; declares none of them.
+(defun vector-node-array-casts (plan)
+  (let ((accum '()))
+    (labels ((add (name type)
+               (unless (assoc name accum :test #'equal)
+                 (push (cons name `(the (simple-array ,type (*)) ,name)) accum)))
+             (walk (tree)
+               (case (car tree)
+                 (:load (add (second tree) (fourth tree)))
+                 (:op (mapc #'walk (third tree)))
+                 (t nil))))
+      (dolist (store (getf plan :stores))
+        (add (car store) (getf plan :element-type))
+        (walk (cdr store)))
+      (nreverse accum))))
 
-  It is the loop and nothing else.  The arrays carry their element types as THE
-  casts, because the recogniser read them from LVAR-TYPE and the scope the loop
-  sits in may declare none of them; the index and the count are bound by the
-  DOTIMES, so nothing in the form refers to a binding of the loop it replaces.
+(defun vector-node-guard-form (plan)
+  "What the packed loop needs of the arrays and the count, as a test.
 
-  An earlier version wrapped this in a fresh local function and called it, to
-  hand IR1 a top-down conversion.  A call to a local function is exactly what
-  IR1-CONVERT-LOCAL-COMBINATION refuses once the callee has been LET converted
-  (ir1tran.lisp:1255-1262), and that is what aborted a switch-on self-build in
-  src/code/weak.lisp.  The wrapper is not needed: the loop is converted into a
-  block of its own (VECTOR-NODE-SPLICE-LOOP), which is the shape IR1 expects,
-  and the note in doc/internals-notes records what the wrapper was for."
+  It is the guard the source-form emitter builds (VECTOR-ELEMENTWISE-PLAN), with one
+  simplification: this pass only plans a store at offset 0, so the length has to
+  cover COUNT and no more.  There is no run-time alias test to make -- the emitter's
+  alias rule (VECTOR-STORES-SAFE-P) is decided when the loop is planned, from the
+  offsets, not from the arrays."
+  (let ((count (getf plan :limit)))
+    `(and (typep ,count 'index)
+          ,@(mapcar (lambda (cast) `(>= (length ,(cdr cast)) ,count))
+                    (vector-node-array-casts plan)))))
+
+(defun vector-node-packed-form (plan)
+  "The packed loop over the loop's aligned prefix, as the source-form pass's shape.
+
+  The DOTIMES is still printed source in this shape of the pass, so that the
+  source-form pass can turn it into packs: that is the layering this work removes,
+  rung by rung.  What is no longer printed is the loop itself.  The index it hands
+  back is the loop's OWN index variable, set to the first element the packed loop
+  does not do, so the loop the pass found does the rest -- exactly the emitter's
+  packed-loop-then-scalar-tail, with the original loop as the tail.
+
+  The arrays carry their element types as THE casts: the recogniser read them from
+  LVAR-TYPE and the loop's scope may declare none of them."
   (let* ((stores (getf plan :stores))          ; (array-name . value-tree) pairs
          (type (getf plan :element-type))
-         (array-type `(simple-array ,type (*)))
-         (index (make-symbol "VN-I"))
-         ;; every reference to an array says what it holds: a load's value type and
-         ;; the store's element type both come from here, not from the scope
-         (subst (mapcar (lambda (store)
-                          (cons (car store) `(the ,array-type ,(car store))))
-                        stores)))
-    `(dotimes (,index ,(getf plan :limit))
-       ,@(mapcar (lambda (store)
-                   `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,index)
-                          ,(vector-node-print-tree (cdr store) subst index)))
-                 stores))))
+         (index (getf plan :index))
+         (packed (make-symbol "VN-I"))
+         (count (getf plan :limit))
+         (subst (vector-node-array-casts plan)))
+    `(progn
+       ;; hand the loop the first element it is to do, before the packed loop runs:
+       ;; the packed loop can only do the aligned prefix
+       (setq ,index (- ,count (mod ,count ,(vector-width type))))
+       (dotimes (,packed ,index)
+         ,@(mapcar (lambda (store)
+                     `(setf (aref ,(cdr (assoc (car store) subst :test #'equal)) ,packed)
+                            ,(vector-node-print-tree (cdr store) subst packed)))
+                   stores)))))
 
 
-;;; Put the replacement where the loop was: convert it into a fresh block between
-;;; the loop's preheader and its exit, relink those two edges, and delete the two
-;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
-;;; for building a block here; there is no call to repoint, so this is the same
-;;; surgery WITHOUT the lambda that the inline-expansion path uses.
+;;; Put the packed loop in front of the loop, and leave the loop there.
+;;;
+;;; Nothing is deleted and nothing is moved: a guard block is inserted on the edge
+;;; from the loop's preheader, and the packed-prefix code hangs off its true edge.
+;;; The loop the pass found is what runs the elements the packed loop does not -- it
+;;; is the scalar tail, entered with its own index variable already advanced to the
+;;; first element the packed loop left.  That is the shape the source-form emitter
+;;; builds (guard, packed loop, scalar tail) with no printed source and no block
+;;; surgery beyond the one insertion.
+;;;
+;;; The technique is INSERT-CLEANUP-CODE's (ir1util.lisp:36-55), which is SBCL's one
+;;; deliberate example of building blocks and nodes in a live component, and the
+;;; invariants are the same ones, for the same reasons:
+;;;
+;;; - the new block is made with MAKE-CTRAN + CTRAN-STARTS-BLOCK, and it is spliced
+;;;   into the flow with CHANGE-BLOCK-SUCCESSOR, which also repoints the IF that
+;;;   jumps to the loop when there is one;
+;;; - the form is converted into a ctran the new block owns, and delivers into the
+;;;   loop's own start ctran, so the loop's BLOCK-LAST and its ENTRY nodes are left
+;;;   exactly as the pipeline left them;
+;;; - WITH-IR1-ENVIRONMENT-FROM-NODE supplies the component, the lexenv and the
+;;;   source path the conversion needs, so the new code is converted in the loop's
+;;;   own scope and inherits its bindings and cleanups;
+;;; - COMPONENT-REANALYZE is set, because the block chain, the DFO and the block
+;;;   numbers are all stale afterwards.
+;;;
+;;; The pass itself never calls FIND-DFO or DELETE-BLOCK: the next round of
+;;; IR1-PHASES, after local call analysis has run, is what refreshes the DFO and
+;;; retires anything the insertion made unreachable.
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (vnloop-head loop))
-         (outside-in (remove-if (lambda (block) (memq block blocks)) (block-pred head)))
-         (outside-out (remove-if (lambda (block) (memq block blocks)) (block-succ head))))
-    ;; one way in and one way out: anything else needs more care than this
-    (unless (and (= (length outside-in) 1) (= (length outside-out) 1))
+         ;; the loop is entered from one place: anything else would need the guard
+         ;; on every edge, and the guard has side effects on the index variable
+         (outside-in (remove-if (lambda (block) (memq block blocks)) (block-pred head))))
+    (unless (and (= (length outside-in) 1)
+                 (block-start head))
       (return-from vector-node-splice-loop nil))
     (let* ((preheader (first outside-in))
-           (exit (first outside-out))
            (component (block-component head))
-           (head-home (block-home-lambda-or-null head))
-           (exit-ctran (and exit (block-start exit)))
-           (exit-home (and exit-ctran (block-home-lambda-or-null exit))))
-      ;; EXIT must be a real block we can deliver into, and both edges of the
-      ;; loop must stay inside the loop's home lambda: a cross-lambda edge is
-      ;; an NLX target that environment-analyze has not established yet
-      ;; (envanal.lisp:200-225 runs later).  BLOCK-HOME-LAMBDA on an empty
-      ;; block would read (block-last block) = nil (ir1util.lisp:1437-1439),
-      ;; hence BLOCK-HOME-LAMBDA-OR-NULL (ir1util.lisp:1405-1433).
-      ;; the replacement is converted INTO EXIT's start ctran, so if that ctran has
-      ;; been deleted (a merge upstream of the loop retired it) RETURN-FROM would
-      ;; throw LOCALL-ALREADY-LET-CONVERTED (ir1-translators.lisp:231).  Decline.
-      (when (ctran-deleted-p exit-ctran)
-        (return-from vector-node-splice-loop nil))
-      (unless (and head-home exit-ctran
-                   (eq exit-home head-home)
+           (head-home (block-home-lambda-or-null head)))
+      ;; Both edges stay inside the loop's home lambda: a cross-lambda edge is an
+      ;; NLX target that environment-analyze has not established yet
+      ;; (envanal.lisp:200-225 runs later).  BLOCK-HOME-LAMBDA on an empty block
+      ;; would read (block-last block) = nil (ir1util.lisp:1437-1439), hence
+      ;; BLOCK-HOME-LAMBDA-OR-NULL (ir1util.lisp:1405-1433).
+      (unless (and head-home
                    (or (null (block-last preheader))   ; the component head
                        (eq (block-home-lambda-or-null preheader) head-home)))
         (return-from vector-node-splice-loop nil))
-      ;; The anchor is the loop's own ENTRY node: the mess-up of the cleanup in
-      ;; the lexenv of the head's test.  The block/tagbody translators convert
-      ;; that entry BEFORE adding the cleanup (ir1-translators.lisp:199-208 and
-      ;; 294-314), so its lexenv is the scope the loop runs in -- every binding
-      ;; and every enclosing cleanup still in effect, minus the loop's own
-      ;; cleanups, which the splice deletes.  Anchoring on a preheader node
-      ;; instead would drop the loop-construct cleanups; anchoring inside the
-      ;; loop would inherit cleanups of code that is about to be deleted
-      ;; (merge-lets stores this lexenv as the call's LAMBDA-CALL-LEXENV,
-      ;; locall.lisp:1081, and node-enclosing-cleanup walks it, ir1util.lisp:23).
-      ;;
-      ;; The lexenv is the anchor's, unchanged: it is the scope the loop runs in,
-      ;; and the ENTRY nodes the emitted DOTIMES creates must be registered
-      ;; against the same lambda its blocks resolve to.  Both come from this one
-      ;; lexenv -- registration from (LEXENV-LAMBDA *LEXENV*)
-      ;; (ir1-translators.lisp:201, 296, 298), home from (NODE-HOME-LAMBDA ...)
-      ;; (ir1util.lisp:1377-1389) -- so a merge that retires that lambda fixes
-      ;; both at once, which is what MERGE-LETS does (locall.lisp:1130-1140).
+      ;; The anchor is the loop's own ENTRY node: the mess-up of the cleanup in the
+      ;; lexenv of the head's test.  The block/tagbody translators convert that
+      ;; entry BEFORE adding the cleanup (ir1-translators.lisp:199-208 and
+      ;; 294-314), so its lexenv is the scope the loop runs in -- every binding and
+      ;; every enclosing cleanup still in effect.  Anchoring on a preheader node
+      ;; would drop the loop-construct cleanups.
       (let ((anchor (or (let ((cleanup (and (block-last head)
                                             (lexenv-cleanup (node-lexenv (block-last head))))))
                           (and cleanup (cleanup-mess-up cleanup)))
                         (block-last preheader)
                         (lambda-bind head-home))))
         (with-ir1-environment-from-node anchor
-          ;; Build the replacement's block by hand and convert the form into it.
-          ;; WRAP-PREDICATE (ir1tran.lisp:1200-1221) is the model: MAKE-CTRAN,
-          ;; CTRAN-STARTS-BLOCK, IR1-CONVERT, then LINK-BLOCKS.  Nothing is
-          ;; converted into a live block: the form starts at a ctran this block
-          ;; owns and continues into EXIT's start ctran, which is where any
-          ;; conversion continuing into an existing block delivers.  That leaves
-          ;; EXIT's own start ctran and BLOCK-LAST untouched, which is the whole
-          ;; reason the replacement gets a block of its own: JOIN-SUCCESSOR-IF-
-          ;; POSSIBLE and the LET merges of the next round both read the block
-          ;; they are joining, and a conversion that put its nodes in the middle
-          ;; of EXIT would leave them reading code that is about to be deleted.
           (let* ((start (make-ctran))
-                 (middle (ctran-starts-block start)))
-            ;; the emitted DOTIMES is what the source-form pass rewrites into the
-            ;; packed loop, so that pass has to be on while it is converted: this
-            ;; one recognizes a loop and emits one, it does not emit packs.
+                 (guard (ctran-starts-block start)))
+            ;; the packed DOTIMES is what the source-form pass rewrites into packs,
+            ;; so that pass has to be on while it is converted; the loop below is
+            ;; not converted at all, it is simply left in place
             (let ((*auto-vectorize* t))
-              (ir1-convert start exit-ctran nil (vector-node-source-form plan)))
-            ;; rewire the entry and leave the deletion to the pipeline.  Do not
-            ;; call DELETE-BLOCK on the loop's blocks by hand: DELETE-LAMBDA
-            ;; deliberately leaves a deleted lambda's blocks queued
-            ;; (ir1util.lisp:2191-2194), so hand deletion leaves ENTRY/EXIT
-            ;; bookkeeping inconsistent.  Do not flag the blocks first either --
-            ;; DELETE-BLOCK-LAZILY skips a flagged block (ir1util.lisp:2402-2406)
-            ;; and MARK-FOR-DELETION stops walking predecessors at one.
-            (unlink-blocks preheader head)
-            (link-blocks preheader middle)
-            ;; Do NOT sweep here.  The replacement's own functionals (the LETs a
-            ;; DOTIMES expands to) are queued in COMPONENT-NEW-FUNCTIONALS and only
-            ;; become reachable once LOCALL-ANALYZE-COMPONENT runs, which happens
-            ;; after this: a sweep now can delete the replacement as unreachable.
-            ;; Flagging the component makes the next round's dfo-as-needed
-            ;; (dfo.lisp:51-69 -> ir1util.lisp:2826) sweep the old region
-            ;; transitively, by which time locall has run.
+              (ir1-convert start (block-start head) nil
+                           `(when ,(vector-node-guard-form plan)
+                              ,(vector-node-packed-form plan))))
+            (change-block-successor preheader head guard)
+            ;; the block chain, the DFO and the block numbers are stale
             (setf (component-reanalyze component) t)
-            ;; Put the replacement through the fixpoint the rest of the component
-            ;; already ran: locall-analyze-component drains
-            ;; COMPONENT-NEW-FUNCTIONALS and LET converts what the DOTIMES
-            ;; expanded to (main.lisp:503-506; locall.lisp:1411, 1044-1136), and
-            ;; the next ir1-optimize round deletes the exits that creates
-            ;; with MAYBE-DELETE-EXIT (ir1opt.lisp:516, 1239).  Re-running
-            ;; IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE* while the
-            ;; component's lvars still index the old one (main.lisp:549-552).
+            ;; the packed form expands to LETs, so the component has functionals
+            ;; waiting for local call analysis; the next round runs it (main.lisp:
+            ;; 503-508) and then optimizes and sweeps what the insertion left
             (locall-analyze-component component)
-            ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
-            ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
-            ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).
             t))))))
-
