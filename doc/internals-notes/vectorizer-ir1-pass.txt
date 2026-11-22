@@ -410,3 +410,94 @@ attempt.  tests/auto-vectorize.pure.lisp (87 tests) and
 tests/auto-vectorize-differential.pure.lisp are green, and with the switch on at
 run time the differential harness still measures 50 of 54 shapes packed through
 the IR1 pass alone, values passing, and the inlined-call shape vectorizing.
+
+Attempt 8: private loop discovery, and what the warm-init failure really is
+--------------------------------------------------------------------------
+
+Attempt 7 recommended finding the loops privately instead of through FIND-DOMINATORS
+and LOOP-ANALYZE, on the theory that the pass was disturbing state the pipeline
+owns.  That is now done: VECTOR-NODE-FIND-LOOPS walks BLOCK-PRED back from every
+retreating edge (BLOCK-NUMBER is reverse DFO, so a retreating edge goes from a
+smaller number to a larger one -- the test LOOP-ANALYZE applies), which needs no
+dominator tree at all, and the result is a pass-private (DEFSTRUCT VECTOR-NODE-LOOP)
+holding the head, the blocks and the loops nested inside it.  Nothing is written
+into the component, so the two hazards attempt 7 listed -- DFO-AS-NEEDED inside
+FIND-DOMINATORS sweeping blocks a pending functional still owns, and a stale
+BLOCK-DOMINATOR tree feeding SET-SLOT-OLD-P -- are gone rather than avoided.
+
+It did not fix the warm-init failure, and the failure is not what it looked like.
+Here is the ladder that says so.  Each rung is make-host-1 + make-host-2 followed
+by one warm-load compile of the resulting cold core, which is ~40 s:
+
+  switch off in the source, full pass compiled in        warm load passes
+  switch on,  full pass                                  FAILS, 0 splices
+  switch on,  full pass, pass disabled at RUN time
+              (symbol-function of VECTOR-NODE-COMPONENT-PASS
+               replaced before the warm load)             FAILS
+  switch on,  pass body replaced at COMPILE time by
+              (declare (ignore component)) nil            passes
+  switch on,  full pass + *VECTOR-PRIMITIVES* gate so it
+              never runs in the cross-compiler            FAILS
+  switch on,  a comment changed and nothing else         FAILS
+
+plus, from host-2 with *VECTOR-NODE-CHECK-PURITY* on:
+
+  the plan ran 1761 times, spliced 0 times, and changed NOTHING in the component
+  it planned: every BLOCK-REOPTIMIZE, BLOCK-FLUSH-P, BLOCK-TYPE-CHECK,
+  NODE-REOPTIMIZE, LVAR-REOPTIMIZE and LVAR-%DERIVED-TYPE it snapshotted before
+  the plan was identical after it.  (That checker is in the tree, off, as
+  *VECTOR-NODE-CHECK-PURITY* -- it is the tool that produced this.)
+
+Read together: the pass does not corrupt a component, does not splice anything
+during a self-build, and its behaviour at run time in the failing warm load is
+irrelevant (disabling it there does not help).  What makes the difference is the
+pass being *compiled in* while the switch reads true -- remove either and the build
+passes.  In other words the warm-init failure is not caused by what the pass does;
+it is a latent layout-sensitive failure in the target's compile-time perfect-hash
+path that the presence of this code perturbs.  An earlier attempt 7 bisection that
+"proved" the plan walk was at fault was measuring that coin: the configurations it
+compared differed in how much code they compiled, not in what ran.
+
+Two things support the layout reading and are worth following up:
+
+  - the only target fasl that differs between a switch-on and a switch-off
+    make-host-2 is src/compiler/perfect-hash.lisp, and every function in it
+    disassembles identically in both.  The difference is not code.  (Take the
+    comparison with a pinch of salt: a controlled rerun, with the two sources
+    differing only in the DEFVAR's value, is what to redo; the first comparison
+    was confounded by other edits in the same file.)
+  - pre-allocating a large array in a passing cold core before the warm load does
+    not flip it, so it is not a plain heap shift.
+
+Where to look next, in order:
+
+1. Reproduce the failure in isolation, in the cold core itself, before it is
+   overwritten: run the 5-key path at the debugger prompt of a failing build
+   (SB-C::MINPERFHASH-KEY-UNIVERSE-TYPE, PREHASH-FUNCTION-FOR-MPH-GENERATOR,
+   MAKE-PERFECT-HASH-LAMBDA, then SB-C::COMPILE-PERFECT-HASH on
+   '(:DYNAMIC :TEXT :FIXED :READ-ONLY :STATIC)) and print the hashes and the
+   generated lambda.  In a healthy build that path validates; the difference
+   between the two must be the actual bug.
+2. COMPILE-PERFECT-HASH validates by (EVAL LAMBDA) under *EVALUATOR-MODE*
+   :INTERPRET (early-c.lisp:135-170), i.e. sb-fasteval compiles a lambda whose
+   body is SB-C::UINT32-MODULARLY, which has a compiler macro
+   (OPTIMIZE-FOR-CALC-PHASH, sxhash.lisp:322-325).  A validating interpreter that
+   can answer differently because of where its code was loaded is a bug in that
+   path, not in the vectorizer.
+3. To get the gate itself green while that is sorted out: keep the pass out of the
+   cross-compiler's *compiled image* -- a build with the pass body compiled in and
+   the switch true is the failing combination.  Moving the pass to its own file
+   that build-order places after perfect-hash.lisp, or putting the whole file
+   behind a feature that make-host-1 does not define, would do it, and both are
+   cheap.  That is a workaround, not a fix, and it should be labelled as one.
+
+What is in the tree
+-------------------
+
+*VECTOR-NODE-SPLICE* is NIL.  Private loop discovery, the *VECTOR-PRIMITIVES*
+gate (a build whose backend publishes nothing cannot vectorize, so the pass does
+not even look), the ENTRY checker with its head/tail fix, and the purity checker
+are in place and inert with the switch off.  tests/auto-vectorize.pure.lisp (87
+tests), tests/auto-vectorize-differential.pure.lisp, and the differential harness
+through the IR1 pass alone (50 of 54 packed, values passing, with the entry and
+purity checks on as well) are green.
