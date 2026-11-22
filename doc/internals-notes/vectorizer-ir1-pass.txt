@@ -700,3 +700,79 @@ Numbers after rung A, unchanged from before it: 87 of 87 tests,
 auto-vectorize-differential 1 of 1, the differential harness 54 of 54 packed through
 both passes and 50 of 54 through the IR1 pass alone, values passing in both, and a
 serial switch-on self-build completing.
+
+Rung B: attempted, not landed.  What is known and what the next attempt needs
+----------------------------------------------------------------------------
+
+Rung B was to replace the converted DOTIMES inside rung A's guard block with real IR1
+for one shape (single-float, a store of the sum of two loads), keeping the printed
+path for every other shape so that coverage could not move.  It was written, it
+compiled, and it crashed the compiler once the test suite and the differential
+harness ran it, so it is not in the tree.  This is what the attempt established,
+because all of it is worth keeping.
+
+The leaf-as-form path works, and it is the right path.  IR1-CONVERT turns a leaf into
+a REF (ir1tran.lisp:632-636), so
+
+  (%VEC-STORE-SINGLE (%VEC-ADD-SINGLE (%VEC-LOAD-SINGLE A I)
+                                      (%VEC-LOAD-SINGLE B I))
+                     C I)
+
+converts with A, B, C and I the lambda-vars the recogniser already holds -- no symbol
+of the user's program is looked up, and the bug that printing caused in attempt 9 (a
+transform's temporary taken for a loop invariant) cannot happen.  No BASIC-COMBINATION
+was built by hand, and none needs to be: a REGULAR combination over leaves is what
+this produces.  The VOP-CALL form of the packed body is settled; do not re-litigate it.
+
+The loop needed no new binding.  The packed counter is the loop's OWN index lambda-var:
+it is already zero on entry, its step is one CSET, and when the packed loop stops it
+holds the first index the packed loop did not do, which is exactly where the scalar
+tail has to start.  So "counter as a lambda-var plus CSET" is NOT the blocker -- the
+CSET is nine lines copied from SETQ-VAR (ir1-translators.lisp:1450-1486) and works.
+What the test needs instead of a hoisted END is a form over leaves that is asked once
+per iteration:
+
+  (<= (+ I <width>) (min <limit> (length A) (length B) (length C)))
+
+which folds the guard, the array lengths and the alignment into one question and needs
+no lvar in a form (only leaves fit in a form).  Re-reading the lengths each iteration
+is the cost of not binding them.
+
+The blocker is the block discipline: the three new blocks (HEADER with the CIF, BODY
+with the stores, STEP with the CSET back to HEADER) can be left in a state FIND-DFO
+rejects.  The failure, from the first run of the test suite:
+
+  The value NIL is not of type SB-C::NODE
+  0: (BLOCK-HOME-LAMBDA #<CBLOCK NIL :START c1>)
+  1: (NOTE-BLOCK-DELETION ...)
+  2: (DELETE-BLOCK ...)
+  3: (CLEAN-COMPONENT ...)
+  4: (FIND-DFO ...)
+
+i.e. a live block with a start ctran, no nodes and a successor, reached by the DFO
+sweep.  Note it appeared in a component compiled with *VECTOR-NODE-SPLICE* NIL, which
+means the damage was done earlier and survived into a later compilation of a component
+of the same name: whatever leaves the block behind, it is not cleaned up by the round
+that follows.  The differential harness died outright (no Lisp error, process gone),
+which is the same class of thing seen from further away.
+
+What the next attempt should do, in order:
+
+1. Build the three blocks the way INSERT-CLEANUP-CODE does and nothing more: one block
+   per conversion, the form converted into a ctran that block owns and delivering into
+   the NEXT block's start ctran, and no block created whose only purpose is to hold a
+   partial result.  Concretely, HEADER's test can be converted with the block already
+   containing its nodes only if the conversion is straight-line; if it is not, the
+   conversion has to deliver into HEADER's own start instead.
+2. Do the whole thing with two blocks, not three, on the first attempt: HEADER holds
+   the test and BODY holds the stores and the CSET, with the CSET delivering into
+   HEADER's start ctran (the back edge).  A loop with one body block is enough for a
+   single elementwise store and removes one place to get the invariants wrong.
+3. Check, after the emission and before returning, that every block it created has a
+   BLOCK-LAST.  If one does not, the emission is wrong and the pass should decline --
+   declining is free here, because the printed path is still available for the shape.
+   That check would have turned this crash into a fallback.
+4. Only then widen the shape set.
+
+Rung A stands unchanged: the guard block, the loop kept as the tail, and the printed
+path for every shape.  The rung-B experiment left no code behind.
