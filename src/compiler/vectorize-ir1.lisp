@@ -724,25 +724,41 @@ increment and the stores gives the set of nodes the replacement reproduces."
 ;;; count and the array lengths every iteration, which is what lets it be a form over
 ;;; leaves and nothing else; hoisting them into bound variables is a later rung.
 
-(defun vector-node-packed-ir1-p (plan)
-  "The one shape this emits: single-float, every store the sum of two loads.
+(defparameter +vector-node-ir1-operators+ '("+" "-" "*")
+  "The operators the IR1 path emits, spelled as a plan tree carries them.  Division
+is not here: the emitter it replaces only takes FLOAT lanes for it, and that family
+lands with the rest.")
 
-Everything else keeps the printed path, so a mistake here is one shape wide."
-  (and (eq (getf plan :element-type) 'single-float)
-       (lambda-var-p (getf plan :index-var))
-       (getf plan :limit-leaf)
-       (every (lambda (store)
-                (let ((tree (cdr store)))
-                  (and (consp tree)
-                       (eq (car tree) :op)
-                       (equal (second tree) "+")
-                       (= (length (third tree)) 2)
-                       (every (lambda (sub)
-                                (and (eq (car sub) :load)
-                                     (eq (fourth sub) 'single-float)
-                                     (fifth sub)))
-                              (third tree)))))
-              (getf plan :stores))))
+(defun vector-node-ir1-family-p (element-type operator)
+  "True when this element type and operator are a family the IR1 path emits.
+
+Rung C widens this one family at a time.  What it does not cover keeps the printed
+path, so a missing primitive is a decline here and never a VOP that is not there."
+  (and (member operator +vector-node-ir1-operators+ :test #'equal)
+       (case element-type
+         (single-float (equal operator "+"))
+         (double-float t)
+         (t nil))))
+
+(defun vector-node-packed-ir1-p (plan)
+  "The shapes this emits as IR1: an elementwise store of (OP (LOAD A I) (LOAD B I)).
+
+Everything else keeps the printed path, so a mistake here is one family wide."
+  (let ((type (getf plan :element-type)))
+    (and (lambda-var-p (getf plan :index-var))
+         (getf plan :limit-leaf)
+         (every (lambda (store)
+                  (let ((tree (cdr store)))
+                    (and (consp tree)
+                         (eq (car tree) :op)
+                         (vector-node-ir1-family-p type (second tree))
+                         (= (length (third tree)) 2)
+                         (every (lambda (sub)
+                                  (and (eq (car sub) :load)
+                                       (eq (fourth sub) type)
+                                       (fifth sub)))
+                                (third tree)))))
+                (getf plan :stores)))))
 
 (defun vector-node-store-form (plan entry index)
   "(%VEC-STORE-SINGLE (%VEC-ADD-SINGLE ...) ARRAY INDEX), with leaves for operands."

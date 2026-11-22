@@ -3036,39 +3036,54 @@ loops the pass puts in one function: the build no longer has to know."
   c)
 
 
-;;; The IR1 pass emits the packed prefix itself, for the one shape it builds as IR1
-;;; (single-float, a store of the sum of two loads): the operands are the leaves the
+;;; The IR1 pass emits the packed prefix itself for the families it builds as IR1
+;;; (the float lanes, one operator family at a time): the operands are the leaves the
 ;;; recogniser holds and the loop's own index variable is the packed counter, so no
-;;; source is printed and the source-form pass is not involved at all.  What the
-;;; loop it found does is the scalar tail -- the elements the packed loop left.
-;;; Both halves are asserted here, and the source pass is off throughout, so the
-;;; packed code can only have come from the IR1 pass.
+;;; source is printed and the source-form pass is not involved at all.  What the loop
+;;; it found does is the scalar tail -- the elements the packed loop left.  Both
+;;; halves are asserted per family, with the source pass off throughout, so the packed
+;;; code can only have come from the IR1 pass.
 (with-test (:name :ir1-packed-prefix-is-ir1 :skipped-on (not :x86-64))
-  (flet ((disassembly (function)
+  (labels ((disassembly (function)
            (string-downcase (with-output-to-string (stream)
-                              (disassemble function :stream stream)))))
-    (let* ((sb-c::*auto-vectorize* nil)
-           (sb-c::*vector-node-splice* t)
-           (fn (compile nil
-                        '(lambda (a b c n)
-                           (declare (type (simple-array single-float (*)) a b c)
-                                    (type vectorize-index n) (optimize speed))
-                           (dotimes (i n)
-                             (setf (aref c i) (+ (aref a i) (aref b i)))))))
-           (text (disassembly fn)))
-      (assert (some (lambda (mnemonic) (search mnemonic text))
-                    *vectorize-packed-mnemonics*)
-              () "the IR1 pass emitted no packed code:~%~A" text)
-      ;; the tail: lengths that straddle the hand-off from the packed prefix to the
-      ;; loop the pass found, including ones no whole vector fits in
-      (dolist (n '(0 1 7 8 9 17))
-        (let ((a (make-array n :element-type 'single-float :initial-element 1.5))
-              (b (make-array n :element-type 'single-float :initial-element 2.25))
-              (c (make-array n :element-type 'single-float :initial-element -1.0f0)))
-          (funcall fn a b c n)
-          (dotimes (i n)
-            (unless (eql (aref c i) 3.75)
-              (error "~@<length ~D, element ~D is ~S, expected 3.75~:@>" n i (aref c i)))))))))
+                              (disassemble function :stream stream))))
+         (check (element-type operator)
+           (let* ((sb-c::*auto-vectorize* nil)
+                  (sb-c::*vector-node-splice* t)
+                  (fn (compile nil
+                               `(lambda (a b c n)
+                                  (declare (type (simple-array ,element-type (*)) a b c)
+                                           (type vectorize-index n) (optimize speed))
+                                  (dotimes (i n)
+                                    (setf (aref c i)
+                                          (,operator (aref a i) (aref b i)))))))
+                  (text (disassembly fn))
+                  (x (coerce 1.5 element-type))
+                  (y (coerce 2.25 element-type))
+                  (expected (funcall operator x y)))
+             (assert (some (lambda (mnemonic) (search mnemonic text))
+                           *vectorize-packed-mnemonics*)
+                     () "~a ~a: the IR1 pass emitted no packed code:~%~A"
+                     element-type operator text)
+             ;; the tail: lengths that straddle the hand-off from the packed prefix to
+             ;; the loop the pass found, including ones no whole vector fits in
+             (dolist (n '(0 1 7 8 9 17))
+               (let ((a (make-array n :element-type element-type :initial-element x))
+                     (b (make-array n :element-type element-type :initial-element y))
+                     (c (make-array n :element-type element-type :initial-element x)))
+                 (funcall fn a b c n)
+                 (dotimes (i n)
+                   (unless (eql (aref c i) expected)
+                     (error "~@<~a ~a, length ~D: element ~D is ~S, expected ~S~:@>"
+                            element-type operator n i (aref c i) expected))))))))
+    (check 'single-float '+)
+    (check 'double-float '+)
+    ;; Not '- or '*: both decline here today, and the printed path still covers them
+    ;; (the harness measures the same 50 of 54 through this pass alone), so what is
+    ;; pinned is the family that is emitted rather than the shapes that are refused.
+    ;; Why they decline is the next thing to find: the plan accepts the shape, and a
+    ;; float subtraction does not reach it as a binary "-" at all.
+    ))
 
 (with-test (:name :ir1-vectorizes-an-inlined-call)
   (flet ((packed-p (splice)
