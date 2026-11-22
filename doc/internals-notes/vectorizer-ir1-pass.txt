@@ -283,3 +283,130 @@ Two cheaper things worth doing BEFORE step 3, because they shrink it:
 That last option is the one this session's evidence points at: convert the *packed body*
 into a block of its own, constructed by hand, rather than converting the whole replacement
 into the loop's place.  If it works it is option 1's benefit for a fraction of its cost.
+
+Attempt 7: the plan was the blocker, not the splice
+---------------------------------------------------
+
+The brief for this attempt was the cheap version of option 1: build the block
+skeleton by hand (guard, packed body, scalar tail, done) and convert only the
+pieces as forms, so that nothing is converted into the loop's own place.  The
+work started by measuring what the splice actually does wrong, and it does
+nothing wrong.  What follows is the measurement, because it overturns the premise
+every earlier attempt was working from.
+
+*The entry check was broken, and it is the only reason anybody believed the ENTRY
+problem was real.*  CHECK-ENTRIES-AFTER-SPLICE walked the component from
+(COMPONENT-HEAD COMPONENT), and the head and tail blocks have no start ctran, so
+DO-NODES begins with (CTRAN-NEXT NIL) and signals "The value NIL is not of type
+SB-C::CTRAN".  That is attempt 6's error, word for word: it was the diagnostic
+failing, not the splice.  Fixed (skip a block with no BLOCK-START), the checker
+reports zero mismatches over the 54 shapes of
+tests/auto-vectorize-differential.pure.lisp, with the splice on.  The ENTRY
+bookkeeping of the in-place splice is fine as it stands: registration
+(LEXENV-LAMBDA *LEXENV*) and home (NODE-HOME-LAMBDA) both come from the anchor's
+lexenv, and MERGE-LETS maintains both together.  So option 1 in full -- build the
+replacement as IR1 with VOP nodes -- is not needed for correctness.  The cheap
+version is not needed either, and the block-building it asks for is what the
+splice already does: VECTOR-NODE-SPLICE-LOOP makes a ctran, starts a block with
+CTRAN-STARTS-BLOCK, converts into it, and delivers into EXIT's start ctran, which
+is WRAP-PREDICATE's pattern (ir1tran.lisp:1200-1221).  No node is ever converted
+into the middle of a live block.
+
+*The wrapper was the LOCALL-ALREADY-LET-CONVERTED throw.*  Removed: the emitted
+form is the bare DOTIMES, with the array element types carried as THE casts
+instead of declarations on a wrapper's parameters (the casts are what the source
+pass reads the types from, and what keeps a store's element type right when the
+enclosing scope declares nothing).  The throw was not unconditional, as attempt 5
+concluded; it needed the second splice a component can do, which is why the
+harness never hit it and MAKE-WEAK-VECTOR did.
+
+*The plan accepted a loop no backend can vectorize.*  The first thing a switch-on
+self-build spliced was two loops in MAKE-WEAK-VECTOR over (SETF (SVREF V I) ...):
+SIMPLE-VECTOR's element type is T, and VECTOR-NODE-PLAN took the element type
+from the first store without asking whether the backend publishes a lane for it.
+So it printed a DOTIMES that the source pass then declined to rewrite -- having
+replaced a loop with itself.  The plan now refuses an element type with no LOAD
+and STORE primitive, and refuses stores that disagree, since the emitter reads
+one element type for the whole loop (VLOOP has one).
+
+Where a switch-on self-build now stops
+--------------------------------------
+
+With those three fixed, a switch-on build compiles every file in make-host-2 --
+it gets past src/code/weak.lisp and out the other side -- and then dies in warm
+init, in the target's compilation of src/code/room.lisp:
+
+  Perfect hash generator failed on #(:DYNAMIC :TEXT :FIXED :READ-ONLY :STATIC)
+
+when compiling room.lisp, i.e. COMPILE-PERFECT-HASH's own validation
+(early-c.lisp:135-170) rejecting a hash it just built.  That is target code
+compiled by a host compiler that the pass corrupted, and the pass had *spliced
+nothing* at that point.
+
+Bisection, each step a switch-on self-build of make-host-1 + make-host-2 followed
+by one warm-init compile of the cold core:
+
+  splice off (HEAD)                            build green
+  splice on, analysis and plan in the pass     dies as above, 0 splices reported
+  splice on, FIND-DFO/FIND-DOMINATORS/LOOP-ANALYZE
+             in the pass, no plan walk           build green
+  splice on, FIND-DOMINATORS only              build green
+  splice on, LOOP-ANALYZE only                 build green
+  splice on, analysis + walk, no VECTOR-NODE-PLAN
+                                               build green
+  splice on, analysis + walk + VECTOR-NODE-PLAN
+                                               dies as above, 0 splices reported
+
+So it is the *plan* walk: calling VECTOR-NODE-PLAN on every natural loop of every
+component in the cross-compiler corrupts the code that compiler generates, and
+never splices anything, because during make-host-2 the backend has not published
+its primitives and every plan refuses at the last check.
+
+What was ruled out on the way, so it is not re-derived:
+
+- FIND-DFO from the pass: it clears COMPONENT-REANALYZE and deletes every block
+  it cannot reach, including the BIND block of a functional still queued on
+  COMPONENT-NEW-FUNCTIONALS.  That is a real hazard, and the pass now declines
+  while COMPONENT-REANALYZE is set.  It is not this failure.
+- FIND-DOMINATORS leaving a stale dominator tree behind: SET-SLOT-OLD-P asks
+  DOMINATES-P a semantic question with it (whether a slot store can skip its GC
+  barrier, ir1util.lisp:1064-1073 and 1127-1133), which looks like a way to
+  corrupt a heap.  Saving and restoring every BLOCK-DOMINATOR around the analysis
+  changes nothing.
+- the loop structure LOOP-ANALYZE leaves going stale: what reads it is heuristic
+  (branch probabilities control.lisp:113, TN ordering pack.lisp:865, loop
+  alignment ir2tran.lisp:2529).
+
+Where the next person should look
+---------------------------------
+
+Inside VECTOR-NODE-PLAN, in this order, because everything before it is a plain
+structure read:
+
+1. LVAR-TYPE and the TYPE-SPECIFIER calls built on it (vector-node-tree, the
+   store's element type, vector-probe-type).  LVAR-TYPE caches into
+   LVAR-%DERIVED-TYPE (ir1opt.lisp:176-202), so a plan that runs between
+   optimization rounds asks for and stores derived types at a moment the
+   pipeline did not intend.  Try replacing every LVAR-TYPE in the reader with
+   (SINGLE-VALUE-TYPE (%LVAR-DERIVED-TYPE ...)) -- which does not cache -- and
+   see whether the self-build survives.
+2. FLUSHABLE-COMBINATION-P (ir1util.lisp:1518-1533), which calls a per-function
+   FLUSHABLE-TEST with the call for a node that is still live.
+3. VECTOR-PROBE-NODE in the refusal messages: it formats and type-specifies every
+   node it cannot account for, on every natural loop.
+
+A cheaper way to sidestep all of it: recognise loops without the analysis.  The
+pass needs, per candidate loop, the head block, the blocks of the natural loop and
+the exit; those can be found by walking predecessors from a retreating edge, with
+dominators in a private table instead of BLOCK-DOMINATOR, and nothing written back
+into the component.  That deletes FIND-DOMINATORS and LOOP-ANALYZE from the pass
+as well, and with them the two hazards above.
+
+What is in the tree now
+-----------------------
+
+*VECTOR-NODE-SPLICE* is still NIL.  The source-form pass is untouched by this
+attempt.  tests/auto-vectorize.pure.lisp (87 tests) and
+tests/auto-vectorize-differential.pure.lisp are green, and with the switch on at
+run time the differential harness still measures 50 of 54 shapes packed through
+the IR1 pass alone, values passing, and the inlined-call shape vectorizing.
