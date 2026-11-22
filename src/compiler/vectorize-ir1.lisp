@@ -340,7 +340,10 @@ compiled an undefined variable."
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var blocks))
                                       (combination-args use))))
                    (and (every #'identity trees)
-                        (list :op (if (string= op "%NEGATE") "-" op) trees)))))))))
+                        ;; the operator is the SYMBOL, which is what VECTOR-OPERATOR-BASE
+                        ;; and the emitter's tables are keyed by; printing it interns
+                        ;; nothing, and the IR1 path needs no per-call-site interning
+                        (list :op (if (string= op "%NEGATE") '- (intern op "CL")) trees)))))))))
 
 ;;; the whole loop, if it is one this pass understands
 ;;; VECTOR-NODE-PLAN answers with a plan plist or with a reason; the reason is what
@@ -598,7 +601,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
     (:load `(aref ,(or (cdr (assoc (second tree) subst :test #'equal))
                        (second tree))
                   ,index))
-    (:op `(,(intern (second tree) "CL")
+    (:op `(,(second tree)
            ,@(mapcar (lambda (sub) (vector-node-print-tree sub subst index))
                      (third tree))))
     (t (error "unexpected tree ~s" tree))))
@@ -724,22 +727,22 @@ increment and the stores gives the set of nodes the replacement reproduces."
 ;;; count and the array lengths every iteration, which is what lets it be a form over
 ;;; leaves and nothing else; hoisting them into bound variables is a later rung.
 
-(defparameter +vector-node-ir1-operators+ '("+" "-" "*")
-  "The operators the IR1 path emits, spelled as a plan tree carries them.  Division
-is not here: the emitter it replaces only takes FLOAT lanes for it, and that family
-lands with the rest.")
+(defparameter +vector-node-ir1-operators+ '(+ - *)
+  "The operators the IR1 path emits, as a plan tree now carries them: the symbol.
+Division is not here yet -- it takes float lanes only, and its family lands with the
+rest.")
 
-(defun vector-node-ir1-family-p (element-type operator)
-  "True when this element type and operator are a family the IR1 path emits.
+(defun vector-node-ir1-family-p (element-type operator arity)
+  "True when this element type, operator and arity are a family the IR1 path emits.
 
-Rung C widens this one family at a time.  What it does not cover keeps the printed
-path, so a missing primitive is a decline here and never a VOP that is not there."
-  (and (member operator +vector-node-ir1-operators+ :test #'equal)
-       (case element-type
-         (single-float (equal operator "+"))
-         (double-float t)
-         (t nil))))
-
+Rung C widens this one family at a time, and what it does not cover keeps the printed
+path: a missing primitive is a decline here, never a VOP that is not there.  Arity 1
+is a sign flip (the recogniser turns %NEGATE into a one-operand -), which is a XOR on
+the sign bit and not a subtraction."
+  (and (member element-type '(single-float double-float))
+       (case arity
+         (1 (eq operator '-))
+         (2 (member operator +vector-node-ir1-operators+)))))
 (defun vector-node-packed-ir1-p (plan)
   "The shapes this emits as IR1: an elementwise store of (OP (LOAD A I) (LOAD B I)).
 
@@ -751,8 +754,9 @@ Everything else keeps the printed path, so a mistake here is one family wide."
                   (let ((tree (cdr store)))
                     (and (consp tree)
                          (eq (car tree) :op)
-                         (vector-node-ir1-family-p type (second tree))
-                         (= (length (third tree)) 2)
+                         (member (length (third tree)) '(1 2))
+                         (vector-node-ir1-family-p type (second tree)
+                                                   (length (third tree)))
                          (every (lambda (sub)
                                   (and (eq (car sub) :load)
                                        (eq (fourth sub) type)
@@ -769,15 +773,16 @@ Everything else keeps the printed path, so a mistake here is one family wide."
       (flet ((operand (sub)
                (let ((leaf (cdr (assoc (second sub) (getf plan :array-vars) :test #'equal))))
                  (and leaf `(,(vector-primitive "LOAD" type) ,leaf ,index)))))
-        (let ((operands (mapcar #'operand (third node)))
-              ;; the tree's operator is a string, the primitive table's key is the
-              ;; symbol it names (VECTOR-OPERATOR-BASE), as in VECTOR-NODE-PRINT-TREE
-              (operator (intern (second node) "CL")))
-          (when (and (every #'identity operands)
-                     (vector-primitive (vector-operator-base operator type) type))
+        (let* ((operands (mapcar #'operand (third node)))
+               ;; a one-operand - is a sign flip, which has its own primitive and is
+               ;; not a subtraction of zero (VECTOR-OPERATOR-BASE :NEGATE)
+               (base (if (= (length operands) 1)
+                         "NEG"
+                         (vector-operator-base (second node) type))))
+          (when (and base (every #'identity operands)
+                     (vector-primitive base type))
             `(,(vector-primitive "STORE" type)
-              (,(vector-primitive (vector-operator-base operator type) type)
-               ,@operands)
+              (,(vector-primitive base type) ,@operands)
               ,array ,index)))))))
 
 (defun vector-node-emit-packed-ir1 (plan preheader head)

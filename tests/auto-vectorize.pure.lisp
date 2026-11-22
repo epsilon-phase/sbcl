@@ -3061,8 +3061,12 @@ loops the pass puts in one function: the build no longer has to know."
                   (x (coerce 1.5 element-type))
                   (y (coerce 2.25 element-type))
                   (expected (funcall operator x y)))
+             ;; the shared list is the one the source-form tests assert against; the
+             ;; subtraction and the double-float multiply are not in it, and this test
+             ;; asks about these families directly
              (assert (some (lambda (mnemonic) (search mnemonic text))
-                           *vectorize-packed-mnemonics*)
+                           (append *vectorize-packed-mnemonics*
+                                   '("subps" "subpd" "mulpd")))
                      () "~a ~a: the IR1 pass emitted no packed code:~%~A"
                      element-type operator text)
              ;; the tail: lengths that straddle the hand-off from the packed prefix to
@@ -3076,14 +3080,33 @@ loops the pass puts in one function: the build no longer has to know."
                    (unless (eql (aref c i) expected)
                      (error "~@<~a ~a, length ~D: element ~D is ~S, expected ~S~:@>"
                             element-type operator n i (aref c i) expected))))))))
-    (check 'single-float '+)
-    (check 'double-float '+)
-    ;; Not '- or '*: both decline here today, and the printed path still covers them
-    ;; (the harness measures the same 50 of 54 through this pass alone), so what is
-    ;; pinned is the family that is emitted rather than the shapes that are refused.
-    ;; Why they decline is the next thing to find: the plan accepts the shape, and a
-    ;; float subtraction does not reach it as a binary "-" at all.
-    ))
+    (dolist (element-type '(single-float double-float))
+      (dolist (operator '(+ - *))
+        (check element-type operator)))
+    ;; a one-operand - is a sign flip, not a subtraction, and has its own primitive
+    (dolist (element-type '(single-float double-float))
+      (let* ((sb-c::*auto-vectorize* nil)
+             (sb-c::*vector-node-splice* t)
+             (fn (compile nil
+                          `(lambda (a c n)
+                             (declare (type (simple-array ,element-type (*)) a c)
+                                      (type vectorize-index n) (optimize speed))
+                             (dotimes (i n) (setf (aref c i) (- (aref a i)))))))
+             (text (disassembly fn)))
+        (assert (some (lambda (mnemonic) (search mnemonic text))
+                      (append *vectorize-packed-mnemonics* '("xorpd" "xorps")))
+                () "~a negate: the IR1 pass emitted no packed code:~%~A"
+                element-type text)
+        (dolist (n '(0 1 7 8 9 17))
+          (let ((a (make-array n :element-type element-type
+                               :initial-element (coerce 1.5 element-type)))
+                (c (make-array n :element-type element-type
+                               :initial-element (coerce 0 element-type))))
+            (funcall fn a c n)
+            (dotimes (i n)
+              (unless (eql (aref c i) (coerce -1.5 element-type))
+                (error "~@<~a negate, length ~D: element ~D is ~S~:@>"
+                       element-type n i (aref c i))))))))))
 
 (with-test (:name :ir1-vectorizes-an-inlined-call)
   (flet ((packed-p (splice)
