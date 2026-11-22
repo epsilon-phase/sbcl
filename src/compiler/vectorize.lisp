@@ -20,26 +20,27 @@
 ;;;; reads the loop into a plan, prints the plan back as a DOTIMES, and lets the
 ;;;; source pass rewrite that -- it adds a recognizer, not an emitter.
 ;;;;
-;;;; It is off, but not for the reason the design note argued for five attempts.
+;;;; It is on, and not for the reason the note argued for its first five attempts.
 ;;;; Converting the replacement in place does not lose ENTRY bookkeeping: with a
 ;;;; working entry check (walk every live block after LOCALL) there is no mismatch
 ;;;; at all, over the 54 shapes of tests/auto-vectorize-differential.pure.lisp.
-;;;; The blocker that was "ENTRY is not in ENTRIES" was a bug in that checker, and
-;;;; the LOCALL-ALREADY-LET-CONVERTED abort was the local-function wrapper the
-;;;; emitted form used to have; the form is now the bare loop.
+;;;; What was "ENTRY is not in ENTRIES" was a bug in that checker, and the
+;;;; LOCALL-ALREADY-LET-CONVERTED abort was the local-function wrapper the emitted
+;;;; form used to have; the form is now the bare loop.
 ;;;;
-;;;; What a switch-on self-build does now: it compiles every file of make-host-2
-;;;; and then dies in warm init with
-;;;;   Perfect hash generator failed on #(:DYNAMIC :TEXT :FIXED :READ-ONLY :STATIC)
-;;;; while the target compiles src/code/room.lisp.  That is not the pass: it
-;;;; splices nothing during a self-build, planning does not change a node, lvar or
-;;;; block (see *VECTOR-NODE-CHECK-PURITY*), and disabling the pass at run time
-;;;; before the failing warm load does not help.  What matters is the pass being
-;;;; compiled in with the switch true -- take either away and the build passes --
-;;;; so the failure is a latent layout-sensitive one in the target's compile-time
-;;;; perfect-hash path that this code perturbs.
-;;;; doc/internals-notes/vectorizer-ir1-pass.txt, attempt 8, has the whole ladder,
-;;;; what it rules out, and where to look.
+;;;; It is on: *VECTOR-NODE-SPLICE* is T.  Two things had to be fixed for that.
+;;;; The pass must not run in the cross-compiler (*VECTOR-NODE-CROSS-COMPILING*):
+;;;; make-host-2 loads every host fasl up front, so the backend's tables are
+;;;; published before the first target file is compiled, and splicing there
+;;;; vectorized a loop in src/compiler/perfect-hash.lisp whose emitted dispatch
+;;;; calls SB-VM::AVX2-AVAILABLE-P -- a direct call compiled before
+;;;; src/code/x86-64-vm.lisp proclaims that function INLINE, which make-host-2
+;;;; treats as fatal.  And a leaf the plan takes for a loop invariant has to be
+;;;; bound OUTSIDE the loop (VECTOR-NODE-LOOP-INVARIANT-P): a transform's
+;;;; temporary bound inside the loop does not survive the splice.
+;;;;
+;;;; doc/internals-notes/vectorizer-ir1-pass.txt, attempts 7 to 9, has the
+;;;; measurements, the dead ends, and the numbers.
 
 (in-package "SB-C")
 
@@ -975,7 +976,7 @@ guard covers the reads as well as the writes."
 ;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
 ;;; only exists after inlining, which the source pass cannot see, but converting
 ;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
-(defvar *vector-node-splice* nil
+(defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
 (defun vector-probe-fun-name (node)
@@ -1198,17 +1199,32 @@ guard covers the reads as well as the writes."
       (error "planning changed the component's node count: ~a -> ~a"
              (length before) (length after)))))
 
+(defvar *vector-node-cross-compiling* #+sb-xc-host t #-sb-xc-host nil
+  "True in the compiler that will not produce the final code.
+
+The pass only runs where its output is the program: never in the cross-compiler.
+It CAN run there -- make-host-2 loads every host fasl up front, so the backend's
+primitive tables are published before the first target file is compiled -- and
+splicing there is what broke a switch-on self-build: it vectorized
+PHASH-HEXEIGHT's (SETF (AREF KEY-A #:KEY) (LOGAND V 7)) DOTIMES in
+src/compiler/perfect-hash.lisp (build-order 165), the source pass rewrote the
+DOTIMES this pass printed, and the wide/narrow dispatch that rewrite emits is
+(IF (SB-VM::AVX2-AVAILABLE-P) ...) -- a direct call, compiled into a target file
+that precedes src/code/x86-64-vm.lisp (515), the file that proclaims
+AVX2-AVAILABLE-P INLINE.  make-host-2 treats a warning as fatal:
+
+  ; caught WARNING: Proclaiming SB-VM::AVX2-AVAILABLE-P to be INLINE, but 1 call
+  ;   to it was previously compiled
+
+which aborts the build, and the abort then looks like anything but that: what
+comes out is a genesis header mismatch or a warm-init failure in an unrelated
+file.  Nothing is lost by
+declining here: a cross-compiled target file that is vectorized is a build-time
+optimization of the compiler's own code, not of the program being built.")
+
 (defun vector-node-component-pass (component)
   (when (and *vector-node-splice*
-             ;; nothing to emit with: the backend publishes its primitives when
-             ;; its file loads, and during make-host-2 that file is compiled after
-             ;; every file this pass looks at, so the whole pass is inert in the
-             ;; cross-compiler -- it can only refuse, at its last check.  Skipping
-             ;; it there costs nothing.  (It is not why a switch-on self-build
-             ;; still stops in warm init: with this test in place, and with the
-             ;; pass never running, that build still fails the same way.  See the
-             ;; note's attempt 8.)
-             *vector-primitives*
+             (not *vector-node-cross-compiling*)
              ;; several loops per function: the cap is what stops the pass from
              ;; chasing its own output if the emitter ever declines the form we
              ;; spliced in, which is the only way a new loop can appear here
@@ -1359,13 +1375,35 @@ function called with it - ARET's lowering passes the index through one."
         )
       value)))
 
+;;; the blocks of the loop being planned, so that a leaf the plan treats as
+;;; loop-invariant can be checked against the loop that binds it
+(defvar *vector-node-plan-blocks* nil)
+
+(defun vector-node-loop-invariant-p (var)
+  "True when VAR is bound outside the loop being planned, and so survives the splice.
+
+A leaf that is bound INSIDE the loop is not a loop invariant: the splice deletes
+the loop's blocks, binding and all, and the replacement would refer to a variable
+that no longer exists.  SBCL's AREF and float transforms bind such temporaries
+freely -- (SETF (AREF OUT I) (* 2.0 (AREF IN I))) for a (UNSIGNED-BYTE 32) IN is
+(+ X X) by the time the loop is analysed, with X bound by the transform's LET
+inside the loop -- which printed (+ SB-C::X SB-C::X) into the replacement and
+compiled an undefined variable."
+  (let* ((home (lambda-var-home var))
+         (bind (and home (typep home 'clambda) (lambda-bind home))))
+    (or (null bind)
+        (not (memq (node-block bind) *vector-node-plan-blocks*)))))
+
 (defun vector-node-tree (lvar depth index-var)
   (unless (lvar-p lvar) (return-from vector-node-tree nil))
   (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
     (cond ((vector-node-constant lvar) (list :const (vector-node-constant lvar)))
           ((and (ref-p use) (lambda-var-p (ref-leaf use)))
-           (list :var (leaf-source-name (ref-leaf use))))
+           ;; only a variable the loop does not bind: see VECTOR-NODE-LOOP-INVARIANT-P
+           (let ((var (ref-leaf use)))
+             (when (vector-node-loop-invariant-p var)
+               (list :var (leaf-source-name var)))))
           ;; an integer store narrows its value through a CAST node (the type
           ;; check's knowledge that the sum needs the lane width); the emitter
           ;; re-derives that from the array's element type
@@ -1447,6 +1485,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
   (when (vnloop-inferiors loop)
     (vector-node-fail :has-inner-loop))
   (let* ((blocks (vector-node-blocks loop))
+         (*vector-node-plan-blocks* blocks)
          (head (vnloop-head loop)))
     (unless (eq (first blocks) head) (vector-node-fail :head-not-first))
     ;; three blocks are as ordinary as two: after inlining, DOTIMES gives the

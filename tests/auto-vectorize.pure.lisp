@@ -997,7 +997,23 @@ OPERATION applied to the same numbers, which involves no array loop."
             "a write ahead of every read was vectorized:~%~A"
             (disassembly #'vectorize-multi-write-ahead))))
 
+
+;;; The IR1 pass (SB-C::*VECTOR-NODE-SPLICE*) is a second, more general recogniser:
+;;; it reads the loop out of IR1 after inlining, so it takes shapes the source
+;;; pass's own shape rules refuse (a DO with a result form, a LOOP with a FINALLY,
+;;; an integer index).  The assertions below pin the SOURCE pass's rules, so those
+;;; shapes are compiled again with the IR1 pass off; their value checks run either
+;;; way, on the definition the file itself compiles.
+(defmacro vectorize-source-pass-only (() &body body)
+  `(let ((sb-c::*vector-node-splice* nil)) ,@body))
+
 ;;; Loops that must be left alone, and must still be right.
+;;; The IR1 pass (SB-C::*VECTOR-NODE-SPLICE*) is a second, more general recogniser:
+;;; it reads the loop after inlining and lets the source pass emit, so it takes
+;;; shapes the source pass's own shape rules refuse (a LOOP with a FINALLY, a DO
+;;; with a result form, an integer index).  The functions below are compiled with
+;;; it off because they pin what the SOURCE pass's rules accept -- and their value
+;;; checks run either way.
 
 (defun vectorize-single-add-loop-from-1 (a b c n)
   (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
@@ -1005,11 +1021,12 @@ OPERATION applied to the same numbers, which involves no array loop."
   (loop for i from 1 below n do (setf (aref c i) (+ (aref a i) (aref b i))))
   c)
 
-(defun vectorize-single-add-loop-with-finally (a b c n)
-  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
-           (optimize speed))
-  (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i)))
-        finally (return c)))
+(let ((sb-c::*vector-node-splice* nil))
+  (defun vectorize-single-add-loop-with-finally (a b c n)
+    (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+             (optimize speed))
+    (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i)))
+          finally (return c))))
 
 (defun vectorize-single-accumulate (a c n)
   "INCF into the destination, which the vectorizer does take; kept here because the
@@ -1048,6 +1065,13 @@ instruction side."
                (dotimes (i n)
                  (unless (eql (aref c i) (+ 1.0f0 (aref a i)))
                    (error "~@<an accumulating loop is wrong at element ~D of ~D.~:@>" i n)))))
+    (vectorize-source-pass-only ()
+      (compile 'vectorize-single-add-loop-with-finally
+               '(lambda (a b c n)
+                  (declare (type (simple-array single-float (*)) a b c)
+                           (type vectorize-index n) (optimize speed))
+                  (loop for i below n do (setf (aref c i) (+ (aref a i) (aref b i)))
+                        finally (return c)))))
     (dolist (function (list #'vectorize-single-add-loop-from-1
                             #'vectorize-single-add-loop-with-finally))
       (let ((text (disassembly function)))
@@ -1694,12 +1718,13 @@ a writer with a fixed color type ends up with."
     (setf (aref c i) (+ (aref a i) (aref b i))))
   c)
 
-(defun vectorize-do-with-result (a b c n)
-  (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
-           (optimize speed))
-  (do ((i 0 (1+ i)))
-      ((>= i n) c)
-    (setf (aref c i) (+ (aref a i) (aref b i)))))
+(let ((sb-c::*vector-node-splice* nil))
+  (defun vectorize-do-with-result (a b c n)
+    (declare (type (simple-array single-float (*)) a b c) (type vectorize-index n)
+             (optimize speed))
+    (do ((i 0 (1+ i)))
+        ((>= i n) c)
+      (setf (aref c i) (+ (aref a i) (aref b i))))))
 
 (test-util:with-test (:name :vectorize-do-loop :skipped-on (not :x86-64))
   (flet ((disassembly (function)
@@ -1725,6 +1750,14 @@ a writer with a fixed color type ends up with."
       (assert (some (lambda (mnemonic) (search mnemonic (disassembly function)))
                     *vectorize-packed-mnemonics*)
               () "~S was not vectorized" function))
+    (vectorize-source-pass-only ()
+      (compile 'vectorize-do-with-result
+               '(lambda (a b c n)
+                  (declare (type (simple-array single-float (*)) a b c)
+                           (type vectorize-index n) (optimize speed))
+                  (do ((i 0 (1+ i)))
+                      ((>= i n) c)
+                    (setf (aref c i) (+ (aref a i) (aref b i)))))))
     (assert (notany (lambda (mnemonic) (search mnemonic (disassembly #'vectorize-do-with-result)))
                     '("addps" "addpd"))
             () "a DO with a result form was vectorized")))
@@ -1823,12 +1856,13 @@ a writer with a fixed color type ends up with."
   (dotimes (i n) (setf (aref c i) (+ (* (float i) 2.0) (aref a i))))
   c)
 
-(defun vectorize-index-into-integers (c n)
-  "An integer element type would need its own index conversion: left scalar."
-  (declare (type (simple-array (unsigned-byte 32) (*)) c) (type vectorize-index n)
-           (optimize speed (safety 0)))
-  (dotimes (i n) (setf (aref c i) i))
-  c)
+(let ((sb-c::*vector-node-splice* nil))
+  (defun vectorize-index-into-integers (c n)
+    "An integer element type would need its own index conversion: left scalar."
+    (declare (type (simple-array (unsigned-byte 32) (*)) c) (type vectorize-index n)
+             (optimize speed (safety 0)))
+    (dotimes (i n) (setf (aref c i) i))
+    c))
 
 (test-util:with-test (:name :vectorize-index-affine :skipped-on (not :x86-64))
   (flet ((disassembly (function)
@@ -1857,6 +1891,13 @@ a writer with a fixed color type ends up with."
       (assert (some (lambda (mnemonic) (search mnemonic text))
                     '("cvtsi2ss" "addps" "movaps"))
               () "the gradient loop was not vectorized:~%~A" text))
+    (vectorize-source-pass-only ()
+      (compile 'vectorize-index-into-integers
+               '(lambda (c n)
+                  (declare (type (simple-array (unsigned-byte 32) (*)) c)
+                           (type vectorize-index n) (optimize speed (safety 0)))
+                  (dotimes (i n) (setf (aref c i) i))
+                  c)))
     (let ((text (disassembly #'vectorize-index-into-integers)))
       (assert (notany (lambda (mnemonic) (search mnemonic text)) '("paddd" "movdqu"))
               () "an integer index loop was vectorized:~%~A" text))))
@@ -1913,11 +1954,12 @@ a writer with a fixed color type ends up with."
     (assert (vectorize-note-mentions notes "safety 0") () "no note: ~s" notes)))
 
 ;;; a source the pass cannot widen, in a shape it otherwise takes
-(defun vectorize-u32-to-single (in out n)
-  (declare (type (simple-array (unsigned-byte 32) (*)) in)
-           (type (simple-array single-float (*)) out)
-           (type vectorize-index n) (optimize speed))
-  (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i)))))
+(let ((sb-c::*vector-node-splice* nil))
+  (defun vectorize-u32-to-single (in out n)
+    (declare (type (simple-array (unsigned-byte 32) (*)) in)
+             (type (simple-array single-float (*)) out)
+             (type vectorize-index n) (optimize speed))
+    (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i))))))
 
 ;;;; A loop that reads an array of another element type is a widening read, and no
 ;;;; backend has all of them: x86-64 reads bytes and 16-bit values into float
@@ -1927,12 +1969,14 @@ a writer with a fixed color type ends up with."
 
 (test-util:with-test (:name :vectorize-missed-widen-note :skipped-on (not :x86-64))
   (flet ((notes-for (element-type source-type)
-           (vectorize-notes-for
-            `(lambda (in out n)
+           ;; the notes are the SOURCE pass's diagnosis, so it is collected alone
+           (let ((sb-c::*vector-node-splice* nil))
+             (vectorize-notes-for
+              `(lambda (in out n)
                (declare (type (simple-array ,source-type (*)) in)
                         (type (simple-array ,element-type (*)) out)
-                        (type fixnum n) (optimize speed))
-               (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i))))))))
+                          (type fixnum n) (optimize speed))
+                 (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i)))))))))
     ;; nothing reads a 32-bit integer array into float lanes at any width
     (let ((notes (notes-for 'single-float '(unsigned-byte 32))))
       (assert (vectorize-note-mentions notes "no packed load reads") () "no note: ~s" notes)

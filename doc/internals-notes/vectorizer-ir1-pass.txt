@@ -501,3 +501,91 @@ are in place and inert with the switch off.  tests/auto-vectorize.pure.lisp (87
 tests), tests/auto-vectorize-differential.pure.lisp, and the differential harness
 through the IR1 pass alone (50 of 54 packed, values passing, with the entry and
 purity checks on as well) are green.
+
+Attempt 9: the pass was splicing during cross-compilation, and that is the whole failure
+--------------------------------------------------------------------------------------
+
+Attempt 8 concluded that the pass "splices nothing during a self-build" and looked for
+a layout-sensitive bug in the perfect-hash path.  Both halves of that were wrong, and a
+SERIAL make-host-2 says so in one line:
+
+  ; file: src/compiler/perfect-hash.lisp
+  ; in: DEFUN PHASH-HEXEIGHT
+  ;     (SB-C::TRY (LOGAND SB-C::V 7) "(& val 7)")
+  ; --> PROGN DOTIMES DO BLOCK LET
+  ; note: vectorized loop over (UNSIGNED-BYTE 32), 8 elements at a time where the
+  ;       machine has avx2 and 4 where it does not
+
+The pass DOES run in the cross-compiler, and it does splice there.  Attempt 8's
+measurement said otherwise because it counted splices with *VECTOR-NODE-TRACE* through
+the parallel driver, which drops a subprocess's output, and because the primitives test
+it added does not mean what it says: make-host-2 loads every HOST fasl up front
+(`load-or-cload-xcompiler`), so src/compiler/x86-64/vec.lisp and vec-256.lisp have
+published their tables before the first TARGET file is compiled.  (The source pass has
+always been live there for the same reason; that is why the note above is a normal
+build note and not a switch-on one.)
+
+Why that breaks the build: the source pass rewrites the DOTIMES this pass prints, and
+emits its wide/narrow dispatch as
+
+  (IF (SB-VM::AVX2-AVAILABLE-P) <wide> <narrow>)
+
+a direct call, compiled into a target file.  src/code/x86-64-vm.lisp is what proclaims
+AVX2-AVAILABLE-P INLINE, and it is build-order 515 -- long after src/compiler/
+perfect-hash.lisp at 165.  make-host-2 treats a warning as fatal:
+
+  ; caught WARNING: Proclaiming SB-VM::AVX2-AVAILABLE-P to be INLINE, but 1 call to it
+  ;   was previously compiled
+  FAILURE-P was set when creating "obj/from-xc/src/code/x86-64-vm.lisp-obj"
+
+and from there the corpse is unrecognisable: output/tls-init.lisp-expr is never written,
+so the next genesis complains that the header files do not match, or warm init fails in
+an unrelated file.  Attempts 7 and 8 chased those corpses.
+
+The fix: the pass never runs in the cross-compiler.
+
+  (defvar *vector-node-cross-compiling* #+sb-xc-host t #-sb-xc-host nil)
+
+A cross-compiled target file that this pass vectorizes is a build-time optimization of
+the compiler's own code, not of the program being built -- not worth an ordering
+invariant that the emitted dispatch cannot keep.  With the test in place, a switch-on
+self-build completes, serially and in parallel.
+
+The bug the test suite then found, which is the real one
+--------------------------------------------------------
+
+Turning the switch on for the first time put 87 tests through a core that has the pass
+on, and four failed.  Three are shape assertions of the source pass (see below); the
+fourth was a genuine miscompile of the pass:
+
+  (defun vectorize-u32-to-single (in out n)
+    (declare (type (simple-array (unsigned-byte 32) (*)) in)
+             (type (simple-array single-float (*)) out) ...)
+    (dotimes (i n) (setf (aref out i) (* 2.0 (aref in i)))))
+
+SBCL's transforms turn the multiply into (+ X X), with X bound by a LET inside the loop.
+VECTOR-NODE-TREE read that leaf as a loop-invariant scalar and the splice printed
+
+  (DOTIMES (#:VN-I N)
+    (SETF (AREF (THE (SIMPLE-ARRAY SINGLE-FLOAT (*)) OUT) #:VN-I) (+ SB-C::X SB-C::X)))
+
+replacing the loop -- and with it the binding of X -- with a loop that reads an
+undefined variable.  The compiled code had a TLS reference to SB-C::X and the compiler
+said "undefined variable: SB-C::X".  VECTOR-NODE-LOOP-INVARIANT-P now refuses a leaf
+whose home lambda is bound inside the loop's blocks, which is the property that makes a
+leaf survivable across the splice.
+
+The three shape tests (:vectorize-loop-not-recognized, :vectorize-do-loop,
+:vectorize-index-affine) assert that the SOURCE pass leaves certain shapes scalar: a DO
+with a result form, a LOOP with a FINALLY, an integer index store.  The IR1 pass takes
+all three, correctly, so those shapes are now recompiled through the source pass alone
+(VECTORIZE-SOURCE-PASS-ONLY) before their disassembly is checked; their value checks run
+on the file's own definitions either way.
+
+State: *VECTOR-NODE-SPLICE* is T.
+  serial self-build, switch on     completes (180 s)
+  parallel self-build, switch on   completes (118 s)
+  tests/auto-vectorize.pure.lisp   87 of 87
+  auto-vectorize-differential       1 of 1 (54 shapes)
+  differential harness, both passes  54 of 54 packed, values PASS
+  differential harness, IR1 pass alone  50 of 54 packed, values PASS
