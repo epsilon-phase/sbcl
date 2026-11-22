@@ -47,137 +47,16 @@
   "LVAR's type, without caching it in the lvar as LVAR-TYPE would."
   (single-value-type (%lvar-derived-type lvar)))
 
-;;; ---------------------------------------------------------------- probe
-;;; A pass that will live after LOOP-ANALYZE (src/compiler/main.lisp) has a natural
-;;; loop object for every loop in the component, with the blocks that make it up and
-;;; with the bodies already macroexpanded, inline-expanded and let-converted.  This
-;;; probe prints what such a loop is really made of, so that the analysis can be
-;;; written against the IR1 that exists instead of the source forms it comes from.
-
-(defvar *vector-node-probe* nil
-  "When true, print the IR1 of every loop in each compiled component.")
-
-;;; Off.  The pass is a demonstration: it can vectorize a loop whose arithmetic
-;;; only exists after inlining, which the source pass cannot see, but converting
-;;; the replacement in place breaks ENTRY bookkeeping.  See the file header.
+;;; Set to NIL to compile without this pass.  The source-form pass in vectorize.lisp
+;;; has a switch of its own, *AUTO-VECTORIZE*.
 (defvar *vector-node-splice* t
   "When true, replace each loop the node analysis plans with what it emits.")
 
-(defun vector-probe-fun-name (node)
-  (let ((use (lvar-uses (combination-fun node))))
-    (typecase use
-      (ref (let ((leaf (ref-leaf use)))
-             (typecase leaf
-               (functional (or (functional-debug-name leaf) "functional"))
-               (global-var (leaf-source-name leaf))
-               (t (type-of leaf)))))
-      (t (type-of use)))))
-
-(defun vector-probe-type (lvar)
-  (if lvar
-      (type-specifier (vector-node-lvar-type lvar))
-      'null))
-
-(defun vector-probe-node (node)
-  (typecase node
-    (basic-combination
-     (format nil "~a(~{~a~^, ~}) -> ~a"
-             (vector-probe-fun-name node)
-             (mapcar #'vector-probe-type (combination-args node))
-             (vector-probe-type (node-lvar node))))
-    (cset (format nil "set ~a = ~a"
-                  (leaf-source-name (set-var node))
-                  (vector-probe-type (set-value node))))
-    (cif (format nil "if ~a" (vector-probe-type (if-test node))))
-    (ref (let ((leaf (ref-leaf node)))
-           (typecase leaf
-             (functional (format nil "ref ~a" (or (functional-debug-name leaf) "functional")))
-             (constant (format nil "ref constant ~s" (constant-value leaf)))
-             (t (format nil "ref ~a" (leaf-source-name leaf))))))
-    (bind (format nil "bind ~a" (or (functional-debug-name (bind-lambda node))
-                                    "lambda")))
-    (creturn (format nil "return"))
-    (exit (format nil "exit"))
-    (entry (format nil "entry"))
-    (t (format nil "~a" (type-of node)))))
-
-(defun vector-probe-block-count (loop)
-  ;; LOOP-BLOCKS is the first block of the loop, the rest follow it through
-  ;; BLOCK-LOOP-NEXT: it is a chain, not a list.
-  (do ((block (loop-blocks loop) (block-loop-next block))
-       (count 0 (1+ count)))
-      ((null block) count)))
-
-(defun vector-probe-loop (loop depth)
-  (let ((indent (make-string depth :initial-element #\space)))
-    (format *error-output* "~&;~a~a loop: depth ~a, ~a block~:p, head b~a, exits ~a~%"
-            indent (if (eq (loop-kind loop) :outer) "outer" "natural")
-            (loop-depth loop) (vector-probe-block-count loop)
-            (block-number (loop-head loop))
-            (mapcar #'block-number (loop-exits loop)))
-    (do ((block (loop-blocks loop) (block-loop-next block)))
-        ((null block))
-      (format *error-output* "~&;~a  b~a -> ~a~%"
-              indent (block-number block) (mapcar #'block-number (block-succ block)))
-      ;; a block whose nodes have not been analysed yet has ctran links the
-      ;; probe cannot walk; report that instead of taking the probe down
-      (handler-case
-          (do-nodes (node lvar block)
-            (when (mv-combination-p node)
-              (vector-probe-mv-call node indent))
-            (format *error-output* "~&;~a    ~a~a~%"
-                    indent (vector-probe-node node)
-                    (if lvar
-                        (format nil " ; value ~a" (vector-probe-type lvar))
-                        "")))
-        (error (e)
-          (format *error-output* "~&;~a    <block unwalkable: ~a>~%" indent e))))
-    (dolist (inferior (loop-inferiors loop))
-      (vector-probe-loop inferior (+ depth 2)))))
-
-;;; an MV-CALL to a local lambda hides the work in another functional: print it,
-;;; so a shape like WITH-ARRAY-DATA can be recognised against the IR1 that exists
-(defun vector-probe-mv-call (node indent)
-  (let* ((fun-lvar (mv-combination-fun node))
-         (use (lvar-uses fun-lvar))
-         (fun (and (ref-p use) (ref-leaf use))))
-    (format *error-output* "~&;~a  MV-CALL -> ~a, kind ~a, vars ~a, blocks ~a~%"
-            indent
-            (and (functional-p fun) (functional-debug-name fun))
-            (and (functional-p fun) (functional-kind fun))
-            (and (typep fun 'clambda)
-                 (mapcar (lambda (v) (and (lambda-var-p v) (leaf-source-name v)))
-                         (lambda-vars fun)))
-            (and (typep fun 'clambda)
-                 (let ((bind (lambda-bind fun))) (and bind (block-number (node-block bind))))))
-    ;; a functional has no blocks slot: its body starts at its BIND node's block
-    (when (typep fun 'clambda)
-      (let ((bind (lambda-bind fun)))
-        (when bind
-          (do ((b (node-block bind) (first (block-succ b)))
-               (n 0 (1+ n)))
-              ((or (null b) (> n 6)))
-            (format *error-output* "~&;~a    b~a -> ~a~%"
-                    indent (block-number b) (mapcar #'block-number (block-succ b)))
-            (handler-case
-                (do-nodes (node l b)
-                  (format *error-output* "~&;~a      ~a~%" indent (vector-probe-node node)))
-              (error (e) (format *error-output* "~&;~a      <unwalkable: ~a>~%" indent e)))))))))
-
-(defun vector-node-probe-component (component)
-  (when *vector-node-probe*
-    (format *error-output* "~&; component ~a~%" (component-name component))
-    (vector-probe-loop (component-outer-loop component) 2)
-    (format *error-output* "~&;~%")))
-
-;;; The pass: after LOOP-ANALYZE, every natural loop is looked at, and one the node
-;;; analysis can describe is replaced by what it emits.
-;;; one splice per component: the replacement contains a DOTIMES of its own, so a
-;; second visit would vectorize the vectorized loop, and then that one, forever.
-;; (The table is emptied per compilation unit, see VECTOR-NODE-COMPONENT-PASS.)
-;;; a weak table: the entry dies with the component, so this needs no reset and
-;; never keeps one alive (a plain variable holding the last component would also
-;; trip RUN-TESTS' comparison of specials across a compilation)
+;;; How many loops have been replaced in each component, so that a component whose
+;;; replacement the source-form pass declines does not go round the fixpoint for
+;;; ever: the printed DOTIMES is itself a natural loop of the same shape.  A weak
+;;; table, so a finished component needs no bookkeeping to be forgotten -- and so
+;;; that nothing keeps a dead component alive.
 (defvar *vector-node-spliced* (make-hash-table :test 'eq :weakness :key))
 
 
@@ -251,38 +130,6 @@
     (sort loops #'< :key (lambda (loop) (length (vnloop-blocks loop))))))
 
 
-;;; A read-only planner.  This exists because one was not: a switch-on self-build
-;;; changed exactly one target fasl and then failed in warm init, and the plan was
-;;; the only thing the pass did to that component (it spliced nothing).  Snapshot
-;;; the state a plan could plausibly disturb, and report the first thing it does.
-(defvar *vector-node-check-purity* nil
-  "When true, assert that planning a loop changes nothing in its component.")
-
-(defun vector-node-snapshot (component)
-  (let ((acc '()))
-    (do-blocks (block component)
-      (when (and (block-start block) (not (block-delete-p block)))
-        (push (list* block (block-reoptimize block) (block-flush-p block)
-                     nil (list (block-type-check block)))
-              acc)
-        (dolist (node (vector-node-nodes block))
-          (push (list node (node-reoptimize node)) acc)
-          (let ((lvar (and (valued-node-p node) (node-lvar node))))
-            (when lvar
-              (push (list lvar (lvar-%derived-type lvar) (lvar-reoptimize lvar)) acc))))))
-    acc))
-
-(defun vector-node-compare-snapshot (component before plan)
-  (let ((after (vector-node-snapshot component)))
-    (dolist (entry before)
-      (let ((now (assoc (first entry) after)))
-        (unless (and now (equal (rest entry) (rest now)))
-          (error "planning changed ~s: ~s -> ~s (plan ~s)"
-                 (first entry) (rest entry) (rest now) plan))))
-    (when (/= (length before) (length after))
-      (error "planning changed the component's node count: ~a -> ~a"
-             (length before) (length after)))))
-
 (defvar *vector-node-cross-compiling* #+sb-xc-host t #-sb-xc-host nil
   "True in the compiler that will not produce the final code.
 
@@ -339,11 +186,7 @@ optimization of the compiler's own code, not of the program being built.")
         ;;
         ;; A plan attempt that signals declines.  Scope: planning only, never the
         ;; splice.
-        (let* ((snapshot (and *vector-node-check-purity*
-                              (vector-node-snapshot component)))
-               (plan (handler-case (vector-node-plan loop) (error () nil))))
-          (when snapshot
-            (vector-node-compare-snapshot component snapshot plan))
+        (let ((plan (handler-case (vector-node-plan loop) (error () nil))))
           ;; VECTOR-NODE-PLAN returns a plan plist or a failure reason, and reasons
           ;; are keywords as often as lists
           (when (and (consp plan) (getf plan :element-type))
@@ -441,11 +284,7 @@ function called with it - ARET's lowering passes the index through one."
         )
       value)))
 
-;;; the blocks of the loop being planned, so that a leaf the plan treats as
-;;; loop-invariant can be checked against the loop that binds it
-(defvar *vector-node-plan-blocks* nil)
-
-(defun vector-node-loop-invariant-p (var)
+(defun vector-node-loop-invariant-p (var blocks)
   "True when VAR is bound outside the loop being planned, and so survives the splice.
 
 A leaf that is bound INSIDE the loop is not a loop invariant: the splice deletes
@@ -458,9 +297,9 @@ compiled an undefined variable."
   (let* ((home (lambda-var-home var))
          (bind (and home (typep home 'clambda) (lambda-bind home))))
     (or (null bind)
-        (not (memq (node-block bind) *vector-node-plan-blocks*)))))
+        (not (memq (node-block bind) blocks)))))
 
-(defun vector-node-tree (lvar depth index-var)
+(defun vector-node-tree (lvar depth index-var blocks)
   (unless (lvar-p lvar) (return-from vector-node-tree nil))
   (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
@@ -468,23 +307,18 @@ compiled an undefined variable."
           ((and (ref-p use) (lambda-var-p (ref-leaf use)))
            ;; only a variable the loop does not bind: see VECTOR-NODE-LOOP-INVARIANT-P
            (let ((var (ref-leaf use)))
-             (when (vector-node-loop-invariant-p var)
+             (when (vector-node-loop-invariant-p var blocks)
                (list :var (leaf-source-name var)))))
           ;; an integer store narrows its value through a CAST node (the type
           ;; check's knowledge that the sum needs the lane width); the emitter
           ;; re-derives that from the array's element type
-          ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var))
+          ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var blocks))
           ((not (basic-combination-p use))
 
            nil)
           ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
            (let* ((args (combination-args use))
-                  (array (vector-node-leaf-var (first args))))
-             (unless (and array
-                          (eql (vector-node-constant (third args)) 0)
-                          (vector-node-index-p (second args) index-var 0))
-               )
-             (and array
+                  (array (vector-node-leaf-var (first args))))             (and array
                   (eql (vector-node-constant (third args)) 0)
                   (vector-node-index-p (second args) index-var 0)
                   (list :load (leaf-source-name array)
@@ -497,12 +331,10 @@ compiled an undefined variable."
           ((and (vector-node-name-p use "LOGAND")
                 (= (length (combination-args use)) 2)
                 (vector-node-constant (second (combination-args use))))
-           (vector-node-tree (first (combination-args use)) (1+ depth) index-var))
+           (vector-node-tree (first (combination-args use)) (1+ depth) index-var blocks))
           (t (let ((op (vector-node-call-name use)))
-               (unless (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
-                 )
                (when (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
-                 (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var))
+                 (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var blocks))
                                       (combination-args use))))
                    (and (every #'identity trees)
                         (list :op (if (string= op "%NEGATE") "-" op) trees)))))))))
@@ -551,7 +383,6 @@ increment and the stores gives the set of nodes the replacement reproduces."
   (when (vnloop-inferiors loop)
     (vector-node-fail :has-inner-loop))
   (let* ((blocks (vector-node-blocks loop))
-         (*vector-node-plan-blocks* blocks)
          (head (vnloop-head loop)))
     (unless (eq (first blocks) head) (vector-node-fail :head-not-first))
     ;; three blocks are as ordinary as two: after inlining, DOTIMES gives the
@@ -634,7 +465,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (dolist (store stores)
             (let* ((sargs (combination-args store))
                    (array (vector-node-leaf-var (first sargs)))
-                   (tree (vector-node-tree (fourth sargs) 0 index-var)))
+                   (tree (vector-node-tree (fourth sargs) 0 index-var blocks)))
               (unless array (vector-node-fail :store-array-not-a-variable))
               (unless (vector-node-index-p (second sargs) index-var 0)
                 (vector-node-fail :store-index-not-the-induction-variable))
@@ -699,7 +530,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
                                            (vector-node-call-name node))))
                             (and name (search "%CHECK-BOUND" name)))
                           (flushable-combination-p node))
-                (vector-node-fail (list :endangers (vector-probe-node node))))))
+                (vector-node-fail (list :endangers (type-of node))))))
           (unless (eql (vector-node-var-init index-var) 0)
             (vector-node-fail (list :index-does-not-start-at-zero (vector-node-var-init index-var))))
           ;; the element type has to be one this backend can load and store a
@@ -743,13 +574,6 @@ increment and the stores gives the set of nodes the replacement reproduces."
                      (third tree))))
     (t (error "unexpected tree ~s" tree))))
 
-(defun vector-node-tree-arrays (tree acc)
-  (case (car tree)
-    (:load (adjoin (second tree) acc :test #'equal))
-    (:op (reduce (lambda (acc2 sub) (vector-node-tree-arrays sub acc2)) (third tree)
-                 :initial-value acc))
-    (t acc)))
-
 (defun vector-node-source-form (plan)
   "The loop the plan describes, as the DOTIMES the source-form pass rewrites.
 
@@ -786,45 +610,6 @@ increment and the stores gives the set of nodes the replacement reproduces."
 ;;; blocks the loop was made of.  WRAP-PREDICATE (ir1tran.lisp:1192) is the model
 ;;; for building a block here; there is no call to repoint, so this is the same
 ;;; surgery WITHOUT the lambda that the inline-expansion path uses.
-;;; An opt-in check, off by default: it fires for the harness's simplest shapes
-;;; too, which is the evidence that converting a form in place inside a live
-;;; component detaches ENTRY nodes generally and not only in MAKE-WEAK-VECTOR.
-;;; Turn it on when working on the blocker; it errors at the splice, with the
-;;; component still intact.
-(defvar *vector-node-check-entries* nil
-  "When true, assert at the splice that every live ENTRY is listed by its home lambda.")
-
-;;; When true, report each loop the splice replaces, with the form it converts.
-(defvar *vector-node-trace* nil
-  "When true, print the component and the form of every splice.")
-
-(defun check-entries-after-splice (component)
-  "Report an ENTRY that its home lambda does not list.
-
-IR1 registration pushes the entry onto (LAMBDA-ENTRIES (LEXENV-LAMBDA *LEXENV*))
-at creation (ir1-translators.lisp:199-208), and the checker asks
-(LAMBDA-ENTRIES (NODE-HOME-LAMBDA node)), which walks out through
-LAMBDA-CALL-LEXENV for a :DELETED or :ZOMBIE lambda (ir1util.lisp:1382-1389).  An
-entry created inside a lambda that a LET merge or a transform later detached is
-registered with one lambda and found through another.  ENVIRONMENT-ANALYZE
-iterates LAMBDA-ENTRIES (envanal.lisp:277), so a mismatch loses that entry's
-cleanup."
-  ;; the component's blocks are a chain from its head, not a slot.  The head and
-  ;; tail blocks have no start ctran, and DO-NODES begins with (CTRAN-NEXT
-  ;; (BLOCK-START block)): walking them signals "The value NIL is not of type
-  ;; SB-C::CTRAN", which is what a first version of this checker reported instead
-  ;; of any stale entry.
-  (do ((block (component-head component) (block-next block)))
-      ((null block))
-    (unless (or (block-delete-p block) (null (block-start block)))
-      (do-nodes (node nil block)
-        (when (typep node 'entry)
-          (let ((home (node-home-lambda node)))
-            (when (and home (not (member node (lambda-entries home))))
-              (error "stale ENTRY ~s in live block ~a: home ~s kind ~a, entries ~s"
-                     node (block-number (node-block node))
-                     home (functional-kind home) (lambda-entries home)))))))))
-
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (vnloop-head loop))
@@ -873,10 +658,6 @@ cleanup."
       ;; (ir1-translators.lisp:201, 296, 298), home from (NODE-HOME-LAMBDA ...)
       ;; (ir1util.lisp:1377-1389) -- so a merge that retires that lambda fixes
       ;; both at once, which is what MERGE-LETS does (locall.lisp:1130-1140).
-      (when *vector-node-trace*
-        (format *error-output* "~&; splice in ~a: ~a block~:p, plan ~s~%;;  form ~s~%"
-                (component-name component) (length blocks) plan
-                (vector-node-source-form plan)))
       (let ((anchor (or (let ((cleanup (and (block-last head)
                                             (lexenv-cleanup (node-lexenv (block-last head))))))
                           (and cleanup (cleanup-mess-up cleanup)))
@@ -927,10 +708,6 @@ cleanup."
             ;; IR1-PHASES here would build a fresh *CONSTRAINT-UNIVERSE* while the
             ;; component's lvars still index the old one (main.lisp:549-552).
             (locall-analyze-component component)
-            ;; after LOCALL, because a LET merge is one of the steps that can
-            ;; detach an ENTRY from the lambda that registered it
-            (when *vector-node-check-entries*
-              (check-entries-after-splice component))
             ;; DFO and block numbers are stale; dfo-as-needed (main.lisp:764)
             ;; re-runs find-dfo on this flag (same setf as insert-cleanup-code,
             ;; ir1util.lisp:37, and node-ends-block, ir1util.lisp:2106).

@@ -589,3 +589,64 @@ State: *VECTOR-NODE-SPLICE* is T.
   auto-vectorize-differential       1 of 1 (54 shapes)
   differential harness, both passes  54 of 54 packed, values PASS
   differential harness, IR1 pass alone  50 of 54 packed, values PASS
+
+Where this rests, and what is left for upstream
+------------------------------------------------
+
+The feature is two files and one hook.
+
+  src/compiler/vectorize.lisp      the source-form pass: the vloop, the matchers, the
+                                   emitter, and the primitive table a backend fills in
+                                   (*VECTOR-PRIMITIVES*, *VECTOR-PRIMITIVES-256*).  On
+                                   by default, *AUTO-VECTORIZE* turns it off.
+
+  src/compiler/vectorize-ir1.lisp  the IR1 pass, build-order 388 -- after ir1util,
+                                   locall, ir1opt, loop and dfo, which it reads, and
+                                   before ir1final.  Placing it there is what let the
+                                   two forward-reference ftype declaims
+                                   (FLUSHABLE-COMBINATION-P, %LVAR-DERIVED-TYPE) go
+                                   away.  It takes exactly one thing from the file
+                                   beside it: VECTOR-PRIMITIVE.  On by default,
+                                   *VECTOR-NODE-SPLICE* turns it off, and
+                                   *VECTOR-NODE-CROSS-COMPILING* keeps it out of the
+                                   cross-compiler.
+
+  src/compiler/main.lisp           IR1-PHASES calls VECTOR-NODE-COMPONENT-PASS as a
+                                   sibling of IR1-OPTIMIZE-PHASE-1, inside the
+                                   fixpoint and inside the dynamic binding of
+                                   *CONSTRAINT-UNIVERSE*.  It is a sibling rather
+                                   than a step inside the optimize phase because a
+                                   splice needs the round after it -- LET conversion,
+                                   optimization, and the DFO sweep that retires the
+                                   old blocks -- and because re-entering IR1-PHASES
+                                   from inside it would build a fresh universe under
+                                   lvars that index the old one.
+
+Everything else that grew here while the pass was being made to work is gone: the
+loop probe, the entry checker, the purity checker, the splice trace, and the special
+variable that carried the loop's blocks into the planner (it is an argument now).  The
+refusal keywords VECTOR-NODE-PLAN returns stay: they are the function's answer, and
+they are what a compiler note would be built from if this ever needed one.
+
+What is left for upstream:
+
+1. History.  This branch is a stack of commits whose messages are a lab notebook
+   (attempts 2 through 9 of the note).  Upstream wants one commit that adds
+   src/compiler/vectorize-ir1.lisp, one that hooks it into IR1-PHASES, and NEWSCAST
+   entries for the two switches; the note can be dropped to a short file or folded
+   into the manual's "Automatic Vectorization" node.
+2. Share the emitter (option 3 of the note, never done).  The IR1 pass carries a
+   second set of shape rules and prints them as a DOTIMES for the source pass to
+   rewrite.  Building the source pass's VLOOP instead and calling VECTOR-EXPAND-LOOP
+   on it would delete VECTOR-NODE-SOURCE-FORM, make the one-element-type rule
+   structural rather than checked, and drop the 50-of-54 coverage question: the IR1
+   pass would then emit what the source pass emits, for the same shapes it can
+   already recognize.  What it does NOT need is the rest of option 1 -- building the
+   guard, the packed loop and the tail as IR1 nodes and the VOPs by hand -- because
+   the splice turned out to be sound (attempt 7) and the emitter belongs in one place.
+3. The 256-bit dispatch is what broke the first switch-on build (attempt 9): the
+   emitted (IF (SB-VM::AVX2-AVAILABLE-P) ...) is a direct call, and a file that
+   vectorizes before src/code/x86-64-vm.lisp proclaims that symbol INLINE aborts the
+   build under make-host-2's fail-on-warnings.  The gate on *VECTOR-NODE-CROSS-COMPILING*
+   is right for this pass, but the same trap is waiting for anything else that
+   vectorizes compiler code during a build.

@@ -755,8 +755,6 @@ necessary, since type inference may take arbitrarily long to converge.")
     (find-dominators component)
     (maybe-mumble "Loop ")
     (loop-analyze component)
-    ;; the splice itself runs inside IR1-PHASES now, see there
-    (vector-node-probe-component component)
 
     #|
     (when *compiler-trace-output*
