@@ -776,3 +776,61 @@ What the next attempt should do, in order:
 
 Rung A stands unchanged: the guard block, the loop kept as the tail, and the printed
 path for every shape.  The rung-B experiment left no code behind.
+
+Rung B landed: the packed prefix is IR1, for one shape
+------------------------------------------------------
+
+Single-float, a store of the sum of two loads, now converts no source text and looks
+up no name.  The shape check is VECTOR-NODE-PACKED-IR1-P; everything else keeps the
+printed path from rung A, so the blast radius of a mistake here is that one shape.
+
+What it emits, and why each part is the way it is:
+
+- the operands are leaves.  IR1-CONVERT turns a leaf into a REF
+  (ir1tran.lisp:632-636), so
+    (%VEC-STORE-SINGLE (%VEC-ADD-SINGLE (%VEC-LOAD-SINGLE A I)
+                                        (%VEC-LOAD-SINGLE B I)) C I)
+  converts with A, B, C and I the lambda-vars the recogniser already holds.  The plan
+  keeps those leaves now (:INDEX-VAR, :LIMIT-LEAF, :ARRAY-VARS, and the array leaf as
+  the fifth element of a :LOAD tree).  No BASIC-COMBINATION is built by hand.
+- the counter is the loop's own index variable.  It is zero on entry, its step is one
+  CSET built from SETQ-VAR (ir1-translators.lisp:1450-1486), and when the packed loop
+  stops it holds the first index the packed loop did not do: the loop the pass found
+  is the tail, and it needs no prologue at all.  This is why the pass needs no new
+  binding and no printed DO.
+- the test is a form over leaves,
+    (IF (<= (+ I W) (MIN LIMIT (LENGTH A) (LENGTH B) (LENGTH C))) T NIL)
+  asked once per iteration, and it folds the guard, the array lengths and the
+  alignment into one question.  Re-reading the lengths each iteration is the cost of
+  having no hoisted END; hoisting it needs a bound variable and is a later rung.
+- the blocks are created and filled in the order they are written, never as empty
+  landing pads, and the test is asked as an (IF ... T NIL) so that the IF translator
+  makes the join block the CIF lives in.  That was the first attempt's bug: MIN and
+  multi-argument <= expand to conditionals, so the test's conversion branched, the CIF
+  was placed in a block the conversion had not filled, and FIND-DFO was handed a block
+  with a start ctran, no nodes and a successor ("The value NIL is not of type
+  SB-C::NODE", from BLOCK-HOME-LAMBDA via NOTE-BLOCK-DELETION out of CLEAN-COMPONENT).
+  An AVER after the emission now names that condition if it ever comes back.
+- there is a second bug the first landed run of the suite caught, worth recording
+  because it is silent: VECTOR-OPERATOR-BASE is keyed by the operator SYMBOL, while a
+  plan tree carries it as a string, so (VECTOR-OPERATOR-BASE "+" ...) answered NIL and
+  the emitted form was (NIL ...) -- a call to the function NIL, which the harness
+  reported as "The function COMMON-LISP:NIL is undefined".  The printer interns the
+  string (VECTOR-NODE-PRINT-TREE); the IR1 path now does too.
+
+The property this rung is for is asserted by :IR1-PACKED-PREFIX-IS-IR1: with
+*VECTOR-AUTO-VECTORIZE*... precisely, with *AUTO-VECTORIZE* bound to NIL and the IR1
+pass on, the compiled shape still contains packed instructions (so the packed code
+cannot have come from the source-form pass), and the tail computes the right values at
+lengths 0 1 7 8 9 17.
+
+Numbers with rung B in: 88 tests (the new one included), differential 1 of 1, harness
+54 of 54 through both passes and 50 of 54 through the IR1 pass alone, values passing,
+serial switch-on self-build completing.
+
+What is left for C and D: the shape gate VECTOR-NODE-PACKED-IR1-P has to grow one
+family at a time (double-float, the integer lanes, the 128/256 split with its
+predicate, the ramp for an index value, splats for a scalar operand), and each family
+needs its operand forms -- (%VEC-SPLAT-* for a constant or an invariant leaf, a
+%VEC-RAMP for the index as a value), after which the printed path has no client left
+and VECTOR-NODE-PACKED-FORM, VECTOR-NODE-GUARD-FORM and VECTOR-NODE-PRINT-TREE can go.

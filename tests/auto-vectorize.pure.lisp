@@ -3035,6 +3035,41 @@ loops the pass puts in one function: the build no longer has to know."
     (setf (aref c i) (vectorize-inlined-add (aref a i) (aref b i))))
   c)
 
+
+;;; The IR1 pass emits the packed prefix itself, for the one shape it builds as IR1
+;;; (single-float, a store of the sum of two loads): the operands are the leaves the
+;;; recogniser holds and the loop's own index variable is the packed counter, so no
+;;; source is printed and the source-form pass is not involved at all.  What the
+;;; loop it found does is the scalar tail -- the elements the packed loop left.
+;;; Both halves are asserted here, and the source pass is off throughout, so the
+;;; packed code can only have come from the IR1 pass.
+(with-test (:name :ir1-packed-prefix-is-ir1 :skipped-on (not :x86-64))
+  (flet ((disassembly (function)
+           (string-downcase (with-output-to-string (stream)
+                              (disassemble function :stream stream)))))
+    (let* ((sb-c::*auto-vectorize* nil)
+           (sb-c::*vector-node-splice* t)
+           (fn (compile nil
+                        '(lambda (a b c n)
+                           (declare (type (simple-array single-float (*)) a b c)
+                                    (type vectorize-index n) (optimize speed))
+                           (dotimes (i n)
+                             (setf (aref c i) (+ (aref a i) (aref b i)))))))
+           (text (disassembly fn)))
+      (assert (some (lambda (mnemonic) (search mnemonic text))
+                    *vectorize-packed-mnemonics*)
+              () "the IR1 pass emitted no packed code:~%~A" text)
+      ;; the tail: lengths that straddle the hand-off from the packed prefix to the
+      ;; loop the pass found, including ones no whole vector fits in
+      (dolist (n '(0 1 7 8 9 17))
+        (let ((a (make-array n :element-type 'single-float :initial-element 1.5))
+              (b (make-array n :element-type 'single-float :initial-element 2.25))
+              (c (make-array n :element-type 'single-float :initial-element -1.0f0)))
+          (funcall fn a b c n)
+          (dotimes (i n)
+            (unless (eql (aref c i) 3.75)
+              (error "~@<length ~D, element ~D is ~S, expected 3.75~:@>" n i (aref c i)))))))))
+
 (with-test (:name :ir1-vectorizes-an-inlined-call)
   (flet ((packed-p (splice)
            (let ((text (string-downcase

@@ -323,7 +323,10 @@ compiled an undefined variable."
                   (vector-node-index-p (second args) index-var 0)
                   (list :load (leaf-source-name array)
                         (vector-node-constant (third args))
-                        (type-specifier (vector-node-lvar-type (node-lvar use)))))))
+                        (type-specifier (vector-node-lvar-type (node-lvar use)))
+                        ;; the leaf itself: a leaf is a form to IR1-CONVERT
+                        ;; (ir1tran.lisp:632-636), a name is not
+                        array))))
           ;; an integer store narrows its value: (+ ub32 ub32) derives (unsigned-byte
           ;; 33), so the VALUE is wrapped in LOGAND with the lane mask.  The mask is
           ;; implied by the array's element type when the form is printed, so the
@@ -494,7 +497,10 @@ increment and the stores gives the set of nodes the replacement reproduces."
               (push (list (leaf-source-name array)
                           (type-specifier
                            (array-type-element-type (vector-node-lvar-type (first sargs))))
-                          tree)
+                          tree
+                          ;; the array's own leaf: the IR1 path indexes the variable
+                          ;; the recogniser read, not a name
+                          array)
                     entries)))
           ;; everything else in the loop's blocks has to be accounted for, or the
           ;; splice deletes it
@@ -555,6 +561,25 @@ increment and the stores gives the set of nodes the replacement reproduces."
               (vector-node-fail (list :no-lane-for element-type))))
           (list :element-type (second (first entries))
                 :index (leaf-source-name index-var)
+                ;; the leaves the IR1 path emits: the index variable, the limit (a
+                ;; leaf, or the constant it is), and every array the plan touches
+                :index-var index-var
+                :limit-leaf (or (vector-node-leaf-var limit-lvar)
+                                (vector-node-constant limit-lvar))
+                :array-vars (let ((acc '()))
+                              (flet ((add (name leaf)
+                                       (when leaf
+                                         (pushnew (cons name leaf) acc
+                                                  :test (lambda (a b) (equal (car a) (car b)))))))
+                                (dolist (entry entries)
+                                  (add (first entry) (fourth entry)))
+                                (labels ((walk (tree)
+                                           (case (car tree)
+                                             (:load (add (second tree) (fifth tree)))
+                                             (:op (mapc #'walk (third tree)))
+                                             (t nil))))
+                                  (dolist (entry entries) (walk (third entry))))
+                                acc))
                 ;; the limit has to be a name or a literal: an expression would
                 ;; be re-evaluated by the emitted DOTIMES, and it was printing as
                 ;; NIL, i.e. (THE INTEGER NIL)
@@ -669,6 +694,136 @@ increment and the stores gives the set of nodes the replacement reproduces."
 ;;; The pass itself never calls FIND-DFO or DELETE-BLOCK: the next round of
 ;;; IR1-PHASES, after local call analysis has run, is what refreshes the DFO and
 ;;; retires anything the insertion made unreachable.
+;;; ---- the packed prefix as IR1 ---------------------------------------------
+;;; What is emitted here is not printed source.  Every operand is a leaf the
+;;; recogniser already holds -- the array variables the DATA-VECTOR-REF/SET nodes
+;;; address, and the loop's own index variable -- and IR1-CONVERT turns a leaf into a
+;;; REF (ir1tran.lisp:632-636), which is what an inline expansion relies on.  So
+;;; IR1-CONVERT is still called, but on a form of VOP-call forms over leaves: no
+;;; symbol of the user's program is looked up, and the name-based bug that printing
+;;; produced (a transform's temporary taken for a loop invariant) cannot happen.
+;;;
+;;; The loop's own index variable is the packed counter.  It is already bound and
+;;; already zero on entry, its step is the one CSET built here, and when the packed
+;;; loop stops it holds the first index the packed loop did not do -- which is where
+;;; the scalar tail, the loop the pass found, has to start.  No new binding.
+;;;
+;;; The ctran discipline, which is where the first attempt went wrong, is the one
+;;; INSERT-CLEANUP-CODE uses (ir1util.lisp:36-55): a conversion is given a ctran to
+;;; start at and a fresh one to continue at, and the blocks are linked by the
+;;; conversions themselves.  Three blocks, each created and then filled by the code
+;;; that follows it, never an empty landing pad:
+;;;
+;;;   ENTRY   the test, from the preheader; the back edge comes here too
+;;;   JOIN    the CIF: consequent BODY, alternative the loop's own head
+;;;   BODY    the VOP stores, then the CSET back to ENTRY
+;;;
+;;; The test is asked as (IF TEST T NIL) rather than converted bare, because MIN and
+;;; multi-argument <= expand to conditionals: the IF translator then guarantees a
+;;; join block, linked from both arms, for the CIF to live in.  TEST re-reads the
+;;; count and the array lengths every iteration, which is what lets it be a form over
+;;; leaves and nothing else; hoisting them into bound variables is a later rung.
+
+(defun vector-node-packed-ir1-p (plan)
+  "The one shape this emits: single-float, every store the sum of two loads.
+
+Everything else keeps the printed path, so a mistake here is one shape wide."
+  (and (eq (getf plan :element-type) 'single-float)
+       (lambda-var-p (getf plan :index-var))
+       (getf plan :limit-leaf)
+       (every (lambda (store)
+                (let ((tree (cdr store)))
+                  (and (consp tree)
+                       (eq (car tree) :op)
+                       (equal (second tree) "+")
+                       (= (length (third tree)) 2)
+                       (every (lambda (sub)
+                                (and (eq (car sub) :load)
+                                     (eq (fourth sub) 'single-float)
+                                     (fifth sub)))
+                              (third tree)))))
+              (getf plan :stores))))
+
+(defun vector-node-store-form (plan entry index)
+  "(%VEC-STORE-SINGLE (%VEC-ADD-SINGLE ...) ARRAY INDEX), with leaves for operands."
+  (let* ((type (getf plan :element-type))
+         (node (cdr entry))
+         (array (cdr (assoc (car entry) (getf plan :array-vars) :test #'equal))))
+    (when array
+      (flet ((operand (sub)
+               (let ((leaf (cdr (assoc (second sub) (getf plan :array-vars) :test #'equal))))
+                 (and leaf `(,(vector-primitive "LOAD" type) ,leaf ,index)))))
+        (let ((operands (mapcar #'operand (third node)))
+              ;; the tree's operator is a string, the primitive table's key is the
+              ;; symbol it names (VECTOR-OPERATOR-BASE), as in VECTOR-NODE-PRINT-TREE
+              (operator (intern (second node) "CL")))
+          (when (and (every #'identity operands)
+                     (vector-primitive (vector-operator-base operator type) type))
+            `(,(vector-primitive "STORE" type)
+              (,(vector-primitive (vector-operator-base operator type) type)
+               ,@operands)
+              ,array ,index)))))))
+
+(defun vector-node-emit-packed-ir1 (plan preheader head)
+  "Build the packed prefix as blocks, nodes and one CSET, ahead of the loop.
+
+Returns true when the flow is built, NIL when this shape is not one it can build.
+The three blocks are created and filled in the order they are written: ENTRY by the
+test, JOIN by the CIF, BODY by the stores and the CSET.  Nothing is created as an
+empty landing pad, which is what the first attempt got wrong."
+  (let* ((type (getf plan :element-type))
+         (index (getf plan :index-var))
+         (limit (getf plan :limit-leaf))
+         (width (vector-width type))
+         (arrays (remove-duplicates (mapcar #'cdr (getf plan :array-vars)) :test #'eq))
+         (stores (getf plan :stores)))
+    (unless (and index limit arrays (= (length arrays) (length (getf plan :array-vars))))
+      (return-from vector-node-emit-packed-ir1 nil))
+    (let* ((start (make-ctran))
+           (entry (ctran-starts-block start))       ; filled by the test, below
+           (body-start (make-ctran))
+           (body (ctran-starts-block body-start)))  ; filled by the stores, below
+      ;; BODY: the stores, each converted after the one before it, then the CSET
+      (let ((cursor body-start))
+        (dolist (store stores)
+          (let ((form (vector-node-store-form plan store index))
+                (next (make-ctran)))
+            (unless form (return-from vector-node-emit-packed-ir1 nil))
+            (ir1-convert cursor next nil form)
+            (setf cursor next)))
+        ;; the increment: INDEX := INDEX + WIDTH, then back to the test.  SETQ-VAR
+        ;; (ir1-translators.lisp:1450-1486) is the model for the CSET.
+        (let* ((next (make-ctran))
+               (value-lvar (make-lvar))
+               (set (make-set index value-lvar)))
+          (ir1-convert cursor next value-lvar `(+ ,index ,width))
+          (setf (lvar-dest value-lvar) set)
+          (push set (basic-var-sets index))
+          (link-node-to-previous-ctran set next)
+          (use-continuation set (block-start entry) nil)))
+      ;; ENTRY: the test, asked as (IF TEST T NIL) so that the IF translator makes a
+      ;; join block for the CIF; JOIN is that block, and it is where the CIF goes
+      (let* ((test-ctran (make-ctran))
+             (test-lvar (make-lvar))
+             (test (make-if test-lvar body head)))
+        (setf (lvar-dest test-lvar) test)
+        (ir1-convert start test-ctran test-lvar
+                     `(if (<= (+ ,index ,width)
+                              (min ,limit ,@(mapcar (lambda (array) `(length ,array))
+                                                    arrays)))
+                          t nil))
+        (let ((join (ctran-starts-block test-ctran)))
+          (link-node-to-previous-ctran test test-ctran)
+          (setf (block-last join) test)
+          (link-blocks join body)
+          (link-blocks join head)
+          ;; every block this built has to end in a node, or FIND-DFO will be handed
+          ;; a block with a start, no nodes and a successor (see the note)
+          (aver (and (block-last entry) (block-last body) (block-last join)))))
+      ;; the loop is entered through ENTRY now, not straight from the preheader
+      (change-block-successor preheader head entry)
+      t)))
+
 (defun vector-node-splice-loop (loop plan)
   (let* ((blocks (vector-node-blocks loop))
          (head (vnloop-head loop))
@@ -702,20 +857,27 @@ increment and the stores gives the set of nodes the replacement reproduces."
                         (block-last preheader)
                         (lambda-bind head-home))))
         (with-ir1-environment-from-node anchor
-          (let* ((start (make-ctran))
-                 (guard (ctran-starts-block start)))
-            ;; the packed DOTIMES is what the source-form pass rewrites into packs,
-            ;; so that pass has to be on while it is converted; the loop below is
-            ;; not converted at all, it is simply left in place
-            (let ((*auto-vectorize* t))
-              (ir1-convert start (block-start head) nil
-                           `(when ,(vector-node-guard-form plan)
-                              ,(vector-node-packed-form plan))))
-            (change-block-successor preheader head guard)
-            ;; the block chain, the DFO and the block numbers are stale
-            (setf (component-reanalyze component) t)
-            ;; the packed form expands to LETs, so the component has functionals
-            ;; waiting for local call analysis; the next round runs it (main.lisp:
-            ;; 503-508) and then optimizes and sweeps what the insertion left
-            (locall-analyze-component component)
-            t))))))
+          (let ((done
+                  (if (vector-node-packed-ir1-p plan)
+                      ;; blocks, nodes and one CSET, with the operands as leaves: no
+                      ;; printed source, and the source-form pass is not involved
+                      (vector-node-emit-packed-ir1 plan preheader head)
+                      ;; the packed prefix as the source-form pass's own shape,
+                      ;; converted into a guard block; that pass has to be on while
+                      ;; it is converted or the DOTIMES stays scalar
+                      (let* ((start (make-ctran))
+                             (guard (ctran-starts-block start)))
+                        (let ((*auto-vectorize* t))
+                          (ir1-convert start (block-start head) nil
+                                       `(when ,(vector-node-guard-form plan)
+                                          ,(vector-node-packed-form plan))))
+                        (change-block-successor preheader head guard)
+                        t))))
+            (when done
+              ;; the block chain, the DFO and the block numbers are stale
+              (setf (component-reanalyze component) t)
+              ;; either path leaves functionals waiting for local call analysis (a
+              ;; converted DOTIMES, or the LETs a VOP call does not have); the next
+              ;; round runs it (main.lisp:503-508) and then optimizes what was added
+              (locall-analyze-component component))
+            done))))))
