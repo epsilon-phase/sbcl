@@ -1034,6 +1034,7 @@ here is a switch-on build):
   tests/auto-vectorize.pure.lisp              89 of 89
   tests/auto-vectorize-differential.pure.lisp  1 of 1
   serial switch-on self-build (SBCL_MAKE_PARALLEL unset)  completes, 4m36s
+  the whole tests/ suite                           8766 passed, 0 failed
 
 The pass is ON by default in the source (*VECTOR-NODE-SPLICE* is T), so an ordinary
 build is the switch-on build, and make-target-2 -- which compiles all of src/code
