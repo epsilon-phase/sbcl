@@ -1033,6 +1033,13 @@ here is a switch-on build):
 
   tests/auto-vectorize.pure.lisp              89 of 89
   tests/auto-vectorize-differential.pure.lisp  1 of 1
+  serial switch-on self-build (SBCL_MAKE_PARALLEL unset)  completes, 4m36s
+
+The pass is ON by default in the source (*VECTOR-NODE-SPLICE* is T), so an ordinary
+build is the switch-on build, and make-target-2 -- which compiles all of src/code
+with the new compiler and the pass live -- is what exercises it.  A serial build is
+the one worth quoting: the parallel driver hides a subprocess's output, and that has
+misled this work before.
 
 The new test is :IR1-PACKED-INTEGER-LANES.  It compiles 52 shapes -- 8 integer
 widths x {+ - logand logior logxor}, and the 8- and 16-bit multiplies -- and for
