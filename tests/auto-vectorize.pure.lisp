@@ -3108,6 +3108,134 @@ loops the pass puts in one function: the build no longer has to know."
                 (error "~@<~a negate, length ~D: element ~D is ~S~:@>"
                        element-type n i (aref c i))))))))))
 
+;;; Integer lanes through the IR1 path.  An integer lane wraps where the scalar loop
+;;; it replaces would signal a type error, so the pass plans one only at (safety 0),
+;;; which is also the policy these lambdas are compiled at.  The inputs overflow the
+;;; lane on purpose -- 255 + 3 in a byte, a negative difference in an unsigned lane,
+;;; 60000 * 300 in a word -- so a missing mask is a wrong number and not a green
+;;; test, and the expected value is the one the scalar loop is defined to produce.
+;;; The bitwise operators are exact at any safety, but this pass takes the same
+;;; (safety 0) gate for every integer family; which widths have which operator is
+;;; the backend's primitive table, so only the families it publishes
+;;; unconditionally are asserted here (there is no 64-bit multiply, and a 32-bit one
+;;; needs SSE4.1).
+(with-test (:name :ir1-packed-integer-lanes :skipped-on (not :x86-64))
+  (labels ((disassembly (function)
+             (string-downcase (with-output-to-string (stream)
+                                (disassemble function :stream stream))))
+           (lane (value element-type)
+             "VALUE as a lane of ELEMENT-TYPE holds it: what a (safety 0) store does."
+             (let* ((bits (second element-type))
+                    (truncated (ldb (byte bits 0) value)))
+               (if (eq (first element-type) 'signed-byte)
+                   (coerce (if (logbitp (1- bits) truncated)
+                               (- truncated (ash 1 bits))
+                               truncated)
+                           element-type)
+                   (coerce truncated element-type))))
+           (evidence (operator)
+             (case operator
+               (+ '("paddb" "paddw" "paddd" "paddq"))
+               (- '("psubb" "psubw" "psubd" "psubq"))
+               (* '("pmullw" "pmulld"))
+               (logand '("pand"))
+               (logior '("por"))
+               (logxor '("pxor"))))
+           (form (element-type operator)
+             `(lambda (a b c n)
+                (declare (type (simple-array ,element-type (*)) a b c)
+                         (type vectorize-index n)
+                         (optimize speed (safety 0)))
+                (dotimes (i n)
+                  (setf (aref c i) (,operator (aref a i) (aref b i))))))
+           (check (element-type operator)
+             (let* ((sb-c::*auto-vectorize* nil)
+                    (sb-c::*vector-node-splice* t)
+                    ;; the pass has a printed path for every shape it declines, and
+                    ;; that path binds *AUTO-VECTORIZE* itself, so "no packed code"
+                    ;; is not the question -- "which of the two emitted it" is.  The
+                    ;; source pass says so with a note and this pass says nothing.
+                    (notes (vectorize-notes-for (form element-type operator)))
+                    (fn (compile nil (form element-type operator)))
+                    (text (disassembly fn)))
+               (assert (not (vectorize-note-mentions notes "vectorized loop"))
+                       () "~a ~a: the printed path vectorized this, not the IR1 pass:~%~{~a~%~}"
+                       element-type operator notes)
+               ;; the packed loop: a load/store of a whole vector, which no scalar
+               ;; loop over these arrays emits, and the operator's own instruction
+               (assert (or (search "movdqu" text) (search "movdqa" text))
+                       () "~a ~a: the IR1 pass emitted no packed load:~%~A"
+                       element-type operator text)
+               (assert (some (lambda (mnemonic) (search mnemonic text))
+                             (evidence operator))
+                       () "~a ~a: the IR1 pass emitted no packed ~a:~%~A"
+                       element-type operator operator text)
+               ;; the tail, and the hand-off from the packed prefix to it: lengths
+               ;; that are shorter than a lane, one lane, one lane and one, and two
+               (dolist (n '(0 1 7 8 9 17))
+                 (let ((a (make-array n :element-type element-type))
+                       (b (make-array n :element-type element-type))
+                       (c (make-array n :element-type element-type)))
+                   (dotimes (i n)
+                     (setf (aref a i) (lane (* 97 (1+ i)) element-type)
+                           (aref b i) (lane (* 131 (+ 3 i)) element-type)
+                           (aref c i) (lane 0 element-type)))
+                   (funcall fn a b c n)
+                   (dotimes (i n)
+                     (let ((expected
+                             (lane (funcall operator
+                                            (coerce (aref a i) 'integer)
+                                            (coerce (aref b i) 'integer))
+                                   element-type)))
+                       (unless (eql (aref c i) expected)
+                         (error "~@<~a ~a, length ~D: element ~D is ~S, expected ~S~:@>"
+                                element-type operator n i (aref c i) expected))))))))
+           (checked-either-way (element-type operator)
+             "A family the backend may or may not publish -- a 32-bit multiply needs
+SSE4.1, a 64-bit one exists nowhere -- must compute the right values whether the IR1
+pass emits it or declines it.  With the source pass off, a decline means the loop
+stays scalar, which is what a decline has to mean."
+             (let* ((sb-c::*auto-vectorize* nil)
+                    (sb-c::*vector-node-splice* t)
+                    (fn (compile nil
+                                 `(lambda (a b c n)
+                                    (declare (type (simple-array ,element-type (*)) a b c)
+                                             (type vectorize-index n)
+                                             (optimize speed (safety 0)))
+                                    (dotimes (i n)
+                                      (setf (aref c i)
+                                            (,operator (aref a i) (aref b i))))))))
+               (dotimes (n '(0 1 7 8 9 17))
+                 (let ((a (make-array n :element-type element-type))
+                       (b (make-array n :element-type element-type))
+                       (c (make-array n :element-type element-type)))
+                   (dotimes (i n)
+                     (setf (aref a i) (lane (* 97 (1+ i)) element-type)
+                           (aref b i) (lane (* 131 (+ 3 i)) element-type)))
+                   (funcall fn a b c n)
+                   (dotimes (i n)
+                     (unless (eql (aref c i)
+                                  (lane (funcall operator
+                                                 (coerce (aref a i) 'integer)
+                                                 (coerce (aref b i) 'integer))
+                                        element-type))
+                       (error "~@<either way: ~a ~a, length ~D: element ~D is ~S~:@>"
+                              element-type operator n i (aref c i)))))))))
+    (dolist (element-type '((unsigned-byte 8) (signed-byte 8)
+                            (unsigned-byte 16) (signed-byte 16)
+                            (unsigned-byte 32) (signed-byte 32)
+                            (unsigned-byte 64) (signed-byte 64)))
+      ;; the families every build publishes: + - and the three bitwise operators
+      (dolist (operator '(+ - logand logior logxor))
+        (check element-type operator))
+      ;; multiply: PMULLW covers the 8- and 16-bit lanes at any build; the 32-bit
+      ;; one is SSE4.1 and the 64-bit one does not exist, so those two must decline
+      (when (member element-type '((unsigned-byte 8) (signed-byte 8)
+                                   (unsigned-byte 16) (signed-byte 16))
+                    :test #'equal)
+        (check element-type '*))
+      (checked-either-way element-type '*))))
+
 (with-test (:name :ir1-vectorizes-an-inlined-call)
   (flet ((packed-p (splice)
            (let ((text (string-downcase

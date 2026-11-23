@@ -299,7 +299,19 @@ compiled an undefined variable."
     (or (null bind)
         (not (memq (node-block bind) blocks)))))
 
-(defun vector-node-tree (lvar depth index-var blocks)
+(defun vector-node-lane-mask (element-type)
+  "The value a LANE of ELEMENT-TYPE keeps, when the store's narrowing is a LOGAND.
+
+The compiler wraps a value the store has to narrow in (LOGAND VALUE MASK) for an
+unsigned lane and in a CAST for a signed one, so the mask is implied by the element
+type.  It is also the only LOGAND this reader looks through: a MASK the program wrote
+itself -- (LOGAND (AREF A I) 3) into a byte array -- is a different operation and is
+not the identity, so it has to keep its place in the tree and be refused."
+  (and (consp element-type)
+       (eq (first element-type) 'unsigned-byte)
+       (1- (ash 1 (second element-type)))))
+
+(defun vector-node-tree (lvar depth index-var blocks element-type)
   (unless (lvar-p lvar) (return-from vector-node-tree nil))
   (when (> depth 8) (return-from vector-node-tree nil))
   (let ((use (lvar-uses lvar)))
@@ -312,7 +324,8 @@ compiled an undefined variable."
           ;; an integer store narrows its value through a CAST node (the type
           ;; check's knowledge that the sum needs the lane width); the emitter
           ;; re-derives that from the array's element type
-          ((cast-p use) (vector-node-tree (cast-value use) (1+ depth) index-var blocks))
+          ((cast-p use)
+           (vector-node-tree (cast-value use) (1+ depth) index-var blocks element-type))
           ((not (basic-combination-p use))
 
            nil)
@@ -333,8 +346,10 @@ compiled an undefined variable."
           ;; reader looks through it
           ((and (vector-node-name-p use "LOGAND")
                 (= (length (combination-args use)) 2)
-                (vector-node-constant (second (combination-args use))))
-           (vector-node-tree (first (combination-args use)) (1+ depth) index-var blocks))
+                (eql (vector-node-constant (second (combination-args use)))
+                     (vector-node-lane-mask element-type)))
+           (vector-node-tree (first (combination-args use)) (1+ depth) index-var blocks
+                             element-type))
           (t (let ((op (vector-node-call-name use)))
                ;; the bitwise operators are elementwise at every width and are
                ;; exact (an n-bit result of an n-bit operation), so they are the
@@ -344,8 +359,10 @@ compiled an undefined variable."
                (when (member op '("+" "-" "*" "/" "%NEGATE"
                                   "LOGAND" "LOGIOR" "LOGXOR")
                              :test #'string=)
-                 (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var blocks))
-                                      (combination-args use))))
+                 (let ((trees (mapcar (lambda (a)
+                                      (vector-node-tree a (1+ depth) index-var blocks
+                                                        element-type))
+                                    (combination-args use))))
                    (and (every #'identity trees)
                         ;; the operator is the SYMBOL, which is what VECTOR-OPERATOR-BASE
                         ;; and the emitter's tables are keyed by; printing it interns
@@ -482,7 +499,18 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (dolist (store stores)
             (let* ((sargs (combination-args store))
                    (array (vector-node-leaf-var (first sargs)))
-                   (tree (vector-node-tree (fourth sargs) 0 index-var blocks)))
+                   ;; the element type comes from the ARRAY, not from the stored
+                   ;; value: the value's lvar can carry the type of a cast or a
+                   ;; constant (this printed (SIMPLE-ARRAY (INTEGER 0 0) (*)) and
+                   ;; failed at run time).  It is read before the tree because the
+                   ;; tree reader needs it: the only LOGAND it may look through is
+                   ;; the narrowing to this lane's own width.
+                   (element-type
+                     (let ((ty (vector-node-lvar-type (first sargs))))
+                       (and (array-type-p ty)
+                            (not (array-type-complexp ty))
+                            (type-specifier (array-type-element-type ty)))))
+                   (tree (vector-node-tree (fourth sargs) 0 index-var blocks element-type)))
               (unless array (vector-node-fail :store-array-not-a-variable))
               (unless (vector-node-index-p (second sargs) index-var 0)
                 (vector-node-fail :store-index-not-the-induction-variable))
@@ -497,16 +525,12 @@ increment and the stores gives the set of nodes the replacement reproduces."
               ;; (the harness found this the moment casts were looked through)
               (when (and (consp tree) (eq (first tree) :op) (string= (second tree) "-")
                          (= (length (third tree)) 1)
-                         (let ((et (type-specifier (vector-node-lvar-type (fourth sargs)))))
-                           (and (consp et) (string= (symbol-name (first et))
-                                                    "UNSIGNED-BYTE"))))
+                         (consp element-type)
+                         (eq (first element-type) 'unsigned-byte))
                 (vector-node-fail :unary-minus-on-unsigned))
-              ;; the element type comes from the ARRAY, not from the stored value:
-              ;; the value's lvar can carry the type of a cast or a constant (this
-              ;; printed (SIMPLE-ARRAY (INTEGER 0 0) (*)) and failed at run time)
+              (unless element-type (vector-node-fail :no-element-type))
               (push (list (leaf-source-name array)
-                          (type-specifier
-                           (array-type-element-type (vector-node-lvar-type (first sargs))))
+                          element-type
                           tree
                           ;; the array's own leaf: the IR1 path indexes the variable
                           ;; the recogniser read, not a name
