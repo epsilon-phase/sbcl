@@ -346,8 +346,12 @@ not the identity, so it has to keep its place in the tree and be refused."
           ;; reader looks through it
           ((and (vector-node-name-p use "LOGAND")
                 (= (length (combination-args use)) 2)
-                (eql (vector-node-constant (second (combination-args use)))
-                     (vector-node-lane-mask element-type)))
+                ;; both have to be there: a signed lane's mask is NIL and so is the
+                ;; answer for a (LOGAND A B) that has no constant at all
+                (let ((mask (vector-node-lane-mask element-type)))
+                  (and mask
+                       (eql (vector-node-constant (second (combination-args use)))
+                            mask))))
            (vector-node-tree (first (combination-args use)) (1+ depth) index-var blocks
                              element-type))
           (t (let ((op (vector-node-call-name use)))

@@ -3205,7 +3205,7 @@ stays scalar, which is what a decline has to mean."
                                     (dotimes (i n)
                                       (setf (aref c i)
                                             (,operator (aref a i) (aref b i))))))))
-               (dotimes (n '(0 1 7 8 9 17))
+               (dolist (n '(0 1 7 8 9 17))
                  (let ((a (make-array n :element-type element-type))
                        (b (make-array n :element-type element-type))
                        (c (make-array n :element-type element-type)))
