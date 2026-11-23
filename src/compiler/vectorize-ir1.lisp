@@ -336,7 +336,14 @@ compiled an undefined variable."
                 (vector-node-constant (second (combination-args use))))
            (vector-node-tree (first (combination-args use)) (1+ depth) index-var blocks))
           (t (let ((op (vector-node-call-name use)))
-               (when (member op '("+" "-" "*" "/" "%NEGATE") :test #'string=)
+               ;; the bitwise operators are elementwise at every width and are
+               ;; exact (an n-bit result of an n-bit operation), so they are the
+               ;; one integer family the source pass vectorizes at any safety; here
+               ;; they still take the (safety 0) gate, and the primitive table
+               ;; decides which widths have them
+               (when (member op '("+" "-" "*" "/" "%NEGATE"
+                                  "LOGAND" "LOGIOR" "LOGXOR")
+                             :test #'string=)
                  (let ((trees (mapcar (lambda (a) (vector-node-tree a (1+ depth) index-var blocks))
                                       (combination-args use))))
                    (and (every #'identity trees)
@@ -563,6 +570,14 @@ increment and the stores gives the set of nodes the replacement reproduces."
                          (vector-primitive "STORE" element-type))
               (vector-node-fail (list :no-lane-for element-type))))
           (list :element-type (second (first entries))
+                ;; An integer lane wraps where a checked loop would signal: the
+                ;; packed store masks, the scalar store it replaces signals.  The
+                ;; source pass states the same rule twice
+                ;; (VECTOR-EXACT-EXPRESSION-P for a tree that cannot leave the
+                ;; lane, VLOOP-UNCHECKED-P for the rest); this pass takes only the
+                ;; strict half -- integer lanes at (safety 0) -- and carries it on
+                ;; the plan, where VECTOR-NODE-IR1-FAMILY-P reads it.
+                :unchecked-p (policy (block-last head) (= safety 0))
                 :index (leaf-source-name index-var)
                 ;; the leaves the IR1 path emits: the index variable, the limit (a
                 ;; leaf, or the constant it is), and every array the plan touches
@@ -727,79 +742,158 @@ increment and the stores gives the set of nodes the replacement reproduces."
 ;;; count and the array lengths every iteration, which is what lets it be a form over
 ;;; leaves and nothing else; hoisting them into bound variables is a later rung.
 
-(defparameter +vector-node-ir1-operators+ '(+ - *)
-  "The operators the IR1 path emits, as a plan tree now carries them: the symbol.
-Division is not here yet -- it takes float lanes only, and its family lands with the
-rest.")
+(defparameter +vector-node-ir1-operators+ '(+ - * logand logior logxor)
+  "The operators the IR1 path emits, as a plan tree carries them: the symbol.
 
-(defun vector-node-ir1-family-p (element-type operator arity)
+Division is not here: it takes float lanes only, and no width has a packed integer
+divide.  Which of these a width can do is the primitive table's answer
+(VECTOR-PRIMITIVE), never this list's: no byte multiply at some widths, no 64-bit
+multiply at any, and the 32-bit multiply and minimum only where the build has the
+instructions.")
+
+(defun vector-node-float-lane-p (element-type)
+  (member element-type '(single-float double-float) :test #'equal))
+
+(defun vector-node-ir1-family-p (element-type operator arity unchecked-p)
   "True when this element type, operator and arity are a family the IR1 path emits.
 
 Rung C widens this one family at a time, and what it does not cover keeps the printed
 path: a missing primitive is a decline here, never a VOP that is not there.  Arity 1
 is a sign flip (the recogniser turns %NEGATE into a one-operand -), which is a XOR on
-the sign bit and not a subtraction."
-  (and (member element-type '(single-float double-float))
+the sign bit and not a subtraction of zero, and only the float lanes have it.
+
+UNCHECKED-P is the plan's (safety 0), and an integer lane is only reached there: the
+packed store masks to the lane width where the scalar store it replaces would signal a
+type error, so the two loops agree at (safety 0) and not above it.  The element type
+is compared with EQUAL because an integer element type is a LIST -- (UNSIGNED-BYTE 32)
+-- and two equal lists are never EQ."
+  (and (or (vector-node-float-lane-p element-type) unchecked-p)
        (case arity
-         (1 (eq operator '-))
-         (2 (member operator +vector-node-ir1-operators+)))))
+         (1 (and (vector-node-float-lane-p element-type) (eq operator '-)))
+         (2 (member operator +vector-node-ir1-operators+ :test #'eq)))))
+
+(defun vector-node-lane-p (element-type)
+  "True when this backend publishes a pack of ELEMENT-TYPE it can move."
+  (and (vector-primitive "LOAD" element-type)
+       (vector-primitive "STORE" element-type)))
+
+(defun vector-node-tree-primitives-p (tree element-type)
+  "True when every primitive TREE needs exists at the width this build published.
+
+This half of the gate must not be left to the emitter.  A store whose operator has no
+primitive at that width -- a 64-bit multiply, a 32-bit one on a build without SSE4.1 --
+has to be refused before the first block exists, because refusing after that leaves an
+unreachable block with no nodes, and FIND-DFO cannot delete one: it reaches
+NOTE-BLOCK-DELETION, which asks the block for its BLOCK-LAST.  Measured, by letting
+(UNSIGNED-BYTE 64) multiply through the gate and having VECTOR-NODE-STORE-FORM answer
+NIL instead: the compiler died with 'The value NIL is not of type SB-C::NODE'."
+  (and (vector-node-lane-p element-type)
+       (let* ((operator (second tree))
+              (arity (length (third tree)))
+              ;; a one-operand - is a sign flip, not a subtraction of zero
+              (base (if (= arity 1) "NEG" (vector-operator-base operator element-type))))
+         (and base (vector-primitive base element-type)))))
+
 (defun vector-node-packed-ir1-p (plan)
   "The shapes this emits as IR1: an elementwise store of (OP (LOAD A I) (LOAD B I)).
 
-Everything else keeps the printed path, so a mistake here is one family wide."
+Everything else keeps the printed path, so a mistake here is one family wide.  Every
+refusal lives HERE, and that is a structural rule rather than tidiness: once the
+emission has made a block it cannot decline, and the gate is the last moment at which
+the loop can still be left to the printed path."
   (let ((type (getf plan :element-type)))
     (and (lambda-var-p (getf plan :index-var))
          (getf plan :limit-leaf)
+         ;; the room test names each array once, so no two names may be one variable
+         (= (length (getf plan :array-vars))
+            (length (remove-duplicates (mapcar #'cdr (getf plan :array-vars))
+                                       :test #'eq)))
+         (vector-node-lane-p type)
          (every (lambda (store)
                   (let ((tree (cdr store)))
                     (and (consp tree)
                          (eq (car tree) :op)
                          (member (length (third tree)) '(1 2))
                          (vector-node-ir1-family-p type (second tree)
-                                                   (length (third tree)))
+                                                   (length (third tree))
+                                                   (getf plan :unchecked-p))
                          (every (lambda (sub)
                                   (and (eq (car sub) :load)
-                                       (eq (fourth sub) type)
+                                       (equal (fourth sub) type)
                                        (fifth sub)))
-                                (third tree)))))
+                                (third tree))
+                         (vector-node-tree-primitives-p tree type))))
                 (getf plan :stores)))))
 
 (defun vector-node-store-form (plan entry index)
-  "(%VEC-STORE-SINGLE (%VEC-ADD-SINGLE ...) ARRAY INDEX), with leaves for operands."
+  "(%VEC-STORE-SINGLE (%VEC-ADD-SINGLE ...) ARRAY INDEX), with leaves for operands.
+
+Total for the shapes VECTOR-NODE-PACKED-IR1-P accepts -- the gate has already asked
+for every primitive this reads -- which is what lets the emission never decline."
   (let* ((type (getf plan :element-type))
          (node (cdr entry))
          (array (cdr (assoc (car entry) (getf plan :array-vars) :test #'equal))))
-    (when array
-      (flet ((operand (sub)
-               (let ((leaf (cdr (assoc (second sub) (getf plan :array-vars) :test #'equal))))
-                 (and leaf `(,(vector-primitive "LOAD" type) ,leaf ,index)))))
-        (let* ((operands (mapcar #'operand (third node)))
-               ;; a one-operand - is a sign flip, which has its own primitive and is
-               ;; not a subtraction of zero (VECTOR-OPERATOR-BASE :NEGATE)
-               (base (if (= (length operands) 1)
-                         "NEG"
-                         (vector-operator-base (second node) type))))
-          (when (and base (every #'identity operands)
-                     (vector-primitive base type))
-            `(,(vector-primitive "STORE" type)
-              (,(vector-primitive base type) ,@operands)
-              ,array ,index)))))))
+    (aver array)
+    (flet ((operand (sub)
+             (let ((leaf (cdr (assoc (second sub) (getf plan :array-vars)
+                                     :test #'equal))))
+               (aver leaf)
+               `(,(vector-primitive "LOAD" type) ,leaf ,index))))
+      (let* ((operands (mapcar #'operand (third node)))
+             ;; one operand is a sign flip, which has its own primitive and is not a
+             ;; subtraction of zero (VECTOR-OPERATOR-BASE :NEGATE)
+             (base (if (= (length operands) 1)
+                       "NEG"
+                       (vector-operator-base (second node) type))))
+        (aver (and base (vector-primitive base type)))
+        `(,(vector-primitive "STORE" type)
+          (,(vector-primitive base type) ,@operands)
+          ,array ,index)))))
+
+(defun vector-node-room-test (plan index width)
+  "The packed loop's test: the index against the limit, and the room in the arrays.
+
+One (IF ... T NIL) over leaves -- the loop's own index variable, the limit, and the
+arrays -- so that the blocks the conversion makes are the same for every element type
+and every number of stores: the arms are constants, so each of them ends in a REF, and
+the only other blocks are the ones a CIF lives in.
+
+The room in the arrays is asked in the test rather than folded into the bound with
+(MIN LIMIT (LENGTH A) (LENGTH B) ...), because that shape puts MIN's own value
+selection in the test: whether it expands to a conditional depends on the element type
+(the lengths and the limit are (INTEGER 0 N) for an integer array) and it costs a MIN
+per iteration either way.  This way (<= (+ INDEX WIDTH) LIMIT) is what stops the packed
+loop, so the index it hands the scalar tail is the first element the tail has to do,
+and every array is at least LIMIT long, so neither a load nor a store can leave one.
+
+A limit that is not an index -- negative, or wide enough to be a bignum -- fails the
+first length check and sends the whole loop to the tail, which is the original loop
+entered at index 0."
+  (let ((limit (getf plan :limit-leaf))
+        (arrays (remove-duplicates (mapcar #'cdr (getf plan :array-vars)) :test #'eq)))
+    `(and (<= (+ ,index ,width) ,limit)
+          ,@(mapcar (lambda (array) `(>= (length ,array) ,limit)) arrays))))
 
 (defun vector-node-emit-packed-ir1 (plan preheader head)
   "Build the packed prefix as blocks, nodes and one CSET, ahead of the loop.
 
-Returns true when the flow is built, NIL when this shape is not one it can build.
-The three blocks are created and filled in the order they are written: ENTRY by the
-test, JOIN by the CIF, BODY by the stores and the CSET.  Nothing is created as an
-empty landing pad, which is what the first attempt got wrong."
+The three blocks are created and filled in the order they are written: BODY by the
+stores and the CSET, ENTRY by the test, JOIN by the CIF.  Nothing is created as an
+empty landing pad, which is what the first attempt got wrong, and nothing here can
+decline -- VECTOR-NODE-PACKED-IR1-P has already answered, and a decline after a block
+exists in the component's chain would leave one with no nodes that FIND-DFO cannot
+delete.  THE VALVE at the end names that condition instead of letting it through."
   (let* ((type (getf plan :element-type))
          (index (getf plan :index-var))
          (limit (getf plan :limit-leaf))
          (width (vector-width type))
-         (arrays (remove-duplicates (mapcar #'cdr (getf plan :array-vars)) :test #'eq))
-         (stores (getf plan :stores)))
-    (unless (and index limit arrays (= (length arrays) (length (getf plan :array-vars))))
-      (return-from vector-node-emit-packed-ir1 nil))
+         (stores (getf plan :stores))
+         (component *current-component*)
+         ;; every block CTRAN-STARTS-BLOCK makes is spliced in front of this one
+         (tail (component-last-block component))
+         (anchor (block-prev tail)))
+    (aver (or (lambda-var-p limit) (integerp limit)))
+    (aver (consp stores))
     (let* ((start (make-ctran))
            (entry (ctran-starts-block start))       ; filled by the test, below
            (body-start (make-ctran))
@@ -807,10 +901,8 @@ empty landing pad, which is what the first attempt got wrong."
       ;; BODY: the stores, each converted after the one before it, then the CSET
       (let ((cursor body-start))
         (dolist (store stores)
-          (let ((form (vector-node-store-form plan store index))
-                (next (make-ctran)))
-            (unless form (return-from vector-node-emit-packed-ir1 nil))
-            (ir1-convert cursor next nil form)
+          (let ((next (make-ctran)))
+            (ir1-convert cursor next nil (vector-node-store-form plan store index))
             (setf cursor next)))
         ;; the increment: INDEX := INDEX + WIDTH, then back to the test.  SETQ-VAR
         ;; (ir1-translators.lisp:1450-1486) is the model for the CSET.
@@ -822,25 +914,29 @@ empty landing pad, which is what the first attempt got wrong."
           (push set (basic-var-sets index))
           (link-node-to-previous-ctran set next)
           (use-continuation set (block-start entry) nil)))
-      ;; ENTRY: the test, asked as (IF TEST T NIL) so that the IF translator makes a
-      ;; join block for the CIF; JOIN is that block, and it is where the CIF goes
+      ;; ENTRY: the test.  JOIN is the block the IF translator's join lands in, and
+      ;; it is where the CIF goes.
       (let* ((test-ctran (make-ctran))
              (test-lvar (make-lvar))
              (test (make-if test-lvar body head)))
         (setf (lvar-dest test-lvar) test)
         (ir1-convert start test-ctran test-lvar
-                     `(if (<= (+ ,index ,width)
-                              (min ,limit ,@(mapcar (lambda (array) `(length ,array))
-                                                    arrays)))
-                          t nil))
+                     `(if ,(vector-node-room-test plan index width) t nil))
         (let ((join (ctran-starts-block test-ctran)))
           (link-node-to-previous-ctran test test-ctran)
           (setf (block-last join) test)
           (link-blocks join body)
           (link-blocks join head)
-          ;; every block this built has to end in a node, or FIND-DFO will be handed
-          ;; a block with a start, no nodes and a successor (see the note)
-          (aver (and (block-last entry) (block-last body) (block-last join)))))
+          ;; THE VALVE.  Every block this made has to end in a node: the next DFO
+          ;; sweep deletes the unreachable ones, and deleting one asks
+          ;; NOTE-BLOCK-DELETION for its BLOCK-LAST, which is NIL here if the
+          ;; conversion left a block it never filled.  An assertion and not a
+          ;; decline, because a decline is impossible at this point: the blocks are
+          ;; already in the component's chain, and an empty one is precisely what
+          ;; the sweep cannot delete.  The gate is what keeps it from firing.
+          (do ((block (block-prev tail) (block-prev block)))
+              ((eq block anchor))
+            (aver (block-last block)))))
       ;; the loop is entered through ENTRY now, not straight from the preheader
       (change-block-successor preheader head entry)
       t)))
