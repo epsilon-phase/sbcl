@@ -904,3 +904,183 @@ was; note that a conversion cannot be withdrawn, so the invariant has to be that
 emission cannot leave an empty block, and the check only names the failure; (4) then the
 integer families, one width at a time, with values that overflow the lane so a missing
 mask is a wrong number.
+
+Rung C landed: integer lanes, and what the crash really was
+----------------------------------------------------------
+
+Integer lanes are IR1 now: (UNSIGNED-BYTE 8/16/32/64) and the signed widths, for
++ - and the three bitwise operators, at (SAFETY 0) -- the only policy where a
+wrapping lane and the scalar loop it replaces agree.  Multiply comes along where
+the primitive table has it (8- and 16-bit at any build, 32-bit where the backend
+has SSE4.1, 64-bit nowhere) and declines where it does not.  The bitwise operators
+entered the recogniser with this rung: it read only "+" "-" "*" "/" "%NEGATE"
+before, so LOGAND, LOGIOR and LOGXOR fell out of the family before any gate saw
+them.
+
+Four gate bugs, three of them as the previous attempt described:
+
+  - VECTOR-NODE-IR1-FAMILY-P listed the float element types only;
+  - VECTOR-NODE-PACKED-IR1-P compared a load's element type with EQ, and an
+    integer element type is a LIST;
+  - the plan held no record of the source pass's integer rule.  It carries
+    :UNCHECKED-P now -- (POLICY (BLOCK-LAST HEAD) (= SAFETY 0)) -- and
+    VECTOR-NODE-IR1-FAMILY-P accepts a non-float element type only while it is
+    true.  The source pass's other half (an exact tree may vectorize at any
+    safety) is not taken here: this pass asks for (SAFETY 0) on every integer
+    family, which is the conservative side of the same rule;
+  - and one the brief did not have: the recogniser looked through ANY
+    (LOGAND ... CONSTANT), on the theory that a store's only LOGAND is the
+    narrowing to the lane width.  That is the identity only when the constant IS
+    the mask the element type implies.  Two ways to be wrong, and the new test
+    caught both:
+
+      (SETF (AREF C I) (LOGAND (AREF A I) 3))     byte lane, 17 elements
+
+    is a mask the program wrote; the packed prefix stored A unmasked and the
+    scalar tail's last element came out right, i.e. a miscompile the tail hides.
+    With the mask compared for real, the same comparison then fired for
+    (LOGAND A B) on a SIGNED lane, because both the mask and "is the second
+    argument a constant" answer NIL and (EQL NIL NIL) is true -- the recogniser
+    read a two-load AND as a bare load of A, and the printed form said
+    (SETF (AREF # #:VN-I) (AREF # #:VN-I)).  A mask the program wrote now keeps
+    its place in the tree, fails the gate (its operand is not a load) and leaves
+    the loop to the printed path, which masks properly.
+
+What the crash was, measured
+----------------------------
+
+The previous attempt saw
+
+  The value NIL is not of type SB-C::NODE   (BLOCK-HOME-LAMBDA via
+  NOTE-BLOCK-DELETION, CLEAN-COMPONENT, FIND-DFO)
+
+with integer lanes reaching the emitter, and suspected the test: MIN over the
+lengths and a two-argument <= were supposed to expand into conditionals whose arms
+and join the emission did not know.  That is not what it is.  With the gate opened
+in a live core (VECTOR-NODE-IR1-FAMILY-P and VECTOR-NODE-PACKED-IR1-P redefined,
+no rebuild), the MIN-shaped test delivers correct packed loops at every integer
+width, and its numbers are the same as the shape this rung lands.  The test is not
+the problem.
+
+The crash reproduces in seconds, from one cause, without a rebuild: let the gate
+accept a shape whose operator has no primitive at the width emitted, and let the
+emitter find out.  (UNSIGNED-BYTE 64) multiply, as the second of two stores:
+
+  (dotimes (i n)
+    (setf (aref c i) (+ (aref a i) (aref b i)))
+    (setf (aref d i) (* (aref a i) (aref b i))))
+
+prints "The value NIL is not of type SB-C::NODE" from that stack, in the same
+compile.  VECTOR-NODE-STORE-FORM answers NIL for the second store, so the emitter
+returns NIL half built: ENTRY exists (a start ctran, no nodes), BODY's CSET
+delivers into it, and nothing links the preheader to ENTRY.  Both blocks are
+unreachable and both are still queued in the component, and the next FIND-DFO asks
+the empty one for its BLOCK-LAST.
+
+So the rule this rung is built on, and it is structural rather than tidiness:
+
+  a decline is only possible before the first block exists.
+
+VECTOR-NODE-PACKED-IR1-P is now the whole gate -- the index leaf, the limit, one
+array variable per name, the lane's LOAD and STORE, and every store's operator
+primitive at this build's width.  After it answers, the emission has nothing left
+to refuse, and it cannot: VECTOR-NODE-STORE-FORM is total and asserts instead of
+answering NIL.
+
+That is also why the valve the brief asks for cannot be a decline.  Declining
+after the test conversion leaves exactly the block above -- and a conversion
+cannot be withdrawn, so the blocks stay.  What is in the tree is THE VALVE: after
+the test conversion and before the preheader is relinked, every block the emitter
+created is walked -- they sit between the component's last block and the anchor
+that preceded it -- and AVERred to end in a node.  It can only fire if the gate is
+wrong, and when it fires the build stops at the assertion that names the
+condition rather than at a note about unreachable code two files later.
+
+The test: one IF, and no runtime function
+-----------------------------------------
+
+The packed loop's test is still one (IF ... T NIL), now
+
+  (and (<= (+ INDEX WIDTH) LIMIT)
+       (>= (LENGTH A) LIMIT) (>= (LENGTH B) LIMIT) (>= (LENGTH C) LIMIT))
+
+instead of (<= (+ INDEX WIDTH) (MIN LIMIT (LENGTH A) (LENGTH B) (LENGTH C))).
+Not for the block structure -- the MIN shape is fine, measured above -- but
+because the MIN is gone from the loop, and because it hardens the one thing the
+emission does assume: with the room checks in the test, the only block that has to
+be identified afterwards is the IF translator's join, which CTRAN-STARTS-BLOCK on
+the pass's own ctran names whatever the element type is, and no value selection
+sits in the test at all.  A limit that is negative, or wider than an index, fails
+the first length check and sends the loop to the tail, entered at index 0.
+
+It is not a call to %VECTOR-NODE-ROOM-P, which is what the brief proposed and what
+was tried first.  The emitted code belongs to the program being compiled, and a
+function that file could call has to exist in the final image: SB-C does not, so a
+defun in vectorize.lisp would compile -- nothing catches an undefined function
+until the code runs -- and then fail at run time as an undefined function.  A
+runtime file would have to grow the function for this one emission, and one
+ordinary call per packed iteration is not obviously cheaper than three compares
+against values the loop already holds.
+
+Numbers
+-------
+
+Numbers
+-------
+
+Tests, on the core built from this tree (the pass is on by default, so every build
+here is a switch-on build):
+
+  tests/auto-vectorize.pure.lisp              89 of 89
+  tests/auto-vectorize-differential.pure.lisp  1 of 1
+
+The new test is :IR1-PACKED-INTEGER-LANES.  It compiles 52 shapes -- 8 integer
+widths x {+ - logand logior logxor}, and the 8- and 16-bit multiplies -- and for
+each one asserts three things: that the code has a packed load/store and the
+operator's own instruction, that the expected values come out at lengths 0 1 7 8 9
+17 with inputs that overflow the lane, and that the source pass's note ("vectorized
+loop over ...") does NOT appear, which is what proves the IR1 pass emitted it.  The
+last check matters: the IR1 pass's printed fallback binds *AUTO-VECTORIZE* itself,
+so binding *AUTO-VECTORIZE* to NIL around the compile does not keep the source pass
+out -- a decline comes back as packed code from the printed path, and "no packed
+code" is not the question to ask.
+
+Differential harness, all 54 shapes, values compared bit-for-bit at 11 lengths on
+both dispatch paths:
+
+  both passes (the default)          54 of 54 packed, 54 of 54 pass
+  IR1 pass alone (*AUTO-VECTORIZE* NIL)   38 of 54 packed, 54 of 54 pass
+
+Of those 38, fifteen are the splice's printed fallback, so the IR1 path itself
+covers 23 of 54: :two-loads for all five element types, the float negate, and the
+float two-stores.  The other 31 shapes are not a regression and not reachable by
+this gate: :load-scalar needs a splat operand (the gate's operands are loads), the
+index-value needs a ramp, the adjustable shape is non-simple arrays (out of scope
+here, on purpose), and the integer unary minus is (- 0 X), which needs a zero splat
+and has no integer NEG primitive.
+
+Which is also the correction to the figure in the brief: "50 of 54 through the IR1
+pass alone" is the *both-passes* configuration, because the printed fallback turns
+the source pass back on for every shape the IR1 gate refuses.  The way to measure
+the IR1 path on its own is the note, not the disassembly: with *AUTO-VECTORIZE* NIL
+and the splice on, no "vectorized loop over" note means the IR1 pass emitted it.
+
+The earlier recorded 51-of-54 file (harness/last-run.txt, from before this rung) is
+that same confusion in the other direction: its integer :two-stores, integer unary
+minus, index-value and adjustable rows are packed=yes with *AUTO-VECTORIZE* NIL,
+which only the source pass can do.  Treat that table as the both-passes one.
+
+What is left for another rung
+-----------------------------
+
+- MIN and MAX over integer lanes: the primitive table publishes them from
+  (UNSIGNED-BYTE 8) to (SIGNED-BYTE 32) (PMINSW, PMINSD/PMINUD where the build has
+  SSE4.1), and VECTOR-OPERATOR-BASE already maps them, but the recogniser does not
+  read "MIN"/"MAX" as operators and VECTOR-NODE-IR1-OPERATORS does not list them,
+  so they keep the printed path.
+- A ramp (:INDEX) and a splat are still printed-path only: an operand has to be a
+  load in this gate, which is what makes the room test and the operand list one
+  shape.  A splat operand means a second gate family, not a change here.
+- The 256-bit split is still the source pass's: the IR1 path emits the 128-bit
+  prefix and relies on the printed path for the AVX2 dispatch, which is why the
+  pass stays out of the cross-compiler.

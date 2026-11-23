@@ -887,12 +887,13 @@ and every number of stores: the arms are constants, so each of them ends in a RE
 the only other blocks are the ones a CIF lives in.
 
 The room in the arrays is asked in the test rather than folded into the bound with
-(MIN LIMIT (LENGTH A) (LENGTH B) ...), because that shape puts MIN's own value
-selection in the test: whether it expands to a conditional depends on the element type
-(the lengths and the limit are (INTEGER 0 N) for an integer array) and it costs a MIN
-per iteration either way.  This way (<= (+ INDEX WIDTH) LIMIT) is what stops the packed
-loop, so the index it hands the scalar tail is the first element the tail has to do,
-and every array is at least LIMIT long, so neither a load nor a store can leave one.
+(MIN LIMIT (LENGTH A) (LENGTH B) ...).  Both shapes deliver correct packed loops -- the
+MIN one is what rung B shipped and what the note records as measured -- but the MIN is
+a value selection sitting in the test, it is recomputed every iteration, and it leaves
+the emission's one structural assumption resting on how MIN happens to expand this
+time.  This way (<= (+ INDEX WIDTH) LIMIT) is what stops the packed loop, so the index
+it hands the scalar tail is the first element the tail has to do, and every array is at
+least LIMIT long, so neither a load nor a store can leave one.
 
 A limit that is not an index -- negative, or wide enough to be a bignum -- fails the
 first length check and sends the whole loop to the tail, which is the original loop
