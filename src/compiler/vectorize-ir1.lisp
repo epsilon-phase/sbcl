@@ -311,6 +311,48 @@ not the identity, so it has to keep its place in the tree and be refused."
        (eq (first element-type) 'unsigned-byte)
        (1- (ash 1 (second element-type)))))
 
+;;; The parts of a data-vector access, in whichever spelling this backend's AREF
+;;; lowering produced.  x86-64 has VOPs that take the offset as a third argument
+;;; (DATA-VECTOR-REF-WITH-OFFSET), so the access to a simple array carries an
+;;; explicit zero; arm64 has only the plain VOPs and no offset argument at all
+;;; (src/compiler/arm64/array.lisp defines data-vector-ref/set and nothing else).
+;;; The pass wants the zero-offset access, which is the same access in both, and
+;;; matching the name alone made it x86-64-only by accident.
+;;;
+;;; VALUES array-lvar index-lvar value-lvar offset, or NIL when NODE is not such an
+;;; access.  OFFSET is 0 for the spelling that has none; a caller refuses any other
+;;; value, since a fixed offset is a shape this pass does not carry.
+(defun vector-node-access-args (node)
+  "VALUES array-lvar index-lvar value-lvar offset, for a data-vector access.
+
+The four spellings have four arities, and getting one wrong is silent: a NIL here
+reads as \"not an access\" and the loop goes to the scalar tail.
+
+  (data-vector-ref vector index)                  2, arm64
+  (data-vector-ref-with-offset vector index offset) 3, x86-64
+  (data-vector-set vector index value)            3, arm64
+  (data-vector-set-with-offset vector index offset value) 4, x86-64
+
+VALUE-LVAR is NIL for a load -- its value is the node's own lvar, which the caller
+already has -- and OFFSET is 0 for the spelling that has none."
+  (when (basic-combination-p node)
+    (let ((name (vector-node-call-name node))
+          (args (combination-args node)))
+      (cond ((string= name "DATA-VECTOR-REF-WITH-OFFSET")
+             (when (= (length args) 3)
+               (values (first args) (second args) nil
+                       (vector-node-constant (third args)))))
+            ((string= name "DATA-VECTOR-REF")
+             (when (= (length args) 2)
+               (values (first args) (second args) nil 0)))
+            ((string= name "DATA-VECTOR-SET-WITH-OFFSET")
+             (when (= (length args) 4)
+               (values (first args) (second args) (fourth args)
+                       (vector-node-constant (third args)))))
+            ((string= name "DATA-VECTOR-SET")
+             (when (= (length args) 3)
+               (values (first args) (second args) (third args) 0)))))))
+
 (defun vector-node-tree (lvar depth index-var blocks element-type)
   (unless (lvar-p lvar) (return-from vector-node-tree nil))
   (when (> depth 8) (return-from vector-node-tree nil))
@@ -329,17 +371,21 @@ not the identity, so it has to keep its place in the tree and be refused."
           ((not (basic-combination-p use))
 
            nil)
-          ((vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
-           (let* ((args (combination-args use))
-                  (array (vector-node-leaf-var (first args))))             (and array
-                  (eql (vector-node-constant (third args)) 0)
-                  (vector-node-index-p (second args) index-var 0)
-                  (list :load (leaf-source-name array)
-                        (vector-node-constant (third args))
-                        (type-specifier (vector-node-lvar-type (node-lvar use)))
-                        ;; the leaf itself: a leaf is a form to IR1-CONVERT
-                        ;; (ir1tran.lisp:632-636), a name is not
-                        array))))
+          ((or (vector-node-name-p use "DATA-VECTOR-REF-WITH-OFFSET")
+               (vector-node-name-p use "DATA-VECTOR-REF"))
+           (multiple-value-bind (array-lvar index-lvar value-lvar offset)
+               (vector-node-access-args use)
+             (declare (ignore value-lvar))
+             (let ((array (vector-node-leaf-var array-lvar)))
+               (and array
+                    (eql offset 0)
+                    (vector-node-index-p index-lvar index-var 0)
+                    (list :load (leaf-source-name array)
+                          0
+                          (type-specifier (vector-node-lvar-type (node-lvar use)))
+                          ;; the leaf itself: a leaf is a form to IR1-CONVERT
+                          ;; (ir1tran.lisp:632-636), a name is not
+                          array)))))
           ;; an integer store narrows its value: (+ ub32 ub32) derives (unsigned-byte
           ;; 33), so the VALUE is wrapped in LOGAND with the lane mask.  The mask is
           ;; implied by the array's element type when the form is printed, so the
@@ -443,7 +489,9 @@ increment and the stores gives the set of nodes the replacement reproduces."
              (body-nodes (mapcan #'vector-node-nodes blocks))
              (increment (find-if (lambda (n) (and (typep n 'cset) (eq (set-var n) index-var)))
                                  body-nodes))
-             (stores (remove-if-not (lambda (n) (vector-node-name-p n "DATA-VECTOR-SET-WITH-OFFSET"))
+             (stores (remove-if-not (lambda (n)
+                                      (or (vector-node-name-p n "DATA-VECTOR-SET-WITH-OFFSET")
+                                          (vector-node-name-p n "DATA-VECTOR-SET")))
                                     body-nodes)))
         ;; the loop must be exactly: test, index increment, and stores.  Anything
         ;; else -- an accumulator, a conditional inside the body, hidden state -- is
@@ -501,25 +549,27 @@ increment and the stores gives the set of nodes the replacement reproduces."
           (vector-node-fail :index-used-outside))
         (let ((entries '()))
           (dolist (store stores)
-            (let* ((sargs (combination-args store))
-                   (array (vector-node-leaf-var (first sargs)))
-                   ;; the element type comes from the ARRAY, not from the stored
-                   ;; value: the value's lvar can carry the type of a cast or a
-                   ;; constant (this printed (SIMPLE-ARRAY (INTEGER 0 0) (*)) and
-                   ;; failed at run time).  It is read before the tree because the
-                   ;; tree reader needs it: the only LOGAND it may look through is
-                   ;; the narrowing to this lane's own width.
-                   (element-type
-                     (let ((ty (vector-node-lvar-type (first sargs))))
-                       (and (array-type-p ty)
-                            (not (array-type-complexp ty))
-                            (type-specifier (array-type-element-type ty)))))
-                   (tree (vector-node-tree (fourth sargs) 0 index-var blocks element-type)))
+            (multiple-value-bind (array-lvar index-lvar value-lvar offset)
+                (vector-node-access-args store)
+             (unless array-lvar (vector-node-fail :store-not-a-data-vector-access))
+             (let* ((array (vector-node-leaf-var array-lvar))
+                    ;; the element type comes from the ARRAY, not from the stored
+                    ;; value: the value's lvar can carry the type of a cast or a
+                    ;; constant (this printed (SIMPLE-ARRAY (INTEGER 0 0) (*)) and
+                    ;; failed at run time).  It is read before the tree because the
+                    ;; tree reader needs it: the only LOGAND it may look through is
+                    ;; the narrowing to this lane's own width.
+                    (element-type
+                      (let ((ty (vector-node-lvar-type array-lvar)))
+                        (and (array-type-p ty)
+                             (not (array-type-complexp ty))
+                             (type-specifier (array-type-element-type ty)))))
+                    (tree (vector-node-tree value-lvar 0 index-var blocks element-type)))
               (unless array (vector-node-fail :store-array-not-a-variable))
-              (unless (vector-node-index-p (second sargs) index-var 0)
+              (unless (vector-node-index-p index-lvar index-var 0)
                 (vector-node-fail :store-index-not-the-induction-variable))
-              (unless (eql (vector-node-constant (third sargs)) 0)
-                (vector-node-fail (list :store-offset (vector-node-constant (third sargs)))))
+              (unless (eql offset 0)
+                (vector-node-fail (list :store-offset offset)))
               (unless tree (vector-node-fail :no-value-tree))
               ;; -x on an unsigned lane has to wrap, and the emitter's negate does
               ;; not: the scalar reference and the packed loop disagree (the harness
@@ -539,7 +589,7 @@ increment and the stores gives the set of nodes the replacement reproduces."
                           ;; the array's own leaf: the IR1 path indexes the variable
                           ;; the recogniser read, not a name
                           array)
-                    entries)))
+                      entries))))
           ;; everything else in the loop's blocks has to be accounted for, or the
           ;; splice deletes it
           (let ((consumed (make-hash-table :test 'eq)))
@@ -860,13 +910,22 @@ Total for the shapes VECTOR-NODE-PACKED-IR1-P accepts -- the gate has already as
 for every primitive this reads -- which is what lets the emission never decline."
   (let* ((type (getf plan :element-type))
          (node (cdr entry))
-         (array (cdr (assoc (car entry) (getf plan :array-vars) :test #'equal))))
+         (array (cdr (assoc (car entry) (getf plan :array-vars) :test #'equal)))
+         ;; how this backend addresses an element.  A backend whose loads and stores
+         ;; take the byte offset publishes OFFSET (arm64: LDR/STR are addressed by
+         ;; %VEC-OFFSET-*, so a raw index is an unsigned-byte-64 the VOP does not
+         ;; accept and the call becomes an undefined function); one whose addressing
+         ;; mode takes the index, as x86-64's does, publishes nothing.  The same
+         ;; question the source-form emitter asks with VECTOR-OFFSET-FORM.
+         (address (if (vector-primitive "OFFSET" type)
+                      `(,(vector-primitive "OFFSET" type) ,index)
+                      index)))
     (aver array)
     (flet ((operand (sub)
              (let ((leaf (cdr (assoc (second sub) (getf plan :array-vars)
                                      :test #'equal))))
                (aver leaf)
-               `(,(vector-primitive "LOAD" type) ,leaf ,index))))
+               `(,(vector-primitive "LOAD" type) ,leaf ,address))))
       (let* ((operands (mapcar #'operand (third node)))
              ;; one operand is a sign flip, which has its own primitive and is not a
              ;; subtraction of zero (VECTOR-OPERATOR-BASE :NEGATE)
@@ -876,7 +935,7 @@ for every primitive this reads -- which is what lets the emission never decline.
         (aver (and base (vector-primitive base type)))
         `(,(vector-primitive "STORE" type)
           (,(vector-primitive base type) ,@operands)
-          ,array ,index)))))
+          ,array ,address)))))
 
 (defun vector-node-room-test (plan index width)
   "The packed loop's test: the index against the limit, and the room in the arrays.

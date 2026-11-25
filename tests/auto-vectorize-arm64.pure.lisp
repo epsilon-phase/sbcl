@@ -781,3 +781,86 @@
     (let ((text (get-output-stream-string stream)))
       (setf notes (search "vectorized loop over" text))
       (assert notes () "no vectorization note in:~%~A" text))))
+
+;;;; The IR1 pass, on this backend.
+
+;;; The recogniser looked for DATA-VECTOR-SET-WITH-OFFSET and DATA-VECTOR-REF-WITH-OFFSET
+;;; by name.  Those VOPs are x86-64's (src/compiler/x86/array.lisp); arm64 lowers an
+;;; access to a simple array to the plain DATA-VECTOR-SET/REF, with no offset argument
+;;; at all (src/compiler/arm64/array.lisp), so every candidate loop answered :NO-STORE
+;;; and the pass was x86-64-only in effect while reading as backend-independent.
+;;; tests/auto-vectorize.pure.lisp is #-x86-64 SKIP-FILE, so nothing here saw it.
+;;;
+;;; These bindings turn the source-form pass off, so packed code can only come from the
+;;; IR1 pass: this is the arm64 half of :IR1-PACKED-PREFIX-IS-IR1.
+
+(test-util:with-test (:name :ir1-packs-on-arm64)
+  (flet ((compile-ir1-only (form)
+           (let ((sb-c::*auto-vectorize* nil)
+                 (sb-c::*vector-node-splice* t))
+             (compile nil form)))
+         (compile-neither (form)
+           (let ((sb-c::*auto-vectorize* nil)
+                 (sb-c::*vector-node-splice* nil))
+             (compile nil form))))
+    ;; single-float: two loads and a sum, which is the shape the IR1 emitter takes
+    (let ((fn (compile-ir1-only
+               '(lambda (a b c n)
+                  (declare (type (simple-array single-float (*)) a b c)
+                           (type vectorize-index n)
+                           (optimize speed (safety 0)))
+                  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+      (assert (packed-p fn) ()
+              "the IR1 pass emitted no packed code for a single-float sum: ~a"
+              (disassembly-text fn))
+      (assert (uses fn "fadd") () "the IR1 pass emitted no packed add: ~a"
+              (disassembly-text fn))
+      (check-floats fn #'+ 'single-float *single-values* *single-values*
+                    "ir1 single-float add"))
+    ;; an integer lane, where the packed lane and the scalar store wrap the same way
+    (let ((fn (compile-ir1-only
+               '(lambda (a b c n)
+                  (declare (type (simple-array (unsigned-byte 32) (*)) a b c)
+                           (type vectorize-index n)
+                           (optimize speed (safety 0)))
+                  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+      (assert (packed-p fn) ()
+              "the IR1 pass emitted no packed code for a u32 sum: ~a"
+              (disassembly-text fn))
+      ;; the values include 4294967295, so a lane that does not wrap is a wrong number
+      (check-elementwise fn #'+ '(unsigned-byte 32) *u32-values* *u32-values*
+                         "ir1 u32 add"))
+    ;; several stores in one iteration
+    (let ((fn (compile-ir1-only
+               '(lambda (a b c d n)
+                  (declare (type (simple-array single-float (*)) a b c d)
+                           (type vectorize-index n)
+                           (optimize speed (safety 0)))
+                  (dotimes (i n)
+                    (setf (aref c i) (+ (aref a i) (aref b i)))
+                    (setf (aref d i) (- (aref a i) (aref b i))))))))
+      (assert (uses fn "fadd" "fsub") ()
+              "the IR1 pass did not emit both stores as packed code: ~a"
+              (disassembly-text fn))
+      (let ((a (make-vector 'single-float *single-values* 23))
+            (b (make-vector 'single-float *single-values* 23 3))
+            (c (make-array 23 :element-type 'single-float :initial-element 0.0))
+            (d (make-array 23 :element-type 'single-float :initial-element 0.0)))
+        (funcall fn a b c d 23)
+        (dotimes (i 23)
+          (unless (and (= (aref c i) (+ (aref a i) (aref b i)))
+                       (= (aref d i) (- (aref a i) (aref b i))))
+            (error "~@<ir1 two stores: element ~D is ~S/~S, expected ~S/~S~:@>"
+                   i (aref c i) (aref d i)
+                   (+ (aref a i) (aref b i)) (- (aref a i) (aref b i)))))))
+    ;; and the control: with both passes off the same loop stays scalar, so the
+    ;; assertions above are about the IR1 pass and not about something else packing it
+    (let ((fn (compile-neither
+               '(lambda (a b c n)
+                  (declare (type (simple-array single-float (*)) a b c)
+                           (type vectorize-index n)
+                           (optimize speed (safety 0)))
+                  (dotimes (i n) (setf (aref c i) (+ (aref a i) (aref b i))))))))
+      (assert (not (packed-p fn)) ()
+              "both passes are off and the loop is packed anyway: ~a"
+              (disassembly-text fn)))))
